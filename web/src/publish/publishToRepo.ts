@@ -1,5 +1,6 @@
 import { generateDistributionsParquet, generateParquet } from "../duckdb/export";
 import { queryAllDistributions, queryResources } from "../duckdb/queries";
+import { databaseService } from "../services/DatabaseService";
 
 type DirectoryHandleLike = any;
 
@@ -9,6 +10,7 @@ export interface PublishToRepoResult {
   publicDirPath: string;
   resourceFileName: string;
   distributionsFileName: string;
+  duckdbFileName?: string;
 }
 
 async function writeBinaryFile(
@@ -33,10 +35,12 @@ export async function publishCurrentDataToRepoRoot(
   const publicDir = await webDir.getDirectoryHandle("public", { create: true });
   const resourceFileName = "resources.parquet";
   const distributionsFileName = "resource_distributions.parquet";
+  const duckdbFileName = "records.duckdb";
 
-  const [resourceParquet, distributionsParquet] = await Promise.all([
+  const [resourceParquet, distributionsParquet, duckdbBlob] = await Promise.all([
     generateParquet(resources),
     generateDistributionsParquet(),
+    databaseService.exportDbBlob(),
   ]);
 
   if (!resourceParquet) {
@@ -49,11 +53,17 @@ export async function publishCurrentDataToRepoRoot(
   await writeBinaryFile(publicDir, resourceFileName, resourceParquet);
   await writeBinaryFile(publicDir, distributionsFileName, distributionsParquet);
 
+  if (duckdbBlob) {
+    const duckdbArray = new Uint8Array(await duckdbBlob.arrayBuffer());
+    await writeBinaryFile(publicDir, duckdbFileName, duckdbArray);
+  }
+
   return {
     resourceCount: resources.length,
     distributionCount: distributions.length,
     publicDirPath: `${webDir.name || "web"}/${publicDir.name || "public"}`,
     resourceFileName,
     distributionsFileName,
+    duckdbFileName: duckdbBlob ? duckdbFileName : undefined,
   };
 }

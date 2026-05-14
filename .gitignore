@@ -55,6 +55,7 @@ records.duckdb
 .env
 .env.*
 !.env.example
+web/local-enrichment.config.json
 
 # Coverage
 web/coverage/*

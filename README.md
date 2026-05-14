@@ -13,6 +13,7 @@ Built with **React**, **Vite**, **DuckDB-WASM**, **Google Auth**, and **GitHub R
 *   **Faceted Search & Discovery**: Powerful faceted search UI (similar to GeoBlacklight) for exploring your metadata collection, powered by SQL `GROUP BY` and `ILIKE` logic.
 *   **Interactive Mapping**: Integrated Leaflet maps to visual bounding boxes (`dcat_bbox`) and spatial footprints.
 *   **Data Ingestion**: Import data from CSV or JSON sources, with automatic validation against the Aardvark schema constants.
+*   **AI Enrichment Workbench**: Configure local S3-compatible storage and OpenAI profiles, inventory source imagery, run stored prompts, review responses, and publish Aardvark drafts.
 
 ## 🛠️ Architecture
 
@@ -70,6 +71,10 @@ npm run coverage
 2.  **Ingest**: The app loads these JSONs into `records.duckdb` (client-side).
 3.  **Edit/Search**: Use the dashboard to filter, search, and edit records.
 4.  **Sync**: (In Progress) Edits are committed back to your GitHub repository as new JSON versions.
+
+## 🧠 Enrichment Workflow
+
+The administrator enrichment workbench uses a local proxy for private S3-compatible storage access and OpenAI calls. See [docs/enrichment-workbench.md](docs/enrichment-workbench.md) for setup and workflow details.
 
 ## 🤝 Contributing
 

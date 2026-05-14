@@ -4,7 +4,7 @@ import { upsertResource, parseCentroidForH3 } from "./mutations";
 import { Resource, SCALAR_FIELDS, REPEATABLE_STRING_FIELDS, CSV_HEADER_MAPPING, REFERENCE_URI_MAPPING, Distribution } from "../aardvark/model";
 import * as duckdb from "@duckdb/duckdb-wasm";
 import { latLngToCell } from "h3-js";
-import { H3_RES_COLUMNS } from "./schema";
+import { ENRICHMENT_TABLES, H3_RES_COLUMNS } from "./schema";
 import { formatCentroid, getCentroidFromGeometry } from "../ui/resource/viewerConfig";
 
 export async function importCsv(file: File): Promise<{ success: boolean, message: string, count?: number }> {
@@ -474,6 +474,18 @@ export async function importDuckDbFile(file: File): Promise<{ success: boolean, 
             try {
                 await conn.query(`INSERT INTO static_maps SELECT * FROM ${alias}.static_maps`);
             } catch { /* ignore */ }
+
+            try {
+                await conn.query("DELETE FROM resources_image_service");
+                await conn.query(`INSERT INTO resources_image_service SELECT * FROM ${alias}.resources_image_service`);
+            } catch { /* ignore */ }
+
+            for (const table of ENRICHMENT_TABLES) {
+                try {
+                    await conn.query(`DELETE FROM ${table}`);
+                    await conn.query(`INSERT INTO ${table} SELECT * FROM ${alias}.${table}`);
+                } catch { /* ignore older snapshots without enrichment tables */ }
+            }
 
             await conn.query("COMMIT");
         } catch (txErr) {

@@ -6,6 +6,7 @@ export * from "./import";
 export * from "./export";
 export * from "./lifecycle";
 export * from "./backfill";
+export * from "./enrichments";
 
 // Legacy or missing types
 export interface ValidationIssue {

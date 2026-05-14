@@ -135,9 +135,15 @@ export const ImportPage: React.FC<ImportPageProps> = ({ resourceCount = 0, onImp
 
         try {
             setLoading(true);
-            setStatus("Writing current catalog into web/public/resources.parquet and web/public/resource_distributions.parquet...");
+            setStatus("Writing current catalog into web/public/resources.parquet, web/public/resource_distributions.parquet, and web/public/records.duckdb...");
             const result = await publishCurrentDataToRepoRoot(repoRootHandle);
-            const readyMessage = `Publish ready. Wrote ${result.resourceCount} records into ${result.publicDirPath}/${result.resourceFileName} and ${result.distributionCount} distributions into ${result.publicDirPath}/${result.distributionsFileName}. Commit and push those files so everyone sees the same dataset on GitHub Pages.`;
+            const extraDuckdb = result.duckdbFileName
+                ? ` and snapshot ${result.publicDirPath}/${result.duckdbFileName}`
+                : "";
+            const readyMessage =
+                `Publish ready. Wrote ${result.resourceCount} records into ${result.publicDirPath}/${result.resourceFileName}` +
+                ` and ${result.distributionCount} distributions into ${result.publicDirPath}/${result.distributionsFileName}${extraDuckdb}. ` +
+                `Commit and push those files so everyone sees the same dataset on GitHub Pages.`;
             setStatus(readyMessage);
             window.alert(readyMessage);
         } catch (err: any) {
@@ -257,10 +263,10 @@ export const ImportPage: React.FC<ImportPageProps> = ({ resourceCount = 0, onImp
             <div className="bg-white dark:bg-slate-900 rounded-lg border border-gray-200 dark:border-slate-800 p-6 shadow-sm">
                 <h2 className="text-lg font-semibold mb-4 text-slate-900 dark:text-slate-200">3. Publish Workflow</h2>
                 <p className="text-slate-500 dark:text-slate-400 mb-6 text-sm">
-                    Choose your local repository root and write the current dataset into <code>web/public/resources.parquet</code>
-                    and <code>web/public/resource_distributions.parquet</code>.
+                    Choose your local repository root and write the current dataset into <code>web/public/resources.parquet</code>,
+                    <code>web/public/resource_distributions.parquet</code>, and a DuckDB snapshot at <code>web/public/records.duckdb</code>.
                     After that, all you need to do is commit and push those files. GitHub Pages will rebuild
-                    the site with those published Parquet artifacts.
+                    the site with those published artifacts.
                 </p>
 
                 <div className="space-y-4">

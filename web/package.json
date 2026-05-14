@@ -7,6 +7,7 @@
   },
   "scripts": {
     "build:db": "node ./scripts/build-db.cjs",
+    "proxy": "node ./proxy/enrichment-proxy.mjs",
     "dev": "npm run build:db && vite",
     "build": "npm run build:db && vite build",
     "preview": "vite preview",

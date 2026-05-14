@@ -13,6 +13,7 @@ export const INDEXEDDB_NAME = "aardvark-duckdb";
 export const INDEXEDDB_STORE = "database";
 export const INDEXEDDB_RECORDS_STORE = "records";
 export const SNAPSHOT_KEY = "records.snapshot.json";
+export const ENRICHMENT_SNAPSHOT_KEY = "enrichments.snapshot.json";
 const INDEXEDDB_VERSION = 2;
 export const DUCKDB_RESTORE_PROGRESS_EVENT = "duckdb-restore-progress";
 export const DUCKDB_RESTORED_EVENT = "duckdb-restored";
@@ -67,26 +68,34 @@ async function startBackgroundRestore(db: duckdb.AsyncDuckDB): Promise<void> {
             }
         }
 
-        if (records.length === 0) {
-            updateRestoreStatus({ inProgress: false, processed: 0, total: 0 });
-            notifyRestoreFinished();
-            return;
-        }
-
-        console.log(`[IndexedDB] Restoring ${records.length} resources from IndexedDB records...`);
-        updateRestoreStatus({ inProgress: true, processed: 0, total: records.length });
-
         const restoreConn = await db.connect();
         try {
-            const { replaceAllJsonData } = await import("./import");
-            await replaceAllJsonData(records, {
-                skipSave: true,
-                connOverride: restoreConn,
-                onProgress: (processed, total) => updateRestoreStatus({ inProgress: true, processed, total }),
-                // IndexedDB persistence currently stores resources only. Preserve any distributions
-                // loaded from Parquet (or created via other means) so we don't wipe them out.
-                preserveDistributions: true,
-            });
+            if (records.length > 0) {
+                console.log(`[IndexedDB] Restoring ${records.length} resources from IndexedDB records...`);
+                updateRestoreStatus({ inProgress: true, processed: 0, total: records.length });
+                const { replaceAllJsonData } = await import("./import");
+                await replaceAllJsonData(records, {
+                    skipSave: true,
+                    connOverride: restoreConn,
+                    onProgress: (processed, total) => updateRestoreStatus({ inProgress: true, processed, total }),
+                    // IndexedDB persistence currently stores resources only. Preserve any distributions
+                    // loaded from Parquet (or created via other means) so we don't wipe them out.
+                    preserveDistributions: true,
+                });
+            } else {
+                updateRestoreStatus({ inProgress: false, processed: 0, total: 0 });
+            }
+
+            const enrichmentSnapshot = await loadEnrichmentSnapshotFromIndexedDB();
+            if (enrichmentSnapshot) {
+                const { restoreEnrichmentSnapshot, ensureDefaultEnrichmentData } = await import("./enrichments");
+                await restoreEnrichmentSnapshot(enrichmentSnapshot, restoreConn);
+                await ensureDefaultEnrichmentData(restoreConn);
+                console.log("[IndexedDB] Restored enrichment workbench snapshot.");
+            } else {
+                const { ensureDefaultEnrichmentData } = await import("./enrichments");
+                await ensureDefaultEnrichmentData(restoreConn);
+            }
         } finally {
             try {
                 await restoreConn.close();
@@ -422,6 +431,64 @@ export async function saveSnapshotToIndexedDB(snapshot: AardvarkJson[]): Promise
             const put = tx.objectStore(INDEXEDDB_STORE).put(JSON.stringify(snapshot), SNAPSHOT_KEY);
             put.onsuccess = () => {
                 console.log(`[IndexedDB] Snapshot saved (${snapshot.length} resources).`);
+                resolve();
+            };
+            put.onerror = () => reject(put.error);
+        };
+        req.onerror = () => reject(req.error);
+    });
+}
+
+export async function loadEnrichmentSnapshotFromIndexedDB(): Promise<any | null> {
+    return new Promise((resolve) => {
+        const req = indexedDB.open(INDEXEDDB_NAME, INDEXEDDB_VERSION);
+        req.onupgradeneeded = (e: any) => {
+            const db = e.target.result as IDBDatabase;
+            if (!db.objectStoreNames.contains(INDEXEDDB_STORE)) db.createObjectStore(INDEXEDDB_STORE);
+            if (!db.objectStoreNames.contains(INDEXEDDB_RECORDS_STORE)) db.createObjectStore(INDEXEDDB_RECORDS_STORE, { keyPath: "id" });
+        };
+        req.onsuccess = (e: any) => {
+            const db = e.target.result;
+            const tx = db.transaction([INDEXEDDB_STORE], "readonly");
+            const get = tx.objectStore(INDEXEDDB_STORE).get(ENRICHMENT_SNAPSHOT_KEY);
+            get.onsuccess = () => {
+                if (typeof get.result !== "string") {
+                    resolve(null);
+                    return;
+                }
+                try {
+                    resolve(JSON.parse(get.result));
+                } catch (error) {
+                    console.warn("[IndexedDB] Failed to parse enrichment snapshot", error);
+                    resolve(null);
+                }
+            };
+            get.onerror = () => {
+                console.warn("[IndexedDB] Failed to load enrichment snapshot", get.error);
+                resolve(null);
+            };
+        };
+        req.onerror = () => {
+            console.warn("[IndexedDB] Failed to open DB for enrichment snapshot", req.error);
+            resolve(null);
+        };
+    });
+}
+
+export async function saveEnrichmentSnapshotToIndexedDB(snapshot: unknown): Promise<void> {
+    return new Promise((resolve, reject) => {
+        const req = indexedDB.open(INDEXEDDB_NAME, INDEXEDDB_VERSION);
+        req.onupgradeneeded = (e: any) => {
+            const db = e.target.result as IDBDatabase;
+            if (!db.objectStoreNames.contains(INDEXEDDB_STORE)) db.createObjectStore(INDEXEDDB_STORE);
+            if (!db.objectStoreNames.contains(INDEXEDDB_RECORDS_STORE)) db.createObjectStore(INDEXEDDB_RECORDS_STORE, { keyPath: "id" });
+        };
+        req.onsuccess = (e: any) => {
+            const db = e.target.result;
+            const tx = db.transaction([INDEXEDDB_STORE], "readwrite");
+            const put = tx.objectStore(INDEXEDDB_STORE).put(JSON.stringify(snapshot), ENRICHMENT_SNAPSHOT_KEY);
+            put.onsuccess = () => {
+                console.log("[IndexedDB] Enrichment snapshot saved.");
                 resolve();
             };
             put.onerror = () => reject(put.error);
