@@ -14,6 +14,7 @@ import { MapFacet } from "./MapFacet";
 import { TimelineFacet } from "./TimelineFacet";
 import { ErrorBoundary } from "./ErrorBoundary";
 import { FacetModal } from "./FacetModal";
+import { displayAardvarkValue } from "../utils/aardvarkDisplay";
 
 interface DashboardProps {
     onEdit: (id: string) => void;
@@ -430,7 +431,7 @@ const FacetSection: React.FC<{
                                             : "text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200"
                                         }`}
                                 >
-                                    <span className="flex-1 truncate" title={item.value}>{item.value || "<Empty>"}</span>
+                                    <span className="flex-1 truncate" title={item.value}>{item.value ? displayAardvarkValue(field, item.value) : "<Empty>"}</span>
                                     <span className="ml-2 text-xs text-slate-400 dark:text-slate-600 font-mono flex-shrink-0">{item.count}</span>
                                 </button>
 

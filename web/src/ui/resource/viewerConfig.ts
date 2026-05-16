@@ -1,10 +1,60 @@
-import { Resource } from '../../aardvark/model';
+import { Distribution, Resource } from '../../aardvark/model';
 import { geoJsonToBounds } from '../viewers/maplibreBounds';
 
 export interface ViewerConfig {
     protocol: string;
     endpoint: string;
     geometry?: string; // GeoJSON string
+    textExtractionEndpoint?: string;
+}
+
+function referenceUrl(refs: Record<string, unknown>, keys: string[]): string | undefined {
+    const extract = (value: unknown): string | undefined => {
+        if (typeof value === "string" && value.trim()) return value;
+        if (Array.isArray(value)) {
+            for (const item of value) {
+                const found = extract(item);
+                if (found) return found;
+            }
+        }
+        if (value && typeof value === "object") {
+            const candidate = value as Record<string, unknown>;
+            return extract(candidate.url) || extract(candidate["@id"]) || extract(candidate.id);
+        }
+        return undefined;
+    };
+
+    for (const key of keys) {
+        const found = extract(refs[key]);
+        if (found) return found;
+    }
+    return undefined;
+}
+
+function refsFromDistributions(distributions: Distribution[]): Record<string, unknown> {
+    const refs: Record<string, unknown> = {};
+    for (const distribution of distributions) {
+        const key = String(distribution.relation_key || "").trim();
+        const url = String(distribution.url || "").trim();
+        if (!key || !url) continue;
+
+        const existing = refs[key];
+        if (existing === undefined) {
+            refs[key] = url;
+        } else if (Array.isArray(existing)) {
+            existing.push(url);
+        } else {
+            refs[key] = [existing, url];
+        }
+    }
+    return refs;
+}
+
+function extractionEndpointFromIiif(iiifUrl: string | undefined): string | undefined {
+    if (!iiifUrl) return undefined;
+    const normalized = iiifUrl.replace(/\/+$/, "");
+    const uploadMatch = normalized.match(/^(.*\/uploads\/[^/]+)\/iiif(?:\/info\.json)?$/i);
+    return uploadMatch ? `${uploadMatch[1]}/enrichment_response.json` : undefined;
 }
 
 // Helper: Extract Geometry (BBox to Polygon or Centroid? GBL usually expects BBox as Polygon)
@@ -39,7 +89,7 @@ export function getViewerGeometry(resource: Resource): string | undefined {
         try {
             JSON.parse(resource.locn_geometry);
             return resource.locn_geometry;
-        } catch (e) {
+        } catch {
             // Not native JSON. Is it ENVELOPE?
             const parsed = parseEnvelope(resource.locn_geometry);
             if (parsed) return parsed;
@@ -70,76 +120,114 @@ export function getCentroidFromGeometry(resource: Resource): [number, number] | 
     return [(minX + maxX) / 2, (minY + maxY) / 2];
 }
 
-export function detectViewerConfig(resource: Resource): ViewerConfig | null {
-    if (!resource.dct_references_s) return null;
+export function detectViewerConfig(resource: Resource, distributions: Distribution[] = []): ViewerConfig | null {
+    let refs: Record<string, unknown> = refsFromDistributions(distributions);
 
-    let refs: Record<string, string> = {};
-    try {
-        refs = JSON.parse(resource.dct_references_s);
-    } catch (e) {
-        console.warn("ResourceViewer: Failed to parse dct_references_s", e);
-        return null;
+    if (resource.dct_references_s) {
+        try {
+            refs = {
+                ...refs,
+                ...JSON.parse(resource.dct_references_s),
+            };
+        } catch (e) {
+            console.warn("ResourceViewer: Failed to parse dct_references_s", e);
+        }
     }
+
+    if (Object.keys(refs).length === 0) return null;
+
+    const textExtractionEndpoint = referenceUrl(refs, [
+        "https://opengeometadata.org/reference/enrichment-response",
+        "http://opengeometadata.org/reference/enrichment-response",
+        "enrichment_response",
+        "extraction",
+    ]);
 
     // Priority Logic
     // IIIF Manifest
-    if (refs["http://iiif.io/api/presentation#manifest"] || refs["iiif_manifest"]) {
+    const iiifManifest = referenceUrl(refs, ["http://iiif.io/api/presentation#manifest", "https://iiif.io/api/presentation#manifest", "iiif_manifest"]);
+    if (iiifManifest) {
         return {
             protocol: "iiif_manifest",
-            endpoint: refs["http://iiif.io/api/presentation#manifest"] || refs["iiif_manifest"]
+            endpoint: iiifManifest,
+            ...(textExtractionEndpoint ? { textExtractionEndpoint } : {}),
+        };
+    }
+
+    // IIIF Image API service. The S3 upload pipeline creates Level 0 info.json
+    // pyramids, not IIIF Presentation manifests, so route these to the image viewer.
+    const iiifImage = referenceUrl(refs, ["http://iiif.io/api/image", "https://iiif.io/api/image", "iiif"]);
+    if (iiifImage) {
+        const endpoint = iiifImage.endsWith("/info.json") ? iiifImage : `${iiifImage.replace(/\/+$/, "")}/info.json`;
+        return {
+            protocol: "iiif_image",
+            endpoint,
+            textExtractionEndpoint: textExtractionEndpoint || extractionEndpointFromIiif(endpoint),
         };
     }
 
     // OGC WMS
-    if (refs["http://www.opengis.net/def/serviceType/ogc/wms"] || refs["wms"]) {
+    const wms = referenceUrl(refs, ["http://www.opengis.net/def/serviceType/ogc/wms", "wms"]);
+    if (wms) {
         return {
             protocol: "wms",
-            endpoint: refs["http://www.opengis.net/def/serviceType/ogc/wms"] || refs["wms"],
-            geometry: getViewerGeometry(resource) // WMS often needs bounds/geom to focus
+            endpoint: wms,
+            geometry: getViewerGeometry(resource), // WMS often needs bounds/geom to focus
+            ...(textExtractionEndpoint ? { textExtractionEndpoint } : {}),
         };
     }
     // XYZ Tiles
-    if (refs["https://wiki.openstreetmap.org/wiki/Slippy_map_tilenames"] || refs["xyz_tiles"]) {
+    const xyz = referenceUrl(refs, ["https://wiki.openstreetmap.org/wiki/Slippy_map_tilenames", "xyz_tiles"]);
+    if (xyz) {
         return {
             protocol: "xyz",
-            endpoint: refs["https://wiki.openstreetmap.org/wiki/Slippy_map_tilenames"] || refs["xyz_tiles"],
-            geometry: getViewerGeometry(resource)
+            endpoint: xyz,
+            geometry: getViewerGeometry(resource),
+            ...(textExtractionEndpoint ? { textExtractionEndpoint } : {}),
         };
     }
 
     // Esri Feature Layer
-    if (refs["urn:x-esri:serviceType:ArcGIS#FeatureLayer"] || refs["arcgis_feature_layer"]) {
+    const arcgisFeatureLayer = referenceUrl(refs, ["urn:x-esri:serviceType:ArcGIS#FeatureLayer", "arcgis_feature_layer"]);
+    if (arcgisFeatureLayer) {
         return {
             protocol: "arcgis_feature_layer",
-            endpoint: refs["urn:x-esri:serviceType:ArcGIS#FeatureLayer"] || refs["arcgis_feature_layer"],
-            geometry: getViewerGeometry(resource)
+            endpoint: arcgisFeatureLayer,
+            geometry: getViewerGeometry(resource),
+            ...(textExtractionEndpoint ? { textExtractionEndpoint } : {}),
         };
     }
 
     // Esri Tiled Map Layer
-    if (refs["urn:x-esri:serviceType:ArcGIS#TiledMapLayer"] || refs["arcgis_tiled_map_layer"]) {
+    const arcgisTiledMapLayer = referenceUrl(refs, ["urn:x-esri:serviceType:ArcGIS#TiledMapLayer", "arcgis_tiled_map_layer"]);
+    if (arcgisTiledMapLayer) {
         return {
             protocol: "arcgis_tiled_map_layer",
-            endpoint: refs["urn:x-esri:serviceType:ArcGIS#TiledMapLayer"] || refs["arcgis_tiled_map_layer"],
-            geometry: getViewerGeometry(resource)
+            endpoint: arcgisTiledMapLayer,
+            geometry: getViewerGeometry(resource),
+            ...(textExtractionEndpoint ? { textExtractionEndpoint } : {}),
         };
     }
 
     // Esri Dynamic Map Layer
-    if (refs["urn:x-esri:serviceType:ArcGIS#DynamicMapLayer"] || refs["arcgis_dynamic_map_layer"]) {
+    const arcgisDynamicMapLayer = referenceUrl(refs, ["urn:x-esri:serviceType:ArcGIS#DynamicMapLayer", "arcgis_dynamic_map_layer"]);
+    if (arcgisDynamicMapLayer) {
         return {
             protocol: "arcgis_dynamic_map_layer",
-            endpoint: refs["urn:x-esri:serviceType:ArcGIS#DynamicMapLayer"] || refs["arcgis_dynamic_map_layer"],
-            geometry: getViewerGeometry(resource)
+            endpoint: arcgisDynamicMapLayer,
+            geometry: getViewerGeometry(resource),
+            ...(textExtractionEndpoint ? { textExtractionEndpoint } : {}),
         };
     }
 
     // Esri Image Map Layer
-    if (refs["urn:x-esri:serviceType:ArcGIS#ImageMapLayer"] || refs["arcgis_image_map_layer"]) {
+    const arcgisImageMapLayer = referenceUrl(refs, ["urn:x-esri:serviceType:ArcGIS#ImageMapLayer", "arcgis_image_map_layer"]);
+    if (arcgisImageMapLayer) {
         return {
             protocol: "arcgis_image_map_layer",
-            endpoint: refs["urn:x-esri:serviceType:ArcGIS#ImageMapLayer"] || refs["arcgis_image_map_layer"],
-            geometry: getViewerGeometry(resource)
+            endpoint: arcgisImageMapLayer,
+            geometry: getViewerGeometry(resource),
+            ...(textExtractionEndpoint ? { textExtractionEndpoint } : {}),
         };
     }
 

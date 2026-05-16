@@ -63,6 +63,28 @@ describe('Aardvark Mapping Logic', () => {
             expect(res.gbl_suppressed_b).toBe(true);
         });
 
+        it('normalizes legacy stringified array artifacts in repeatable fields', () => {
+            const row = {
+                id: 'test-legacy-arrays',
+                dct_title_s: 'Legacy Arrays',
+                gbl_resourceClass_sm: ['Imagery', '[Imagery]', '[Maps,Datasets]'],
+                dct_language_sm: ['eng', '[eng]'],
+                dct_alternative_sm: ['[]'],
+                dct_subject_sm: ['Transportation', 'Railroads', 'England Maps', '[Transportation,Railroads,England Maps]'],
+                dct_description_sm: ['Description', '[Description]'],
+                gbl_dateRange_drsim: ['[1912 TO 1912]', '[[1912 TO 1912]]'],
+            };
+
+            const res = resourceFromRow(row, []);
+
+            expect(res.gbl_resourceClass_sm).toEqual(['Imagery', 'Maps', 'Datasets']);
+            expect(res.dct_language_sm).toEqual(['eng']);
+            expect(res.dct_alternative_sm).toEqual([]);
+            expect(res.dct_subject_sm).toEqual(['Transportation', 'Railroads', 'England Maps']);
+            expect(res.dct_description_sm).toEqual(['Description']);
+            expect(res.gbl_dateRange_drsim).toEqual(['[1912 TO 1912]']);
+        });
+
         it('integrates distributions', () => {
             const row = { id: 'test-3', dct_title_s: 'With Dist' };
             const dists: Distribution[] = [
@@ -91,6 +113,26 @@ describe('Aardvark Mapping Logic', () => {
             expect(dists[0].relation_key).toBe('http://schema.org/url');
         });
 
+        it('parses object references with labels', () => {
+            const json = {
+                id: 'test-5',
+                dct_references_s: JSON.stringify({
+                    "http://iiif.io/api/image": [
+                        { url: "http://example.com/iiif/info.json", label: "IIIF Image API Level 0" }
+                    ]
+                })
+            };
+            const dists = extractDistributionsFromJson(json);
+            expect(dists).toEqual([
+                {
+                    resource_id: 'test-5',
+                    relation_key: 'http://iiif.io/api/image',
+                    url: 'http://example.com/iiif/info.json',
+                    label: 'IIIF Image API Level 0',
+                }
+            ]);
+        });
+
         it('returns empty for invalid JSON', () => {
             const dists = extractDistributionsFromJson({ id: 't', dct_references_s: '{broken' });
             expect(dists).toEqual([]);
@@ -106,8 +148,7 @@ describe('Aardvark Mapping Logic', () => {
             expect(json).toContain('"k1": "u1"');
         });
 
-        // SKIPPED: Mystery failure in environment where property seems lost
-        it.skip('handles complex distributions (labels)', () => {
+        it('handles complex distributions (labels)', () => {
             const dists: Distribution[] = [
                 { resource_id: '1', relation_key: 'k1', url: 'u1', label: 'Label' }
             ];

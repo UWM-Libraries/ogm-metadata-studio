@@ -1,5 +1,6 @@
 
 import React from "react";
+import { displayAardvarkValue } from "../utils/aardvarkDisplay";
 
 
 interface ActiveFilterBarProps {
@@ -93,7 +94,7 @@ export const ActiveFilterBar: React.FC<ActiveFilterBarProps> = ({
                     >
                         {isExclude && <span className="font-bold mr-0.5">NOT</span>}
                         <span className="opacity-70">{getLabel(realField)}:</span>
-                        {val}
+                        {displayAardvarkValue(realField, val)}
                         <button
                             onClick={() => onRemoveFacet(field, val)}
                             className={`ml-1 rounded-full p-0.5 focus:outline-none ${hoverClasses}`}

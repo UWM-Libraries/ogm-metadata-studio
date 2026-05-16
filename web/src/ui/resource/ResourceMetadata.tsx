@@ -1,6 +1,7 @@
 import React from 'react';
 import { Resource } from '../../aardvark/model';
 import { Link } from '../Link';
+import { displayAardvarkValue } from '../../utils/aardvarkDisplay';
 
 const FACETABLE_FIELDS = [
     'dct_subject_sm',
@@ -44,11 +45,12 @@ export const ResourceMetadata: React.FC<ResourceMetadataProps> = ({ resource }) 
                                                 <Link
                                                     href={`/?include_filters[${key}][]=${encodeURIComponent(val)}`}
                                                     className="text-indigo-600 dark:text-indigo-400 hover:underline"
+                                                    title={val}
                                                 >
-                                                    {val}
+                                                    {displayAardvarkValue(key, val)}
                                                 </Link>
                                             ) : (
-                                                val
+                                                displayAardvarkValue(key, val)
                                             )}
                                         </React.Fragment>
                                     ));

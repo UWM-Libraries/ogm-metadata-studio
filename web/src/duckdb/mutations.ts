@@ -1,6 +1,6 @@
-import { getDuckDbContext } from "./dbInit";
-import { saveDb } from "./lifecycle";
-import { Resource, Distribution, SCALAR_FIELDS, REPEATABLE_STRING_FIELDS } from "../aardvark/model";
+import { getDuckDbContext, saveResourceDeleteOverlayToIndexedDB, saveResourceOverlayToIndexedDB } from "./dbInit";
+import { Resource, Distribution, SCALAR_FIELDS, REPEATABLE_STRING_FIELDS, resourceToJson } from "../aardvark/model";
+import { buildDctReferencesS } from "../aardvark/mapping";
 import { fetchResourcesByIds } from "./queries";
 import embeddingWorkerUrl from "../workers/embedding.worker?worker&url";
 import { getCentroidFromGeometry, formatCentroid } from "../ui/resource/viewerConfig";
@@ -86,7 +86,7 @@ export async function deleteResource(id: string): Promise<void> {
     await conn.query(`DELETE FROM distributions WHERE resource_id = '${safeId}'`);
     await conn.query(`DELETE FROM search_index WHERE id = '${safeId}'`);
 
-    await saveDb();
+    await saveResourceDeleteOverlayToIndexedDB(id);
 }
 
 export async function upsertResource(resource: Resource, distributions: Distribution[] = [], options: { skipSave?: boolean } = {}): Promise<void> {
@@ -208,7 +208,10 @@ export async function upsertResource(resource: Resource, distributions: Distribu
     await conn.query(`INSERT INTO search_index (id, content) VALUES ('${safeId}', '${content}')`);
 
     if (!options.skipSave) {
-        await saveDb();
+        const record = resourceToJson(resource);
+        const references = buildDctReferencesS(distributions);
+        if (references) record.dct_references_s = references;
+        await saveResourceOverlayToIndexedDB(record);
     }
 }
 

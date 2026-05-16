@@ -2,9 +2,10 @@ import { getDuckDbContext } from "./dbInit";
 import { saveDb } from "./lifecycle";
 import { upsertResource, parseCentroidForH3 } from "./mutations";
 import { Resource, SCALAR_FIELDS, REPEATABLE_STRING_FIELDS, CSV_HEADER_MAPPING, REFERENCE_URI_MAPPING, Distribution } from "../aardvark/model";
+import { normalizeRepeatableStringValues } from "../aardvark/mapping";
 import * as duckdb from "@duckdb/duckdb-wasm";
 import { latLngToCell } from "h3-js";
-import { H3_RES_COLUMNS } from "./schema";
+import { ENRICHMENT_TABLES, H3_RES_COLUMNS } from "./schema";
 import { formatCentroid, getCentroidFromGeometry } from "../ui/resource/viewerConfig";
 
 export async function importCsv(file: File): Promise<{ success: boolean, message: string, count?: number }> {
@@ -395,8 +396,12 @@ function extractDistributions(record: any, uriToKey: Map<string, string>): Distr
                             if ('url' in item) {
                                 finalUrl = String((item as any).url);
                                 if ('label' in item) label = String((item as any).label);
+                            } else if ('@id' in item) {
+                                finalUrl = String((item as any)['@id']);
+                            } else if ('id' in item) {
+                                finalUrl = String((item as any).id);
                             } else {
-                                finalUrl = JSON.stringify(item);
+                                finalUrl = "";
                             }
                         } else {
                             finalUrl = String(item);
@@ -427,22 +432,8 @@ function prepareResource(record: any): Resource {
         ...record
     };
 
-    const listFields = [
-        "dct_alternative_sm", "dct_description_sm", "dct_language_sm",
-        "gbl_displayNote_sm", "dct_creator_sm", "dct_publisher_sm",
-        "gbl_resourceType_sm", "dct_subject_sm", "dcat_theme_sm",
-        "dcat_keyword_sm", "dct_temporal_sm", "gbl_dateRange_drsim",
-        "gbl_indexYear_im", "dct_spatial_sm", "dct_identifier_sm",
-        "dct_rights_sm", "dct_rightsHolder_sm", "dct_license_sm",
-        "pcdm_memberOf_sm", "dct_isPartOf_sm", "dct_source_sm",
-        "dct_isVersionOf_sm", "dct_replaces_sm", "dct_isReplacedBy_sm",
-        "dct_relation_sm"
-    ];
-
-    for (const field of listFields) {
-        if (res[field as keyof Resource] !== undefined && !Array.isArray(res[field as keyof Resource])) {
-            (res as any)[field] = [res[field as keyof Resource]];
-        }
+    for (const field of REPEATABLE_STRING_FIELDS) {
+        (res as any)[field] = normalizeRepeatableStringValues(field, res[field as keyof Resource]);
     }
     return res;
 }
@@ -474,6 +465,18 @@ export async function importDuckDbFile(file: File): Promise<{ success: boolean, 
             try {
                 await conn.query(`INSERT INTO static_maps SELECT * FROM ${alias}.static_maps`);
             } catch { /* ignore */ }
+
+            try {
+                await conn.query("DELETE FROM resources_image_service");
+                await conn.query(`INSERT INTO resources_image_service SELECT * FROM ${alias}.resources_image_service`);
+            } catch { /* ignore */ }
+
+            for (const table of ENRICHMENT_TABLES) {
+                try {
+                    await conn.query(`DELETE FROM ${table}`);
+                    await conn.query(`INSERT INTO ${table} SELECT * FROM ${alias}.${table}`);
+                } catch { /* ignore older snapshots without enrichment tables */ }
+            }
 
             await conn.query("COMMIT");
         } catch (txErr) {

@@ -12,16 +12,17 @@ import { AutosuggestInput } from "./AutosuggestInput";
 import { ThemeToggle } from "./ThemeToggle";
 import { ResourceShow } from "./ResourceShow";
 import { ResourceAdmin } from "./ResourceAdmin";
+import { EnrichmentWorkbench } from "./enrichments/EnrichmentWorkbench";
 import { ErrorBoundary } from "./shared/ErrorBoundary";
 import { useToast } from "./shared/ToastContext";
 import { GoogleAuthButton } from "./GoogleAuthButton";
 import { useAuth } from "../auth/useAuth";
 import { withBasePath } from "../utils/basePath";
-import { DUCKDB_RESTORED_EVENT, DUCKDB_RESTORE_PROGRESS_EVENT, getDuckDbRestoreStatus } from "../duckdb/dbInit";
+import { DUCKDB_RESTORED_EVENT, DUCKDB_RESTORE_PROGRESS_EVENT, getDuckDbRestoreStatus, waitForDuckDbRestore } from "../duckdb/dbInit";
 
 
 // URL State
-type ViewType = "dashboard" | "admin" | "edit" | "create" | "import" | "distributions" | "list" | "gallery" | "map" | "resource" | "resource_admin";
+type ViewType = "dashboard" | "admin" | "edit" | "create" | "import" | "distributions" | "enrichments" | "list" | "gallery" | "map" | "resource" | "resource_admin";
 interface AppState {
   view: ViewType;
   id?: string;
@@ -94,9 +95,9 @@ export const App: React.FC = () => {
   const { view, id: selectedId } = urlState;
 
   // When not signed in on a CRUD view, show the safe view (stable tree = no hook order warning)
-  const isCrudView = view === "edit" || view === "create" || view === "resource_admin";
+  const isCrudView = view === "edit" || view === "create" || view === "resource_admin" || view === "enrichments";
   const displayView = isCrudView && !isSignedIn
-    ? (view === "create" ? "dashboard" as const : "resource" as const)
+    ? ((view === "edit" || view === "resource_admin") && selectedId ? "resource" as const : "dashboard" as const)
     : view;
   const displayId = selectedId;
 
@@ -211,7 +212,11 @@ export const App: React.FC = () => {
   useEffect(() => {
     const load = async () => {
       if (view === "edit" && selectedId && (!editing || editing.id !== selectedId)) {
-        const r = await queryResourceById(selectedId);
+        let r = await queryResourceById(selectedId);
+        if (!r) {
+          await waitForDuckDbRestore();
+          r = await queryResourceById(selectedId);
+        }
         if (r) {
           const d = await queryDistributionsForResource(selectedId);
           setEditing(r);
@@ -375,6 +380,15 @@ export const App: React.FC = () => {
             >
               Import / Export
             </button>
+            <button
+              type="button"
+              onClick={() => setUrlState({ view: "enrichments" })}
+              className={`rounded-md border px-2 py-1 text-[10px] transition-colors ${view === "enrichments"
+                ? "bg-emerald-50 dark:bg-emerald-900/30 border-emerald-200 dark:border-emerald-500/50 text-emerald-700 dark:text-emerald-300"
+                : "border-transparent text-slate-600 dark:text-slate-200 hover:bg-gray-100 dark:hover:bg-slate-800/70"}`}
+            >
+              Enrichments
+            </button>
             <div className="w-[1px] h-6 bg-gray-300 dark:bg-slate-800 mx-1"></div>
             <GoogleAuthButton />
             <ThemeToggle />
@@ -430,6 +444,18 @@ export const App: React.FC = () => {
                 {displayView === "distributions" && (
                   <div className="flex flex-col h-full">
                     <DistributionsList onEditResource={handleEditResource} />
+                  </div>
+                )}
+
+                {displayView === "enrichments" && isSignedIn && (
+                  <div className="flex flex-col h-full">
+                    <button
+                      onClick={() => setUrlState({ view: "dashboard" })}
+                      className="mb-4 self-start flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-white transition-colors"
+                    >
+                      ← Back to Dashboard
+                    </button>
+                    <EnrichmentWorkbench />
                   </div>
                 )}
 

@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 import { ResourceMetadata } from './ResourceMetadata';
 import { SimilarResourcesCarousel } from './SimilarResourcesCarousel';
@@ -11,6 +11,7 @@ describe('Resource Components Coverage', () => {
             dct_title_s: 'Test Title',
             dct_creator_sm: ['Creator 1', 'Creator 2'], // Facetable
             dct_description_sm: ['Description'], // Not facetable
+            dct_language_sm: ['eng'],
             gbl_resourceClass_sm: ['Map'], // Facetable
             dct_issued_s: '2020',
             _hidden: 'should not show'
@@ -26,6 +27,8 @@ describe('Resource Components Coverage', () => {
             // Facetable should be links
             const creatorLink = screen.getByText('Creator 1').closest('a');
             expect(creatorLink).toHaveAttribute('href', '/?include_filters[dct_creator_sm][]=Creator%201');
+            expect(screen.getByText('English')).toBeDefined();
+            expect(screen.queryByText('eng')).toBeNull();
 
             // Non-facetable should be text (Label 'Description' and value 'Description')
             const descElements = screen.getAllByText('Description');

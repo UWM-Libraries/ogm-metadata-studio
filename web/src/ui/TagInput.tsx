@@ -1,6 +1,7 @@
 import React from "react";
 import AsyncCreatableSelect from "react-select/async-creatable";
 import { getDistinctValues } from "../duckdb/duckdbClient";
+import { displayAardvarkValue } from "../utils/aardvarkDisplay";
 
 interface TagInputProps {
     value: string[];
@@ -23,7 +24,7 @@ export const TagInput: React.FC<TagInputProps> = ({
     const loadOptions = async (inputValue: string): Promise<Option[]> => {
         try {
             const values = await getDistinctValues(fieldName, inputValue);
-            return values.map((v) => ({ label: v, value: v }));
+            return values.map((v) => ({ label: displayAardvarkValue(fieldName, v), value: v }));
         } catch (err) {
             console.warn("Failed to load options for", fieldName, err);
             return [];
@@ -40,7 +41,7 @@ export const TagInput: React.FC<TagInputProps> = ({
         onChange(newValue.map((o) => o.value));
     };
 
-    const currentOptions: Option[] = value.map((v) => ({ label: v, value: v }));
+    const currentOptions: Option[] = value.map((v) => ({ label: displayAardvarkValue(fieldName, v), value: v }));
 
     return (
         <AsyncCreatableSelect
