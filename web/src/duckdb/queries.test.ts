@@ -61,6 +61,32 @@ describe('DuckDB Queries', () => {
             expect(res?.dct_subject_sm).toEqual(['Maps']);
         });
 
+        it('uses normalized multivalue rows instead of repeatable columns from resource rows', async () => {
+            mockConn.query
+                .mockResolvedValueOnce({
+                    toArray: () => [{
+                        id: 'res-1',
+                        dct_title_s: 'Title',
+                        gbl_resourceClass_sm: { toString: () => '[Maps]' }
+                    }]
+                })
+                .mockResolvedValueOnce({
+                    toArray: () => [
+                        { id: 'res-1', field: 'gbl_resourceClass_sm', val: 'Maps' },
+                        { id: 'res-1', field: 'gbl_resourceClass_sm', val: 'Maps' }
+                    ]
+                })
+                .mockResolvedValueOnce({ toArray: () => [] })
+                .mockResolvedValueOnce({ toArray: () => [] });
+
+            const res = await queries.queryResourceById('res-1');
+            const scalarSql = mockConn.query.mock.calls[0][0];
+
+            expect(scalarSql).not.toContain('SELECT *');
+            expect(scalarSql).not.toContain('gbl_resourceClass_sm');
+            expect(res?.gbl_resourceClass_sm).toEqual(['Maps']);
+        });
+
         it('returns null if not found', async () => {
             mockConn.query
                 .mockResolvedValueOnce({ toArray: () => [] })

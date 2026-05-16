@@ -97,7 +97,7 @@ export async function backfillCentroidAndH3(): Promise<{ centroidFilled: number;
         }
 
         if (centroidFilled > 0 || h3Filled > 0) {
-            await saveDb();
+            await saveDb({ resourcesDirty: false });
         }
     } catch (e) {
         console.warn("Backfill centroid/H3 failed", e);

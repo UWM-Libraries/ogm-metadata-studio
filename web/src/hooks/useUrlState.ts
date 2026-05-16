@@ -1,6 +1,14 @@
 import { useState, useCallback, useEffect } from 'react';
 import { stripBasePath, withBasePath } from '../utils/basePath';
 
+function stableStringify(value: unknown): string {
+    try {
+        return JSON.stringify(value);
+    } catch {
+        return String(value);
+    }
+}
+
 export function useUrlState<T extends Record<string, any>>(
     initialState: T,
     mapping: {
@@ -19,6 +27,7 @@ export function useUrlState<T extends Record<string, any>>(
     const updateState = useCallback((newState: T | ((prev: T) => T)) => {
         setState((prev) => {
             const next = typeof newState === 'function' ? (newState as any)(prev) : newState;
+            const stateChanged = stableStringify(prev) !== stableStringify(next);
 
             const currentParams = new URLSearchParams(window.location.search);
 
@@ -35,10 +44,14 @@ export function useUrlState<T extends Record<string, any>>(
 
             const currentPath = stripBasePath(window.location.pathname);
             const path = mapping.path ? mapping.path(next) : currentPath;
-            const newUrl = `${path}?${currentParams.toString()}`;
-            window.history.pushState({}, '', withBasePath(newUrl));
+            const query = currentParams.toString();
+            const newUrl = withBasePath(query ? `${path}?${query}` : path);
+            const currentUrl = `${window.location.pathname}${window.location.search}`;
+            if (newUrl !== currentUrl) {
+                window.history.pushState({}, '', newUrl);
+            }
 
-            return next;
+            return stateChanged ? next : prev;
         });
     }, [mapping]);
 
@@ -46,7 +59,8 @@ export function useUrlState<T extends Record<string, any>>(
     useEffect(() => {
         const onPopState = () => {
             const params = new URLSearchParams(window.location.search);
-            setState({ ...initialState, ...mapping.fromUrl(params, stripBasePath(window.location.pathname)) });
+            const next = { ...initialState, ...mapping.fromUrl(params, stripBasePath(window.location.pathname)) };
+            setState((prev) => stableStringify(prev) === stableStringify(next) ? prev : next);
         };
         window.addEventListener('popstate', onPopState);
         return () => window.removeEventListener('popstate', onPopState);

@@ -16,13 +16,63 @@ function pipeJoin(values: string[]): string {
   return cleaned.join("|");
 }
 
-function pipeSplit(value: string | undefined | null | any): string[] {
+const COMMA_SPLIT_REPEATABLE_FIELDS = new Set([
+  "dct_language_sm",
+  "gbl_resourceClass_sm",
+  "gbl_resourceType_sm",
+  "dcat_theme_sm",
+  "dcat_keyword_sm",
+  "dct_temporal_sm",
+]);
+
+function normalizeRepeatableStringValue(field: string, value: unknown): string[] {
+  const text = String(value ?? "").trim();
+  if (!text || text === "[]") return [];
+
+  if (field === "gbl_dateRange_drsim") {
+    if (text.startsWith("[[") && text.endsWith("]]")) {
+      return [text.slice(1, -1).trim()];
+    }
+    return [text];
+  }
+
+  const unwrapped = text.startsWith("[") && text.endsWith("]")
+    ? text.slice(1, -1).trim()
+    : text;
+
+  if (!unwrapped || unwrapped === "[]") return [];
+  if (!COMMA_SPLIT_REPEATABLE_FIELDS.has(field) || !unwrapped.includes(",")) {
+    return [unwrapped];
+  }
+
+  return unwrapped.split(",").map((part) => part.trim()).filter(Boolean);
+}
+
+export function normalizeRepeatableStringValues(field: string, values: unknown): string[] {
+  if (!values) return [];
+  const rawValues = Array.isArray(values) ? values : String(values).split("|");
+  const normalized: string[] = [];
+  const seen = new Set<string>();
+
+  for (const rawValue of rawValues) {
+    for (const value of normalizeRepeatableStringValue(field, rawValue)) {
+      if (!value || seen.has(value)) continue;
+      normalized.push(value);
+      seen.add(value);
+    }
+  }
+
+  return normalized.filter((value) => {
+    if (!value.includes(",")) return true;
+    const parts = value.split(",").map((part) => part.trim()).filter(Boolean);
+    if (parts.length < 2) return true;
+    return !parts.every((part) => seen.has(part));
+  });
+}
+
+function pipeSplit(field: string, value: string | undefined | null | any): string[] {
   if (!value) return [];
-  if (Array.isArray(value)) return value.map(String);
-  return String(value)
-    .split("|")
-    .map((v) => v.trim())
-    .filter((v) => v.length > 0);
+  return normalizeRepeatableStringValues(field, value);
 }
 
 // JSON → tabular row for the resources table (no dct_references_s)
@@ -112,7 +162,7 @@ export function resourceFromRow(
   }
 
   for (const field of REPEATABLE_STRING_FIELDS) {
-    data[field] = pipeSplit(row[field]);
+    data[field] = pipeSplit(field, row[field]);
   }
 
   if (distributionsForResource.length > 0) {
@@ -174,13 +224,35 @@ export function extractDistributionsFromJson(
 
   const resourceId = String(json["id"] ?? "");
   const distributions: Distribution[] = [];
-  for (const [key, url] of Object.entries(obj as Record<string, unknown>)) {
-    if (!url) continue;
-    distributions.push({
-      resource_id: resourceId,
-      relation_key: String(key),
-      url: String(url),
-    });
+  const extractItem = (item: unknown): { url: string; label?: string } | null => {
+    if (typeof item === "string") {
+      const url = item.trim();
+      return url ? { url } : null;
+    }
+    if (item && typeof item === "object") {
+      const candidate = item as Record<string, unknown>;
+      const rawUrl = candidate.url ?? candidate["@id"] ?? candidate.id;
+      if (typeof rawUrl !== "string" || rawUrl.trim() === "") return null;
+      const label = typeof candidate.label === "string" && candidate.label.trim()
+        ? candidate.label.trim()
+        : undefined;
+      return { url: rawUrl.trim(), label };
+    }
+    return null;
+  };
+
+  for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
+    const items = Array.isArray(value) ? value : [value];
+    for (const item of items) {
+      const extracted = extractItem(item);
+      if (!extracted) continue;
+      distributions.push({
+        resource_id: resourceId,
+        relation_key: String(key),
+        url: extracted.url,
+        label: extracted.label,
+      });
+    }
   }
   return distributions;
 }
@@ -211,7 +283,9 @@ export function buildDctReferencesS(
   }
 
   if (Object.keys(refs).length === 0) return undefined;
-  return JSON.stringify(refs, Object.keys(refs).sort(), 2);
+  const sortedRefs: Record<string, any> = {};
+  for (const key of Object.keys(refs).sort()) {
+    sortedRefs[key] = refs[key];
+  }
+  return JSON.stringify(sortedRefs, null, 2);
 }
-
-

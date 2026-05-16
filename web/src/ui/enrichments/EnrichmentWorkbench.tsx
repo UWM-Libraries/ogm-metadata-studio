@@ -1,28 +1,78 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-    AardvarkDraft,
-    completeRun,
-    createDraftFromRun,
-    createEnrichmentBatch,
-    createPendingRun,
     ensureDefaultEnrichmentData,
     getHistoricalMapDefinition,
-    listAardvarkDrafts,
-    listEnrichmentDefinitions,
-    listEnrichmentRuns,
-    listStagedAssets,
-    publishAardvarkDraft,
     ProxyModelProfile,
     ProxyStorageProfile,
-    StagedAsset,
+    ProxyVisionProfile,
     syncProxyProfilesToDuckDb,
-    updateAardvarkDraft,
-    upsertStagedAssets,
+    upsertResource,
 } from "../../duckdb/duckdbClient";
-import { enrichmentProxyClient, ProxyConfig } from "../../services/EnrichmentProxyClient";
+import { enrichmentProxyClient, ProcessedS3Resource, ProxyConfig } from "../../services/EnrichmentProxyClient";
+import { DUCKDB_RESTORED_EVENT, DUCKDB_RESTORE_PROGRESS_EVENT, getDuckDbRestoreStatus } from "../../duckdb/dbInit";
+import { safeJsonStringify } from "../../duckdb/json";
+import { Distribution, resourceFromJson } from "../../aardvark/model";
 import { useToast } from "../shared/ToastContext";
+import { IiifImageViewer } from "../viewers/IiifImageViewer";
+import { normalizeTextExtractionAnnotations } from "../viewers/textExtractionOverlay";
 
-type Panel = "config" | "inventory" | "runs" | "drafts";
+type Panel = "upload" | "config" | "inventory";
+type BusyOperation = "" | "upload" | "regenerate" | "refresh";
+type EnrichmentPhase = "starting" | "requesting" | "storing" | "completed" | "failed";
+type UploadStatus = "queued" | "hashing" | "processing" | "publishing" | "completed" | "cached" | "failed";
+
+interface EnrichmentMilestone {
+    id: string;
+    at: string;
+    status: "active" | "done" | "error";
+    label: string;
+    detail?: string;
+}
+
+interface EnrichmentProgress {
+    kind: "regeneration" | "refresh";
+    total: number;
+    completed: number;
+    failed: number;
+    currentIndex: number;
+    currentAsset: string;
+    phase: EnrichmentPhase;
+    phaseProgress: number;
+    message: string;
+    startedAt: number;
+    updatedAt: number;
+    finishedAt?: number;
+    milestones: EnrichmentMilestone[];
+}
+
+interface UploadItem {
+    id: string;
+    file: File;
+    name: string;
+    size: number;
+    status: UploadStatus;
+    message: string;
+    checksum?: string;
+    resourceId?: string;
+    confidence?: number | null;
+    extraction?: unknown;
+    artifacts?: {
+        originalUrl: string;
+        thumbnailUrl: string;
+        iiifInfoUrl: string;
+        extractionUrl: string;
+        aardvarkUrl: string;
+    };
+    error?: string;
+    milestones?: EnrichmentMilestone[];
+}
+
+interface MetadataUploadItem {
+    id: string;
+    file: File;
+    name: string;
+    size: number;
+}
 
 const blankStorageProfile = (): ProxyStorageProfile => ({
     id: `s3-${crypto.randomUUID()}`,
@@ -44,7 +94,17 @@ const blankModelProfile = (): ProxyModelProfile => ({
     provider: "openai",
     apiKeyEnv: "OPENAI_API_KEY",
     defaultModel: "gpt-5.5",
-    modelParams: { temperature: 0 },
+    modelParams: {},
+});
+
+const blankVisionProfile = (): ProxyVisionProfile => ({
+    id: `vision-${crypto.randomUUID()}`,
+    name: "Google Cloud Vision",
+    provider: "google_cloud_vision",
+    apiKeyEnv: "GOOGLE_CLOUD_VISION_API_KEY",
+    endpoint: "https://vision.googleapis.com/v1/images:annotate",
+    featureType: "DOCUMENT_TEXT_DETECTION",
+    languageHints: [],
 });
 
 const defaultBatchDefaults = {
@@ -59,7 +119,7 @@ const defaultBatchDefaults = {
     isPartOf: "",
     language: "eng",
     resourceClass: ["Maps"],
-    resourceType: ["Topographic maps"],
+    resourceType: ["Cartographic materials"],
     subjects: [],
     themes: [],
 };
@@ -73,33 +133,132 @@ function parseJsonField<T>(text: string, fallback: T): T {
 }
 
 function pretty(value: unknown): string {
-    return JSON.stringify(value, null, 2);
+    return safeJsonStringify(value, 2);
 }
 
 function profileSummary(profile: ProxyStorageProfile): string {
     return [profile.bucket, (profile.prefixes ?? []).filter(Boolean).join(", ")].filter(Boolean).join(" / ") || "Not configured";
 }
 
+function normalizeModelParams(model: string, params: Record<string, unknown> = {}): Record<string, unknown> {
+    const next = { ...params };
+    if (/^gpt-5/i.test(model)) delete next.temperature;
+    return next;
+}
+
+function formatElapsed(totalSeconds: number): string {
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return minutes > 0 ? `${minutes}m ${seconds.toString().padStart(2, "0")}s` : `${seconds}s`;
+}
+
+function formatBytes(value: number): string {
+    if (!Number.isFinite(value) || value <= 0) return "";
+    const units = ["B", "KB", "MB", "GB"];
+    let size = value;
+    let unit = 0;
+    while (size >= 1024 && unit < units.length - 1) {
+        size /= 1024;
+        unit += 1;
+    }
+    return `${size >= 10 || unit === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[unit]}`;
+}
+
+function base64FromArrayBuffer(buffer: ArrayBuffer): string {
+    const bytes = new Uint8Array(buffer);
+    const chunkSize = 0x8000;
+    let binary = "";
+    for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+        binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+    }
+    return btoa(binary);
+}
+
+async function checksumArrayBuffer(buffer: ArrayBuffer): Promise<string> {
+    const digest = await crypto.subtle.digest("SHA-256", buffer);
+    return Array.from(new Uint8Array(digest)).map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function isImageUpload(file: File): boolean {
+    return file.type.startsWith("image/") || /\.(jpe?g|png|webp|tiff?|jp2|j2k)$/i.test(file.name);
+}
+
+function isMetadataUpload(file: File): boolean {
+    return file.type.includes("xml") || file.type.startsWith("text/") || /\.(txt|xml|fgdc|iso)$/i.test(file.name);
+}
+
+function normalizedBaseName(name: string): string {
+    return name.replace(/\.[^.]+$/, "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+async function readMetadataPayload(file: File) {
+    return {
+        name: file.name,
+        type: file.type || (file.name.toLowerCase().endsWith(".xml") ? "application/xml" : "text/plain"),
+        size: file.size,
+        text: await file.text(),
+    };
+}
+
+function milestoneTime(date = new Date()): string {
+    return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" });
+}
+
+function formatDateTime(value?: string | null): string {
+    if (!value) return "not synced yet";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return String(value);
+    return date.toLocaleString([], {
+        month: "short",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit",
+    });
+}
+
+async function withTimeout<T>(promise: Promise<T>, label: string, timeoutMs: number): Promise<T> {
+    let timeoutId: number | undefined;
+    try {
+        return await Promise.race([
+            promise,
+            new Promise<T>((_, reject) => {
+                timeoutId = window.setTimeout(() => {
+                    reject(new Error(`${label} timed out after ${Math.round(timeoutMs / 1000)} seconds.`));
+                }, timeoutMs);
+            }),
+        ]);
+    } finally {
+        if (timeoutId !== undefined) window.clearTimeout(timeoutId);
+    }
+}
+
 export const EnrichmentWorkbench: React.FC = () => {
     const { addToast } = useToast();
-    const [activePanel, setActivePanel] = useState<Panel>("config");
-    const [config, setConfig] = useState<ProxyConfig>({ storageProfiles: [], modelProfiles: [] });
+    const inventoryAbortRef = useRef<AbortController | null>(null);
+    const runAbortRef = useRef<AbortController | null>(null);
+    const uploadAbortRef = useRef<AbortController | null>(null);
+    const [activePanel, setActivePanel] = useState<Panel>("upload");
+    const [config, setConfig] = useState<ProxyConfig>({ storageProfiles: [], modelProfiles: [], visionProfiles: [] });
     const [selectedStorageId, setSelectedStorageId] = useState("");
     const [selectedModelId, setSelectedModelId] = useState("");
+    const [selectedVisionId, setSelectedVisionId] = useState("");
     const [storageDraft, setStorageDraft] = useState<ProxyStorageProfile>(blankStorageProfile);
     const [modelDraft, setModelDraft] = useState<ProxyModelProfile>(blankModelProfile);
-    const [assets, setAssets] = useState<StagedAsset[]>([]);
-    const [definitions, setDefinitions] = useState<any[]>([]);
-    const [runs, setRuns] = useState<any[]>([]);
-    const [drafts, setDrafts] = useState<AardvarkDraft[]>([]);
-    const [selectedAssetIds, setSelectedAssetIds] = useState<Set<string>>(new Set());
-    const [selectedRunId, setSelectedRunId] = useState("");
-    const [selectedDraftId, setSelectedDraftId] = useState("");
-    const [draftEditor, setDraftEditor] = useState("");
+    const [visionDraft, setVisionDraft] = useState<ProxyVisionProfile>(blankVisionProfile);
     const [batchDefaultsText, setBatchDefaultsText] = useState(pretty(defaultBatchDefaults));
-    const [threshold, setThreshold] = useState(0.85);
     const [status, setStatus] = useState("");
-    const [busy, setBusy] = useState(false);
+    const [busyOperation, setBusyOperation] = useState<BusyOperation>("");
+    const [runProgress, setRunProgress] = useState<EnrichmentProgress | null>(null);
+    const [uploadItems, setUploadItems] = useState<UploadItem[]>([]);
+    const [expandedTextReviewId, setExpandedTextReviewId] = useState<string | null>(null);
+    const [metadataItems, setMetadataItems] = useState<MetadataUploadItem[]>([]);
+    const [inventoryResources, setInventoryResources] = useState<ProcessedS3Resource[]>([]);
+    const [inventoryQuery, setInventoryQuery] = useState("");
+    const [inventoryStatus, setInventoryStatus] = useState("");
+    const [inventoryLoadedAt, setInventoryLoadedAt] = useState("");
+    const [isInventoryLoading, setIsInventoryLoading] = useState(false);
+    const [elapsedSeconds, setElapsedSeconds] = useState(0);
+    const [restoreStatus, setRestoreStatus] = useState(getDuckDbRestoreStatus);
 
     const selectedStorageProfile = useMemo(
         () => config.storageProfiles.find((profile) => profile.id === selectedStorageId),
@@ -109,42 +268,134 @@ export const EnrichmentWorkbench: React.FC = () => {
         () => config.modelProfiles.find((profile) => profile.id === selectedModelId),
         [config.modelProfiles, selectedModelId],
     );
-    const selectedRun = useMemo(() => runs.find((run) => run.id === selectedRunId), [runs, selectedRunId]);
-    const selectedDraft = useMemo(() => drafts.find((draft) => draft.id === selectedDraftId), [drafts, selectedDraftId]);
-
-    const refreshLocal = async () => {
-        await ensureDefaultEnrichmentData();
-        const [nextAssets, nextDefinitions, nextRuns, nextDrafts] = await Promise.all([
-            listStagedAssets(),
-            listEnrichmentDefinitions(),
-            listEnrichmentRuns(),
-            listAardvarkDrafts(),
-        ]);
-        setAssets(nextAssets);
-        setDefinitions(nextDefinitions);
-        setRuns(nextRuns);
-        setDrafts(nextDrafts);
-    };
+    const selectedVisionProfile = useMemo(
+        () => config.visionProfiles.find((profile) => profile.id === selectedVisionId),
+        [config.visionProfiles, selectedVisionId],
+    );
+    const inventoryRows = useMemo(() => {
+        const query = inventoryQuery.trim().toLowerCase();
+        if (!query) return inventoryResources;
+        return inventoryResources.filter((resource) => [
+            resource.resourceId,
+            resource.fileName,
+            resource.root,
+            resource.originalKey,
+        ].some((value) => String(value || "").toLowerCase().includes(query)));
+    }, [inventoryQuery, inventoryResources]);
+    const inventoryCompleteCount = useMemo(
+        () => inventoryResources.filter((resource) => resource.hasAardvark && resource.hasExtraction && resource.hasThumbnail && resource.hasIiif).length,
+        [inventoryResources],
+    );
+    const inventoryMissingCount = Math.max(0, inventoryResources.length - inventoryCompleteCount);
+    const processableUploadCount = useMemo(
+        () => uploadItems.filter((item) => ["queued", "failed"].includes(item.status)).length,
+        [uploadItems],
+    );
+    const completedUploadCount = useMemo(
+        () => uploadItems.filter((item) => item.status === "completed" || item.status === "cached").length,
+        [uploadItems],
+    );
+    const isBusy = busyOperation !== "";
+    const isUploading = busyOperation === "upload";
+    const isRegenerating = busyOperation === "regenerate";
+    const isRefreshing = busyOperation === "refresh";
+    const isRestoring = restoreStatus.inProgress;
+    const restoreLabel = restoreStatus.total > 0
+        ? `Restoring local records into DuckDB: ${restoreStatus.processed.toLocaleString()} / ${restoreStatus.total.toLocaleString()}`
+        : "Restoring local records into DuckDB.";
+    const runProgressPercent = useMemo(() => {
+        if (!runProgress?.total) return 0;
+        const units = Math.min(runProgress.total, runProgress.completed + runProgress.failed + runProgress.phaseProgress);
+        return Math.max(1, Math.min(100, Math.round((units / runProgress.total) * 100)));
+    }, [runProgress]);
+    const runElapsedLabel = useMemo(() => {
+        if (!runProgress) return "0s";
+        const end = runProgress.finishedAt ?? Date.now();
+        const seconds = Math.max(elapsedSeconds, Math.floor((end - runProgress.startedAt) / 1000));
+        return formatElapsed(seconds);
+    }, [elapsedSeconds, runProgress]);
 
     const loadConfig = async () => {
         try {
             const next = await enrichmentProxyClient.getConfig();
-            setConfig(next);
-            setSelectedStorageId(next.storageProfiles[0]?.id || "");
-            setSelectedModelId(next.modelProfiles[0]?.id || "");
-            setStorageDraft(next.storageProfiles[0] || blankStorageProfile());
-            setModelDraft(next.modelProfiles[0] || blankModelProfile());
-            await syncProxyProfilesToDuckDb(next.storageProfiles, next.modelProfiles);
+            const normalized = { ...next, visionProfiles: next.visionProfiles || [] };
+            setConfig(normalized);
+            setSelectedStorageId(normalized.storageProfiles[0]?.id || "");
+            setSelectedModelId(normalized.modelProfiles[0]?.id || "");
+            setSelectedVisionId(normalized.visionProfiles[0]?.id || "");
+            setStorageDraft(normalized.storageProfiles[0] || blankStorageProfile());
+            setModelDraft(normalized.modelProfiles[0] || blankModelProfile());
+            setVisionDraft(normalized.visionProfiles[0] || blankVisionProfile());
+            await syncProxyProfilesToDuckDb(normalized.storageProfiles, normalized.modelProfiles);
             setStatus("Connected to enrichment proxy.");
         } catch (error: any) {
             setStatus(`Proxy unavailable: ${error.message}. Start it with npm run proxy from web/.`);
         }
     };
 
+    const refreshS3Inventory = useCallback(async (showToast = true) => {
+        if (!selectedStorageId) {
+            setInventoryResources([]);
+            setInventoryStatus("Choose a storage profile.");
+            return;
+        }
+        inventoryAbortRef.current?.abort();
+        const controller = new AbortController();
+        inventoryAbortRef.current = controller;
+        setIsInventoryLoading(true);
+        setInventoryStatus(`Reading ${selectedStorageProfile?.name || "S3 bucket"}...`);
+        try {
+            const result = await enrichmentProxyClient.listS3UploadInventory(selectedStorageId, controller.signal);
+            setInventoryResources(result.resources);
+            setInventoryLoadedAt(new Date().toISOString());
+            setInventoryStatus(result.message);
+            if (showToast) addToast(`Loaded ${result.resources.length} S3 resource(s).`, "success");
+        } catch (error: any) {
+            if (String(error.message || "").includes("canceled")) {
+                setInventoryStatus("Inventory refresh canceled.");
+                if (showToast) addToast("Inventory refresh canceled.", "info");
+            } else {
+                setInventoryStatus(`Inventory refresh failed: ${error.message}`);
+                if (showToast) addToast("Inventory refresh failed.", "error");
+            }
+        } finally {
+            if (inventoryAbortRef.current === controller) inventoryAbortRef.current = null;
+            setIsInventoryLoading(false);
+        }
+    }, [addToast, selectedStorageId, selectedStorageProfile?.name]);
+
+    const cancelInventoryRefresh = () => {
+        inventoryAbortRef.current?.abort();
+        inventoryAbortRef.current = null;
+        setIsInventoryLoading(false);
+        setInventoryStatus("Inventory refresh canceled.");
+    };
+
     useEffect(() => {
         void loadConfig();
-        void refreshLocal();
+        void ensureDefaultEnrichmentData();
     }, []);
+
+    useEffect(() => {
+        const handleRestoreProgress = (event: Event) => {
+            const customEvent = event as CustomEvent<typeof restoreStatus>;
+            setRestoreStatus(customEvent.detail ?? getDuckDbRestoreStatus());
+        };
+        const refreshAfterRestore = () => {
+            setRestoreStatus(getDuckDbRestoreStatus());
+            setStatus("Loaded restored local enrichment data.");
+        };
+        window.addEventListener(DUCKDB_RESTORE_PROGRESS_EVENT, handleRestoreProgress);
+        window.addEventListener(DUCKDB_RESTORED_EVENT, refreshAfterRestore);
+        return () => {
+            window.removeEventListener(DUCKDB_RESTORE_PROGRESS_EVENT, handleRestoreProgress);
+            window.removeEventListener(DUCKDB_RESTORED_EVENT, refreshAfterRestore);
+        };
+    }, []);
+
+    useEffect(() => {
+        if (activePanel === "inventory" && selectedStorageId) void refreshS3Inventory(false);
+    }, [activePanel, selectedStorageId, refreshS3Inventory]);
 
     useEffect(() => {
         const next = config.storageProfiles.find((profile) => profile.id === selectedStorageId);
@@ -157,14 +408,701 @@ export const EnrichmentWorkbench: React.FC = () => {
     }, [selectedModelId, config.modelProfiles]);
 
     useEffect(() => {
-        if (selectedDraft) setDraftEditor(pretty(JSON.parse(selectedDraft.resource_json)));
-    }, [selectedDraftId, selectedDraft]);
+        const next = config.visionProfiles.find((profile) => profile.id === selectedVisionId);
+        if (next) setVisionDraft({ ...next, languageHints: [...(next.languageHints ?? [])] });
+    }, [selectedVisionId, config.visionProfiles]);
+
+    useEffect(() => {
+        const startedAt = runProgress?.startedAt;
+        if (!startedAt || runProgress?.finishedAt) return;
+        const tick = () => setElapsedSeconds(Math.floor((Date.now() - startedAt) / 1000));
+        tick();
+        const interval = window.setInterval(tick, 1000);
+        return () => window.clearInterval(interval);
+    }, [runProgress?.startedAt, runProgress?.finishedAt]);
+
+    const startRegenerationProgress = (total: number) => {
+        const startedAt = Date.now();
+        setElapsedSeconds(0);
+        setRunProgress({
+            kind: "regeneration",
+            total,
+            completed: 0,
+            failed: 0,
+            currentIndex: 0,
+            currentAsset: "",
+            phase: "starting",
+            phaseProgress: 0.02,
+            message: `Starting Aardvark regeneration for ${total} S3 resource(s).`,
+            startedAt,
+            updatedAt: startedAt,
+            milestones: [{
+                id: crypto.randomUUID(),
+                at: milestoneTime(),
+                status: "active",
+                label: "Regeneration started",
+                detail: `${total} processed S3 resource(s) queued for Aardvark regeneration.`,
+            }],
+        });
+    };
+
+    const startS3RefreshProgress = (total: number) => {
+        const startedAt = Date.now();
+        setElapsedSeconds(0);
+        setRunProgress({
+            kind: "refresh",
+            total,
+            completed: 0,
+            failed: 0,
+            currentIndex: 0,
+            currentAsset: "",
+            phase: "starting",
+            phaseProgress: 0.02,
+            message: `Starting local refresh for ${total} S3 resource(s).`,
+            startedAt,
+            updatedAt: startedAt,
+            milestones: [{
+                id: crypto.randomUUID(),
+                at: milestoneTime(),
+                status: "active",
+                label: "S3 refresh started",
+                detail: `${total} processed S3 resource(s) queued for local DuckDB refresh.`,
+            }],
+        });
+    };
+
+    const updateRunProgress = (updates: Partial<EnrichmentProgress>, milestone?: Omit<EnrichmentMilestone, "id" | "at">) => {
+        setRunProgress((prev) => {
+            if (!prev) return prev;
+            const nextMilestones = milestone
+                ? [{
+                    id: crypto.randomUUID(),
+                    at: milestoneTime(),
+                    ...milestone,
+                }, ...prev.milestones].slice(0, 12)
+                : prev.milestones;
+            return {
+                ...prev,
+                ...updates,
+                updatedAt: Date.now(),
+                milestones: nextMilestones,
+            };
+        });
+    };
+
+    const updateUploadItem = (id: string, updates: Partial<UploadItem>) => {
+        setUploadItems((prev) => prev.map((item) => item.id === id ? { ...item, ...updates } : item));
+    };
+
+    const appendUploadMilestone = (
+        id: string,
+        status: EnrichmentMilestone["status"],
+        label: string,
+        detail?: string,
+    ) => {
+        const milestone = {
+            id: crypto.randomUUID(),
+            at: milestoneTime(),
+            status,
+            label,
+            detail,
+        };
+        setUploadItems((prev) => prev.map((item) => (
+            item.id === id
+                ? { ...item, milestones: [milestone, ...(item.milestones || [])].slice(0, 20) }
+                : item
+        )));
+        const item = uploadItems.find((candidate) => candidate.id === id);
+        console.debug("[Upload pipeline]", { file: item?.name, status, label, detail });
+    };
+
+    const appendProxyMilestones = (
+        id: string,
+        proxyMilestones: Array<{ at: string; elapsed_ms: number; label: string; detail?: Record<string, unknown> }> = [],
+    ) => {
+        if (proxyMilestones.length === 0) return;
+        const converted = proxyMilestones.slice().reverse().map((milestone) => ({
+            id: crypto.randomUUID(),
+            at: milestoneTime(new Date(milestone.at)),
+            status: "done" as const,
+            label: `Proxy: ${milestone.label}`,
+            detail: `${formatElapsed(Math.round(milestone.elapsed_ms / 1000))}${milestone.detail ? ` · ${safeJsonStringify(milestone.detail)}` : ""}`,
+        }));
+        setUploadItems((prev) => prev.map((item) => (
+            item.id === id
+                ? { ...item, milestones: [...converted, ...(item.milestones || [])].slice(0, 24) }
+                : item
+        )));
+    };
+
+    const metadataForImage = (imageName: string): MetadataUploadItem[] => {
+        const imageBase = normalizedBaseName(imageName);
+        const matched = metadataItems.filter((item) => normalizedBaseName(item.name) === imageBase);
+        if (matched.length > 0) return matched;
+        return metadataItems.length === 1 ? metadataItems : [];
+    };
+
+    const addUploadFiles = (fileList: FileList | File[]) => {
+        const incoming = Array.from(fileList);
+        const files = incoming.filter(isImageUpload);
+        const metadataFiles = incoming.filter((file) => !isImageUpload(file) && isMetadataUpload(file));
+        if (files.length === 0 && metadataFiles.length === 0) {
+            addToast("Choose image files or companion metadata files.", "info");
+            return;
+        }
+        if (metadataFiles.length > 0) {
+            setMetadataItems((prev) => [
+                ...metadataFiles.map((file) => ({
+                    id: `metadata-${crypto.randomUUID()}`,
+                    file,
+                    name: file.name,
+                    size: file.size,
+                })),
+                ...prev,
+            ]);
+        }
+        if (files.length > 0) {
+            setUploadItems((prev) => [
+                ...files.map((file) => ({
+                    id: `upload-${crypto.randomUUID()}`,
+                    file,
+                    name: file.name,
+                    size: file.size,
+                    status: "queued" as UploadStatus,
+                    message: "Ready to process",
+                    milestones: [{
+                        id: crypto.randomUUID(),
+                        at: milestoneTime(),
+                        status: "active" as const,
+                        label: "Queued",
+                        detail: formatBytes(file.size),
+                    }],
+                })),
+                ...prev,
+            ]);
+        }
+        setActivePanel("upload");
+        setStatus(`${files.length} image file(s) queued. ${metadataFiles.length} companion metadata file(s) available.`);
+    };
+
+    const removeUploadItem = (id: string) => {
+        setUploadItems((prev) => prev.filter((item) => item.id !== id));
+        setExpandedTextReviewId((current) => current === id ? null : current);
+    };
+
+    const removeMetadataItem = (id: string) => {
+        setMetadataItems((prev) => prev.filter((item) => item.id !== id));
+    };
+
+    const clearFinishedUploads = () => {
+        setUploadItems((prev) => prev.filter((item) => item.status !== "completed" && item.status !== "cached"));
+        setExpandedTextReviewId(null);
+    };
+
+    const cancelUpload = () => {
+        uploadAbortRef.current?.abort();
+        uploadAbortRef.current = null;
+        setBusyOperation("");
+        setStatus("Upload processing canceled. Completed resources remain published.");
+        setUploadItems((prev) => prev.map((item) => (
+            item.status === "hashing" || item.status === "processing" || item.status === "publishing"
+                ? { ...item, status: "failed", message: "Canceled", error: "Upload processing canceled." }
+                : item
+        )));
+    };
+
+    const processUploads = async () => {
+        if (isRestoring) {
+            setStatus(`${restoreLabel}. Upload processing is available when restore finishes.`);
+            addToast("Wait for local DuckDB restore to finish before processing uploads.", "info");
+            return;
+        }
+        if (!selectedStorageProfile || !selectedModelProfile) {
+            addToast("Choose storage and OpenAI profiles before uploading.", "info");
+            return;
+        }
+        const queued = uploadItems.filter((item) => item.status === "queued" || item.status === "failed");
+        if (queued.length === 0) {
+            addToast("Queue one or more image files first.", "info");
+            return;
+        }
+
+        uploadAbortRef.current?.abort();
+        const controller = new AbortController();
+        uploadAbortRef.current = controller;
+        setBusyOperation("upload");
+        setStatus(`Processing ${queued.length} uploaded image file(s).`);
+
+        try {
+            const { definition, promptVersion } = await withTimeout(
+                getHistoricalMapDefinition(),
+                "Loading historical map prompt",
+                15_000,
+            );
+            const outputSchema = JSON.parse(definition.output_schema_json);
+            const modelParams = normalizeModelParams(selectedModelProfile.defaultModel, selectedModelProfile.modelParams ?? {});
+            const batchDefaults = parseJsonField(batchDefaultsText, defaultBatchDefaults);
+            const ocrEngineLabel = selectedVisionProfile
+                ? `Google Cloud Vision ${selectedVisionProfile.featureType || "DOCUMENT_TEXT_DETECTION"}`
+                : "OpenAI vision extraction";
+            let published = 0;
+            let failed = 0;
+
+            for (let index = 0; index < queued.length; index++) {
+                const item = queued[index];
+                try {
+                    if (controller.signal.aborted) throw new Error("Upload processing canceled.");
+
+                    updateUploadItem(item.id, { status: "hashing", message: "Calculating SHA-256 checksum" });
+                    appendUploadMilestone(item.id, "active", "Hashing", "Calculating SHA-256 checksum in the browser.");
+                    const buffer = await item.file.arrayBuffer();
+                    const checksum = await checksumArrayBuffer(buffer);
+                    appendUploadMilestone(item.id, "done", "Checksum ready", `sha256:${checksum}`);
+                    if (controller.signal.aborted) throw new Error("Upload processing canceled.");
+
+                    updateUploadItem(item.id, {
+                        checksum,
+                        status: "processing",
+                        message: `Uploading original, building IIIF tiles, and extracting text with ${ocrEngineLabel}`,
+                        error: undefined,
+                    });
+                    setStatus(`Processing ${index + 1} / ${queued.length}: ${item.name}`);
+
+                    const jobId = `upload-${crypto.randomUUID()}`;
+                    appendUploadMilestone(item.id, "active", "Proxy request started", `Job ${jobId}. Watch the proxy terminal for [upload:${jobId}] logs.`);
+                    const companionMetadata = metadataForImage(item.name);
+                    const metadataDocuments = await Promise.all(companionMetadata.map((metadata) => readMetadataPayload(metadata.file)));
+                    if (metadataDocuments.length > 0) {
+                        appendUploadMilestone(item.id, "done", "Companion metadata attached", metadataDocuments.map((document) => document.name).join(", "));
+                    }
+                    let heartbeatCount = 0;
+                    const heartbeat = window.setInterval(() => {
+                        heartbeatCount += 1;
+                        const elapsed = heartbeatCount * 20;
+                        const detail = `${formatElapsed(elapsed)} waiting on proxy. The active step may be S3 upload, IIIF tile generation, or ${selectedVisionProfile ? "Google Vision OCR" : "OpenAI extraction"}.`;
+                        updateUploadItem(item.id, {
+                            message: `Still processing in proxy: ${detail}`,
+                        });
+                        console.debug("[Upload pipeline]", { file: item.name, jobId, elapsedSeconds: elapsed, phase: "proxy-wait" });
+                        if (heartbeatCount % 3 === 0) {
+                            appendUploadMilestone(item.id, "active", "Still waiting on proxy", detail);
+                        }
+                    }, 20_000);
+                    let response;
+                    try {
+                        response = await enrichmentProxyClient.processUploadedImage({
+                            jobId,
+                            storageProfileId: selectedStorageProfile.id,
+                            modelProfileId: selectedModelProfile.id,
+                            visionProfileId: selectedVisionProfile?.id,
+                            file: {
+                                name: item.file.name,
+                                type: item.file.type,
+                                size: item.file.size,
+                                checksum,
+                                base64: base64FromArrayBuffer(buffer),
+                            },
+                            checksum,
+                            systemPrompt: String(promptVersion.system_prompt || ""),
+                            userPrompt: String(promptVersion.user_prompt_template || "")
+                                .replaceAll("{{asset_id}}", checksum)
+                                .replaceAll("{{file_name}}", item.file.name),
+                            model: selectedModelProfile.defaultModel,
+                            modelParams,
+                            outputSchema,
+                            batchDefaults,
+                            metadataDocuments,
+                        }, controller.signal);
+                    } finally {
+                        window.clearInterval(heartbeat);
+                    }
+                    appendProxyMilestones(item.id, response.proxyMilestones);
+                    appendUploadMilestone(item.id, "done", "Proxy response received", response.cached ? "Existing S3 artifacts reused." : "S3 artifacts and extraction response returned.");
+                    if (controller.signal.aborted) throw new Error("Upload processing canceled.");
+
+                    updateUploadItem(item.id, { status: "publishing", message: "Publishing Aardvark metadata into DuckDB" });
+                    appendUploadMilestone(item.id, "active", "DuckDB publish started", "Upserting resource and distribution rows.");
+                    const resource = resourceFromJson(response.aardvarkJson);
+                    const distributions: Distribution[] = (response.distributions || []).map((distribution) => ({
+                        resource_id: resource.id,
+                        relation_key: String(distribution.relation_key),
+                        url: String(distribution.url),
+                        label: distribution.label ? String(distribution.label) : undefined,
+                    }));
+                    await withTimeout(upsertResource(resource, distributions), `Publishing ${item.name}`, 30_000);
+                    published += 1;
+                    appendUploadMilestone(item.id, "done", "DuckDB publish complete", resource.id);
+
+                    updateUploadItem(item.id, {
+                        status: response.cached ? "cached" : "completed",
+                        message: response.cached ? "Already processed; local DuckDB record refreshed" : "Processed and published",
+                        resourceId: resource.id,
+                        confidence: response.confidence,
+                        extraction: response.extraction,
+                        artifacts: response.artifacts,
+                        error: undefined,
+                    });
+                    setExpandedTextReviewId(item.id);
+                } catch (error: any) {
+                    if (String(error.message || "").includes("canceled")) throw error;
+                    failed += 1;
+                    appendUploadMilestone(item.id, "error", "Upload failed", error.message || String(error));
+                    updateUploadItem(item.id, {
+                        status: "failed",
+                        message: "Failed",
+                        error: error.message || String(error),
+                    });
+                }
+            }
+
+            await ensureDefaultEnrichmentData();
+            setStatus(`Upload workflow complete: ${published} resource(s) published${failed > 0 ? `, ${failed} failed` : ""}.`);
+            addToast(failed > 0 ? `Published ${published}; ${failed} failed.` : `Published ${published} uploaded resource(s).`, failed > 0 ? "error" : "success");
+        } catch (error: any) {
+            if (String(error.message || "").includes("canceled")) {
+                setStatus("Upload processing canceled.");
+                addToast("Upload processing canceled.", "info");
+            } else {
+                setStatus(`Upload processing failed: ${error.message}`);
+                setUploadItems((prev) => prev.map((item) => (
+                    item.status === "hashing" || item.status === "processing" || item.status === "publishing"
+                        ? { ...item, status: "failed", message: "Failed", error: error.message }
+                        : item
+                )));
+                addToast("Upload processing failed.", "error");
+            }
+        } finally {
+            if (uploadAbortRef.current === controller) uploadAbortRef.current = null;
+            setBusyOperation("");
+        }
+    };
+
+    const regenerateAardvarkFromS3 = async () => {
+        if (isRestoring) {
+            setStatus(`${restoreLabel}. Aardvark regeneration is available when restore finishes.`);
+            addToast("Wait for local DuckDB restore to finish before regenerating Aardvark.", "info");
+            return;
+        }
+        if (!selectedStorageProfile || !selectedModelProfile) {
+            addToast("Choose storage and OpenAI profiles before regenerating Aardvark.", "info");
+            return;
+        }
+
+        runAbortRef.current?.abort();
+        const controller = new AbortController();
+        runAbortRef.current = controller;
+        setBusyOperation("regenerate");
+        setStatus(`Scanning ${selectedStorageProfile.name} for processed S3 resources...`);
+        setRunProgress(null);
+
+        try {
+            const discovered = await enrichmentProxyClient.listProcessedS3Resources(selectedStorageProfile.id, controller.signal);
+            const resources = discovered.resources;
+            if (controller.signal.aborted) throw new Error("Aardvark regeneration canceled.");
+            if (resources.length === 0) {
+                setStatus("No processed S3 resources with Aardvark and extraction JSON were found.");
+                addToast("No processed S3 resources found.", "info");
+                return;
+            }
+
+            startRegenerationProgress(resources.length);
+            const modelParams = normalizeModelParams(selectedModelProfile.defaultModel, selectedModelProfile.modelParams ?? {});
+            const batchDefaults = parseJsonField(batchDefaultsText, defaultBatchDefaults);
+            let published = 0;
+            let failed = 0;
+
+            for (let index = 0; index < resources.length; index++) {
+                const s3Resource = resources[index];
+                const name = s3Resource.fileName || s3Resource.resourceId;
+                if (controller.signal.aborted) throw new Error("Aardvark regeneration canceled.");
+                setStatus(`Regenerating ${index + 1} / ${resources.length}: ${name}`);
+                updateRunProgress({
+                    currentIndex: index,
+                    currentAsset: name,
+                    phase: "requesting",
+                    phaseProgress: 0.35,
+                    message: `Regenerating Aardvark for ${name}. Reading S3 artifacts and waiting on the metadata writer.`,
+                }, {
+                    status: "active",
+                    label: `Regenerating ${name}`,
+                    detail: s3Resource.root,
+                });
+
+                try {
+                    const jobId = `regen-${crypto.randomUUID()}`;
+                    let heartbeatCount = 0;
+                    const heartbeat = window.setInterval(() => {
+                        heartbeatCount += 1;
+                        const waitSeconds = heartbeatCount * 20;
+                        updateRunProgress({
+                            phase: "requesting",
+                            phaseProgress: Math.min(0.78, 0.35 + heartbeatCount * 0.05),
+                            message: `Still regenerating Aardvark for ${name}. ${formatElapsed(waitSeconds)} elapsed in this request.`,
+                        }, heartbeatCount % 3 === 0 ? {
+                            status: "active",
+                            label: "Still waiting on metadata writer",
+                            detail: `${name} has been in regeneration for ${formatElapsed(waitSeconds)}.`,
+                        } : undefined);
+                    }, 20_000);
+                    let response;
+                    try {
+                        response = await enrichmentProxyClient.regenerateAardvark({
+                            jobId,
+                            storageProfileId: selectedStorageProfile.id,
+                            modelProfileId: selectedModelProfile.id,
+                            resource: s3Resource,
+                            model: selectedModelProfile.defaultModel,
+                            modelParams,
+                            batchDefaults,
+                        }, controller.signal);
+                    } finally {
+                        window.clearInterval(heartbeat);
+                    }
+                    if (controller.signal.aborted) throw new Error("Aardvark regeneration canceled.");
+
+                    updateRunProgress({
+                        phase: "storing",
+                        phaseProgress: 0.82,
+                        message: `Publishing regenerated Aardvark for ${name} into DuckDB.`,
+                    }, {
+                        status: "done",
+                        label: "Regenerated Aardvark JSON",
+                        detail: response.resourceId,
+                    });
+
+                    const resource = resourceFromJson(response.aardvarkJson);
+                    const distributions: Distribution[] = (response.distributions || []).map((distribution) => ({
+                        resource_id: resource.id,
+                        relation_key: String(distribution.relation_key),
+                        url: String(distribution.url),
+                        label: distribution.label ? String(distribution.label) : undefined,
+                    }));
+                    await withTimeout(upsertResource(resource, distributions), `Publishing ${name}`, 30_000);
+                    published += 1;
+                    updateRunProgress({
+                        completed: published,
+                        currentIndex: index + 1,
+                        phase: "completed",
+                        phaseProgress: 0,
+                        message: `Regenerated and published ${published} of ${resources.length} resource(s).`,
+                    }, {
+                        status: "done",
+                        label: `Published ${resource.id}`,
+                        detail: resource.dct_title_s,
+                    });
+                } catch (error: any) {
+                    if (String(error.message || "").includes("canceled")) throw error;
+                    failed += 1;
+                    updateRunProgress({
+                        failed,
+                        currentIndex: index + 1,
+                        phase: "failed",
+                        phaseProgress: 0,
+                        message: `Aardvark regeneration failed for ${name}: ${error.message}`,
+                    }, {
+                        status: "error",
+                        label: `Failed ${name}`,
+                        detail: error.message,
+                    });
+                }
+            }
+
+            if (activePanel === "inventory") void refreshS3Inventory(false);
+            setStatus(`Aardvark regeneration complete: ${published} published${failed > 0 ? `, ${failed} failed` : ""}.`);
+            updateRunProgress({
+                phase: failed > 0 ? "failed" : "completed",
+                phaseProgress: 0,
+                completed: published,
+                failed,
+                message: `Aardvark regeneration complete: ${published} published, ${failed} failed.`,
+                finishedAt: Date.now(),
+            }, {
+                status: failed > 0 ? "error" : "done",
+                label: "Regeneration complete",
+                detail: `${published} published, ${failed} failed.`,
+            });
+            addToast(failed > 0 ? `Regenerated ${published}; ${failed} failed.` : `Regenerated ${published} Aardvark record(s).`, failed > 0 ? "error" : "success");
+        } catch (error: any) {
+            if (String(error.message || "").includes("canceled")) {
+                setStatus("Aardvark regeneration canceled.");
+                addToast("Aardvark regeneration canceled.", "info");
+            } else {
+                setStatus(`Aardvark regeneration failed: ${error.message}`);
+                updateRunProgress({
+                    phase: "failed",
+                    phaseProgress: 0,
+                    message: `Aardvark regeneration failed: ${error.message}`,
+                    finishedAt: Date.now(),
+                }, {
+                    status: "error",
+                    label: "Regeneration failed",
+                    detail: error.message,
+                });
+                addToast("Aardvark regeneration failed.", "error");
+            }
+        } finally {
+            if (runAbortRef.current === controller) runAbortRef.current = null;
+            setBusyOperation("");
+        }
+    };
+
+    const refreshLocalAardvarkFromS3 = async () => {
+        if (isRestoring) {
+            setStatus(`${restoreLabel}. S3 refresh is available when restore finishes.`);
+            addToast("Wait for local DuckDB restore to finish before refreshing from S3.", "info");
+            return;
+        }
+        if (!selectedStorageProfile) {
+            addToast("Choose a storage profile before refreshing from S3.", "info");
+            return;
+        }
+
+        runAbortRef.current?.abort();
+        const controller = new AbortController();
+        runAbortRef.current = controller;
+        setBusyOperation("refresh");
+        setStatus(`Scanning ${selectedStorageProfile.name} for existing S3 Aardvark JSON...`);
+        setRunProgress(null);
+
+        try {
+            const discovered = await enrichmentProxyClient.listProcessedS3Resources(selectedStorageProfile.id, controller.signal);
+            const resources = discovered.resources;
+            if (controller.signal.aborted) throw new Error("S3 refresh canceled.");
+            if (resources.length === 0) {
+                setStatus("No processed S3 resources with Aardvark JSON were found.");
+                addToast("No processed S3 resources found.", "info");
+                return;
+            }
+
+            startS3RefreshProgress(resources.length);
+            let published = 0;
+            let failed = 0;
+
+            for (let index = 0; index < resources.length; index++) {
+                const s3Resource = resources[index];
+                const name = s3Resource.fileName || s3Resource.resourceId;
+                if (controller.signal.aborted) throw new Error("S3 refresh canceled.");
+                setStatus(`Refreshing ${index + 1} / ${resources.length}: ${name}`);
+                updateRunProgress({
+                    currentIndex: index,
+                    currentAsset: name,
+                    phase: "requesting",
+                    phaseProgress: 0.35,
+                    message: `Fetching existing Aardvark JSON for ${name} from S3.`,
+                }, {
+                    status: "active",
+                    label: `Fetching ${name}`,
+                    detail: s3Resource.root,
+                });
+
+                try {
+                    const response = await enrichmentProxyClient.fetchAardvarkFromS3({
+                        storageProfileId: selectedStorageProfile.id,
+                        resource: s3Resource,
+                    }, controller.signal);
+                    if (controller.signal.aborted) throw new Error("S3 refresh canceled.");
+
+                    updateRunProgress({
+                        phase: "storing",
+                        phaseProgress: 0.82,
+                        message: `Publishing existing S3 Aardvark for ${name} into DuckDB.`,
+                    }, {
+                        status: "done",
+                        label: "Fetched S3 Aardvark JSON",
+                        detail: response.resourceId,
+                    });
+
+                    const resource = resourceFromJson(response.aardvarkJson);
+                    const distributions: Distribution[] = (response.distributions || []).map((distribution) => ({
+                        resource_id: resource.id,
+                        relation_key: String(distribution.relation_key),
+                        url: String(distribution.url),
+                        label: distribution.label ? String(distribution.label) : undefined,
+                    }));
+                    await withTimeout(upsertResource(resource, distributions), `Publishing ${name}`, 30_000);
+                    published += 1;
+                    updateRunProgress({
+                        completed: published,
+                        currentIndex: index + 1,
+                        phase: "completed",
+                        phaseProgress: 0,
+                        message: `Refreshed and published ${published} of ${resources.length} resource(s).`,
+                    }, {
+                        status: "done",
+                        label: `Published ${resource.id}`,
+                        detail: resource.dct_title_s,
+                    });
+                } catch (error: any) {
+                    if (String(error.message || "").includes("canceled")) throw error;
+                    failed += 1;
+                    updateRunProgress({
+                        failed,
+                        currentIndex: index + 1,
+                        phase: "failed",
+                        phaseProgress: 0,
+                        message: `S3 refresh failed for ${name}: ${error.message}`,
+                    }, {
+                        status: "error",
+                        label: `Failed ${name}`,
+                        detail: error.message,
+                    });
+                }
+            }
+
+            await ensureDefaultEnrichmentData();
+            if (activePanel === "inventory") void refreshS3Inventory(false);
+            setStatus(`S3 refresh complete: ${published} published${failed > 0 ? `, ${failed} failed` : ""}.`);
+            updateRunProgress({
+                phase: failed > 0 ? "failed" : "completed",
+                phaseProgress: 1,
+                completed: published,
+                failed,
+                message: `S3 refresh complete: ${published} published, ${failed} failed.`,
+                finishedAt: Date.now(),
+            }, {
+                status: failed > 0 ? "error" : "done",
+                label: "S3 refresh complete",
+                detail: `${published} published, ${failed} failed.`,
+            });
+            addToast(failed > 0 ? `Refreshed ${published}; ${failed} failed.` : `Refreshed ${published} local record(s) from S3.`, failed > 0 ? "error" : "success");
+        } catch (error: any) {
+            if (String(error.message || "").includes("canceled")) {
+                setStatus("S3 refresh canceled.");
+                addToast("S3 refresh canceled.", "info");
+            } else {
+                setStatus(`S3 refresh failed: ${error.message}`);
+                updateRunProgress({
+                    phase: "failed",
+                    phaseProgress: 0,
+                    message: `S3 refresh failed: ${error.message}`,
+                    finishedAt: Date.now(),
+                }, {
+                    status: "error",
+                    label: "S3 refresh failed",
+                    detail: error.message,
+                });
+                addToast("S3 refresh failed.", "error");
+            }
+        } finally {
+            if (runAbortRef.current === controller) runAbortRef.current = null;
+            setBusyOperation("");
+        }
+    };
 
     const saveProxyConfig = async (nextConfig: ProxyConfig) => {
-        const saved = await enrichmentProxyClient.saveConfig(nextConfig);
-        setConfig(saved);
-        await syncProxyProfilesToDuckDb(saved.storageProfiles, saved.modelProfiles);
-        addToast("Enrichment proxy config saved.", "success");
+        try {
+            const normalized = { ...nextConfig, visionProfiles: nextConfig.visionProfiles || [] };
+            const saved = await enrichmentProxyClient.saveConfig(normalized);
+            const savedConfig = { ...saved, visionProfiles: saved.visionProfiles || [] };
+            setConfig(savedConfig);
+            await syncProxyProfilesToDuckDb(savedConfig.storageProfiles, savedConfig.modelProfiles);
+            addToast("Enrichment proxy config saved.", "success");
+            return true;
+        } catch (error: any) {
+            setStatus(`Config save failed: ${error.message}`);
+            addToast("Config save failed.", "error");
+            return false;
+        }
     };
 
     const saveStorageProfile = async () => {
@@ -172,8 +1110,9 @@ export const EnrichmentWorkbench: React.FC = () => {
             ...config.storageProfiles.filter((profile) => profile.id !== storageDraft.id),
             storageDraft,
         ];
-        await saveProxyConfig({ ...config, storageProfiles: nextProfiles });
-        setSelectedStorageId(storageDraft.id);
+        if (await saveProxyConfig({ ...config, storageProfiles: nextProfiles })) {
+            setSelectedStorageId(storageDraft.id);
+        }
     };
 
     const saveModelProfile = async () => {
@@ -181,171 +1120,311 @@ export const EnrichmentWorkbench: React.FC = () => {
             ...config.modelProfiles.filter((profile) => profile.id !== modelDraft.id),
             modelDraft,
         ];
-        await saveProxyConfig({ ...config, modelProfiles: nextProfiles });
-        setSelectedModelId(modelDraft.id);
+        if (await saveProxyConfig({ ...config, modelProfiles: nextProfiles })) {
+            setSelectedModelId(modelDraft.id);
+        }
+    };
+
+    const saveVisionProfile = async () => {
+        const draft = {
+            ...visionDraft,
+            endpoint: visionDraft.endpoint?.trim() || undefined,
+            featureType: visionDraft.featureType || "DOCUMENT_TEXT_DETECTION",
+            languageHints: (visionDraft.languageHints || []).map((hint) => hint.trim()).filter(Boolean),
+        };
+        const nextProfiles = [
+            ...config.visionProfiles.filter((profile) => profile.id !== draft.id),
+            draft,
+        ];
+        if (await saveProxyConfig({ ...config, visionProfiles: nextProfiles })) {
+            setSelectedVisionId(draft.id);
+        }
     };
 
     const deleteStorageProfile = async () => {
         const nextProfiles = config.storageProfiles.filter((profile) => profile.id !== selectedStorageId);
-        await saveProxyConfig({ ...config, storageProfiles: nextProfiles });
-        setSelectedStorageId(nextProfiles[0]?.id || "");
+        if (await saveProxyConfig({ ...config, storageProfiles: nextProfiles })) {
+            setSelectedStorageId(nextProfiles[0]?.id || "");
+        }
     };
 
     const deleteModelProfile = async () => {
         const nextProfiles = config.modelProfiles.filter((profile) => profile.id !== selectedModelId);
-        await saveProxyConfig({ ...config, modelProfiles: nextProfiles });
-        setSelectedModelId(nextProfiles[0]?.id || "");
+        if (await saveProxyConfig({ ...config, modelProfiles: nextProfiles })) {
+            setSelectedModelId(nextProfiles[0]?.id || "");
+        }
     };
 
-    const syncInventory = async () => {
-        if (!selectedStorageProfile) {
-            addToast("Choose a storage profile first.", "info");
-            return;
+    const deleteVisionProfile = async () => {
+        const nextProfiles = config.visionProfiles.filter((profile) => profile.id !== selectedVisionId);
+        if (await saveProxyConfig({ ...config, visionProfiles: nextProfiles })) {
+            setSelectedVisionId(nextProfiles[0]?.id || "");
         }
-        setBusy(true);
+    };
+
+    const testStorageProfile = async () => {
+        if (!selectedStorageId) return;
         try {
-            setStatus(`Syncing ${selectedStorageProfile.name}...`);
-            const result = await enrichmentProxyClient.syncStorageProfile(selectedStorageProfile.id);
-            await upsertStagedAssets(selectedStorageProfile.id, result.assets);
-            await refreshLocal();
-            setStatus(result.message);
-            addToast(`Synced ${result.assets.length} object(s).`, "success");
+            setStatus((await enrichmentProxyClient.testStorageProfile(selectedStorageId)).message);
         } catch (error: any) {
-            setStatus(`Inventory sync failed: ${error.message}`);
-            addToast("Inventory sync failed.", "error");
-        } finally {
-            setBusy(false);
+            setStatus(`Storage test failed: ${error.message}`);
+            addToast("Storage test failed.", "error");
         }
     };
 
-    const toggleAsset = (assetId: string) => {
-        setSelectedAssetIds((prev) => {
-            const next = new Set(prev);
-            if (next.has(assetId)) next.delete(assetId);
-            else next.add(assetId);
-            return next;
-        });
-    };
-
-    const runBatch = async () => {
-        if (!selectedStorageProfile || !selectedModelProfile) {
-            addToast("Choose storage and OpenAI profiles before running.", "info");
-            return;
-        }
-        const chosenAssets = assets.filter((asset) => selectedAssetIds.has(asset.id) && asset.status === "ready");
-        if (chosenAssets.length === 0) {
-            addToast("Select at least one ready asset.", "info");
-            return;
-        }
-        const batchDefaults = parseJsonField(batchDefaultsText, defaultBatchDefaults);
-        setBusy(true);
+    const testModelProfile = async () => {
+        if (!selectedModelId) return;
         try {
-            const { definition, promptVersion } = await getHistoricalMapDefinition();
-            const definitionForRun = {
-                ...definition,
-                model_profile_id: selectedModelProfile.id,
-                model_name: selectedModelProfile.defaultModel,
-                model_params_json: JSON.stringify(selectedModelProfile.modelParams ?? {}),
-            };
-            const batchId = await createEnrichmentBatch({
-                definitionId: definition.id,
-                storageProfileId: selectedStorageProfile.id,
-                name: `Historical map extraction ${new Date().toLocaleString()}`,
-                totalCount: chosenAssets.length,
-                autoCreateThreshold: threshold,
-                batchDefaults,
-            });
-
-            for (let index = 0; index < chosenAssets.length; index++) {
-                const asset = chosenAssets[index];
-                setStatus(`Running ${index + 1} / ${chosenAssets.length}: ${asset.object_key}`);
-                const renderedSystemPrompt = String(promptVersion.system_prompt || "");
-                const renderedUserPrompt = String(promptVersion.user_prompt_template || "").replaceAll("{{asset_id}}", asset.id);
-                const runId = await createPendingRun({
-                    batchId,
-                    definition: definitionForRun,
-                    promptVersion,
-                    asset,
-                    renderedSystemPrompt,
-                    renderedUserPrompt,
-                });
-                try {
-                    const response = await enrichmentProxyClient.runHistoricalMapExtraction({
-                        storageProfileId: selectedStorageProfile.id,
-                        modelProfileId: selectedModelProfile.id,
-                        asset,
-                        systemPrompt: renderedSystemPrompt,
-                        userPrompt: renderedUserPrompt,
-                        model: selectedModelProfile.defaultModel,
-                        modelParams: selectedModelProfile.modelParams ?? {},
-                        outputSchema: JSON.parse(definition.output_schema_json),
-                    });
-                    await completeRun(runId, response);
-                    const confidence = response.confidence ?? (response.parsedResponse as any)?.map_bbox_estimate?.confidence ?? 0;
-                    if (confidence >= threshold) {
-                        await createDraftFromRun(runId, asset, batchDefaults);
-                    }
-                } catch (error: any) {
-                    await completeRun(runId, { error: error.message, validationErrors: [error.message] });
-                }
-                await refreshLocal();
-            }
-            setStatus("Batch complete.");
-            addToast("Enrichment batch complete.", "success");
-        } finally {
-            setBusy(false);
+            setStatus((await enrichmentProxyClient.testModelProfile(selectedModelId)).message);
+        } catch (error: any) {
+            setStatus(`OpenAI test failed: ${error.message}`);
+            addToast("OpenAI test failed.", "error");
         }
     };
 
-    const createDraftForSelectedRun = async () => {
-        if (!selectedRun) return;
-        const asset = assets.find((item) => item.id === selectedRun.asset_id);
-        if (!asset) {
-            addToast("Could not find the staged asset for this run.", "error");
-            return;
+    const testVisionProfile = async () => {
+        if (!selectedVisionId) return;
+        try {
+            setStatus((await enrichmentProxyClient.testVisionProfile(selectedVisionId)).message);
+        } catch (error: any) {
+            setStatus(`Google Vision test failed: ${error.message}`);
+            addToast("Google Vision test failed.", "error");
         }
-        const batchDefaults = parseJsonField(batchDefaultsText, defaultBatchDefaults);
-        await createDraftFromRun(selectedRun.id, asset, batchDefaults);
-        await refreshLocal();
-        addToast("Draft created from response.", "success");
     };
 
-    const saveSelectedDraft = async () => {
-        if (!selectedDraft) return;
-        const resourceJson = JSON.parse(draftEditor);
-        await updateAardvarkDraft(selectedDraft.id, { resourceJson });
-        await refreshLocal();
-        addToast("Draft saved.", "success");
-    };
-
-    const publishSelectedDraft = async () => {
-        if (!selectedDraft) return;
-        const resourceId = await publishAardvarkDraft(selectedDraft.id);
-        await refreshLocal();
-        addToast(`Published ${resourceId}.`, "success");
+    const cancelRun = () => {
+        const label = "Aardvark regeneration";
+        runAbortRef.current?.abort();
+        runAbortRef.current = null;
+        setBusyOperation("");
+        setStatus(`${label} canceled. Completed work remains available.`);
+        updateRunProgress({
+            phase: "failed",
+            phaseProgress: 0,
+            message: `${label} canceled by user. Completed work remains available.`,
+            finishedAt: Date.now(),
+        }, {
+            status: "error",
+            label: `${label} canceled`,
+            detail: "The active proxy/OpenAI request was aborted from the browser.",
+        });
     };
 
     return (
         <div className="flex h-full min-h-0 flex-col gap-4">
             <div className="flex flex-wrap items-center gap-2 border-b border-gray-200 pb-3 dark:border-slate-800">
-                {(["config", "inventory", "runs", "drafts"] as Panel[]).map((panel) => (
+                {([
+                    { id: "upload", label: "Upload Pipeline" },
+                    { id: "config", label: "Config" },
+                    { id: "inventory", label: "Inventory" },
+                ] as Array<{ id: Panel; label: string }>).map((panel) => (
                     <button
-                        key={panel}
+                        key={panel.id}
                         type="button"
-                        onClick={() => setActivePanel(panel)}
-                        className={`rounded-md border px-3 py-1.5 text-xs font-medium capitalize ${activePanel === panel
+                        onClick={() => setActivePanel(panel.id)}
+                        className={`rounded-md border px-3 py-1.5 text-xs font-medium ${activePanel === panel.id
                             ? "border-indigo-300 bg-indigo-50 text-indigo-700 dark:border-indigo-500/60 dark:bg-indigo-950/40 dark:text-indigo-200"
                             : "border-gray-200 text-slate-600 hover:bg-gray-50 dark:border-slate-800 dark:text-slate-300 dark:hover:bg-slate-800"
                             }`}
                     >
-                        {panel}
+                        {panel.label}
                     </button>
                 ))}
                 <div className="ml-auto text-xs text-slate-500 dark:text-slate-400">{status}</div>
             </div>
 
+            {activePanel === "upload" && (
+                <div className="flex min-h-0 flex-col gap-3">
+                    {isRestoring && (
+                        <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100">
+                            {restoreLabel}. Upload processing is paused until restore finishes.
+                        </div>
+                    )}
+                    {runProgress && (runProgress.kind === "regeneration" || runProgress.kind === "refresh") && (
+                        <div className="rounded-md border border-indigo-100 bg-indigo-50/70 p-3 text-xs dark:border-indigo-900/70 dark:bg-indigo-950/20" role="status" aria-live="polite">
+                            <div className="mb-2 flex flex-wrap items-center gap-2">
+                                <div className="font-semibold text-slate-900 dark:text-slate-100">{runProgress.kind === "refresh" ? "S3 Refresh Progress" : "Aardvark Regeneration Progress"}</div>
+                                <div className="text-slate-500 dark:text-slate-400">{runProgressPercent}%</div>
+                                <div className="ml-auto text-slate-500 dark:text-slate-400">Elapsed {runElapsedLabel}</div>
+                            </div>
+                            <div className="h-2 overflow-hidden rounded-full bg-white dark:bg-slate-800">
+                                <div className="h-full rounded-full bg-indigo-600 transition-all duration-500" style={{ width: `${runProgressPercent}%` }} />
+                            </div>
+                            <div className="mt-2 text-slate-700 dark:text-slate-200">{runProgress.message}</div>
+                            <div className="mt-2 text-slate-600 dark:text-slate-300">
+                                {runProgress.completed} published · {runProgress.failed} failed · {runProgress.total} total
+                                {runProgress.currentAsset ? ` · ${runProgress.currentAsset}` : ""}
+                            </div>
+                        </div>
+                    )}
+                    <div className="grid grid-cols-1 gap-3 lg:grid-cols-[minmax(320px,420px)_1fr]">
+                        <section className="rounded-lg border border-gray-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
+                            <div className="grid grid-cols-1 gap-3 text-xs">
+                                <select value={selectedStorageId} onChange={(e) => setSelectedStorageId(e.target.value)} className="rounded border border-gray-300 bg-white px-2 py-1.5 text-sm dark:border-slate-700 dark:bg-slate-950">
+                                    <option value="">Storage profile...</option>
+                                    {config.storageProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}
+                                </select>
+                                <select value={selectedModelId} onChange={(e) => setSelectedModelId(e.target.value)} className="rounded border border-gray-300 bg-white px-2 py-1.5 text-sm dark:border-slate-700 dark:bg-slate-950">
+                                    <option value="">OpenAI profile...</option>
+                                    {config.modelProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name} - {profile.defaultModel}</option>)}
+                                </select>
+                                <select value={selectedVisionId} onChange={(e) => setSelectedVisionId(e.target.value)} className="rounded border border-gray-300 bg-white px-2 py-1.5 text-sm dark:border-slate-700 dark:bg-slate-950">
+                                    <option value="">OCR: OpenAI image extraction</option>
+                                    {config.visionProfiles.map((profile) => <option key={profile.id} value={profile.id}>OCR: {profile.name} - {profile.featureType || "DOCUMENT_TEXT_DETECTION"}</option>)}
+                                </select>
+                                <label
+                                    className="flex min-h-40 cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed border-indigo-200 bg-indigo-50/50 px-4 py-6 text-center text-slate-700 hover:bg-indigo-50 dark:border-indigo-900 dark:bg-indigo-950/20 dark:text-slate-200 dark:hover:bg-indigo-950/40"
+                                    onDragOver={(event) => event.preventDefault()}
+                                    onDrop={(event) => {
+                                        event.preventDefault();
+                                        addUploadFiles(event.dataTransfer.files);
+                                    }}
+                                >
+                                    <input
+                                        type="file"
+                                        multiple
+                                        accept="image/*,.tif,.tiff,.jp2,.j2k,.txt,.xml,.fgdc,.iso"
+                                        className="sr-only"
+                                        onChange={(event) => {
+                                            if (event.currentTarget.files) addUploadFiles(event.currentTarget.files);
+                                            event.currentTarget.value = "";
+                                        }}
+                                    />
+                                    <span className="text-sm font-semibold">Drop Image Assets</span>
+                                    <span className="mt-1 text-xs text-slate-500 dark:text-slate-400">JPEG, PNG, WebP, TIFF, JP2, TXT, FGDC XML, ISO XML</span>
+                                </label>
+                                {metadataItems.length > 0 && (
+                                    <div className="rounded-md border border-gray-200 bg-gray-50 p-2 dark:border-slate-800 dark:bg-slate-950/50">
+                                        <div className="mb-1 text-[11px] font-semibold uppercase text-slate-500 dark:text-slate-400">Companion Metadata</div>
+                                        <div className="flex flex-col gap-1">
+                                            {metadataItems.map((item) => (
+                                                <div key={item.id} className="flex items-center gap-2 rounded bg-white px-2 py-1 dark:bg-slate-900">
+                                                    <span className="min-w-0 flex-1 truncate font-mono">{item.name}</span>
+                                                    <span className="shrink-0 text-slate-500 dark:text-slate-400">{formatBytes(item.size)}</span>
+                                                    <button type="button" onClick={() => removeMetadataItem(item.id)} disabled={isUploading} className="shrink-0 rounded border border-gray-300 px-1.5 py-0.5 disabled:opacity-40 dark:border-slate-700">Remove</button>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    </div>
+                                )}
+                                <div className="flex flex-wrap items-center gap-2">
+                                    <button type="button" onClick={processUploads} disabled={isBusy || isRestoring || processableUploadCount === 0 || !selectedStorageId || !selectedModelId} className="rounded bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white disabled:opacity-40">
+                                        {isUploading ? "Processing..." : "Process Uploads"}
+                                    </button>
+                                    <button type="button" onClick={regenerateAardvarkFromS3} disabled={isBusy || isRestoring || !selectedStorageId || !selectedModelId} className="rounded border border-indigo-300 px-3 py-1.5 text-xs font-medium text-indigo-700 disabled:opacity-40 dark:border-indigo-700 dark:text-indigo-200">
+                                        {isRegenerating ? "Regenerating..." : "Regenerate S3 Aardvark"}
+                                    </button>
+                                    <button type="button" onClick={refreshLocalAardvarkFromS3} disabled={isBusy || isRestoring || !selectedStorageId} className="rounded border border-emerald-300 px-3 py-1.5 text-xs font-medium text-emerald-700 disabled:opacity-40 dark:border-emerald-700 dark:text-emerald-200">
+                                        {isRefreshing ? "Refreshing..." : "Refresh Local from S3"}
+                                    </button>
+                                    {isUploading && <button type="button" onClick={cancelUpload} className="rounded border border-amber-300 px-3 py-1.5 text-xs text-amber-800 dark:border-amber-700 dark:text-amber-200">Cancel</button>}
+                                    {isRegenerating && <button type="button" onClick={cancelRun} className="rounded border border-amber-300 px-3 py-1.5 text-xs text-amber-800 dark:border-amber-700 dark:text-amber-200">Cancel Regeneration</button>}
+                                    {isRefreshing && <button type="button" onClick={cancelRun} className="rounded border border-amber-300 px-3 py-1.5 text-xs text-amber-800 dark:border-amber-700 dark:text-amber-200">Cancel Refresh</button>}
+                                    <button type="button" onClick={clearFinishedUploads} disabled={isUploading || completedUploadCount === 0} className="rounded border border-gray-300 px-3 py-1.5 text-xs disabled:opacity-40 dark:border-slate-700">Clear Finished</button>
+                                </div>
+                                <textarea value={batchDefaultsText} onChange={(e) => setBatchDefaultsText(e.target.value)} className="h-52 w-full rounded border px-2 py-1 font-mono text-xs dark:border-slate-700 dark:bg-slate-950" />
+                            </div>
+                        </section>
+
+                        <section className="min-h-0 rounded-lg border border-gray-200 bg-white dark:border-slate-800 dark:bg-slate-900">
+                            <div className="flex flex-wrap items-center gap-2 border-b border-gray-100 px-4 py-3 text-xs dark:border-slate-800">
+                                <h2 className="text-sm font-semibold">Upload Pipeline</h2>
+                                <span className="text-slate-500 dark:text-slate-400">{uploadItems.length} queued · {completedUploadCount} published</span>
+                                {uploadItems.length > 0 && (
+                                    <div className="ml-auto flex min-w-40 items-center gap-2">
+                                        <div className="h-2 flex-1 overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800">
+                                            <div className="h-full rounded-full bg-indigo-600 transition-all duration-500" style={{ width: `${Math.round((completedUploadCount / uploadItems.length) * 100)}%` }} />
+                                        </div>
+                                        <span className="text-slate-500 dark:text-slate-400">{Math.round((completedUploadCount / uploadItems.length) * 100)}%</span>
+                                    </div>
+                                )}
+                            </div>
+                            <div className="min-h-0 overflow-auto">
+                                {uploadItems.map((item) => (
+                                    <div key={item.id} className="border-b border-gray-100 p-4 text-xs last:border-b-0 dark:border-slate-800">
+                                        <div className="flex flex-wrap items-start gap-3">
+                                            <div className="min-w-0 flex-1">
+                                                <div className="flex flex-wrap items-center gap-2">
+                                                    <div className="truncate font-semibold text-slate-900 dark:text-slate-100">{item.name}</div>
+                                                    <span className={`rounded px-2 py-0.5 text-[11px] font-medium ${item.status === "failed"
+                                                        ? "bg-red-50 text-red-700 dark:bg-red-950/40 dark:text-red-200"
+                                                        : item.status === "completed" || item.status === "cached"
+                                                            ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-200"
+                                                            : "bg-indigo-50 text-indigo-700 dark:bg-indigo-950/40 dark:text-indigo-200"
+                                                        }`}>{item.status}</span>
+                                                    <span className="text-slate-500 dark:text-slate-400">{formatBytes(item.size)}</span>
+                                                </div>
+                                                <div className="mt-1 text-slate-600 dark:text-slate-300">{item.message}</div>
+                                                {item.error && <div className="mt-1 whitespace-pre-wrap font-mono text-red-700 dark:text-red-300">{item.error}</div>}
+                                                {item.checksum && <div className="mt-1 truncate font-mono text-slate-500 dark:text-slate-400">sha256:{item.checksum}</div>}
+                                                {item.resourceId && <div className="mt-1 truncate text-emerald-700 dark:text-emerald-300">Published {item.resourceId}{item.confidence != null ? ` · confidence ${item.confidence}` : ""}</div>}
+                                                {item.artifacts && (
+                                                    <div className="mt-2 flex flex-wrap gap-2">
+                                                        <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.originalUrl} target="_blank" rel="noreferrer">Original</a>
+                                                        <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.thumbnailUrl} target="_blank" rel="noreferrer">Thumbnail</a>
+                                                        <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.iiifInfoUrl} target="_blank" rel="noreferrer">IIIF</a>
+                                                        <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.extractionUrl} target="_blank" rel="noreferrer">Extraction</a>
+                                                        <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.aardvarkUrl} target="_blank" rel="noreferrer">Aardvark</a>
+                                                    </div>
+                                                )}
+                                                {item.artifacts && item.extraction !== undefined && item.extraction !== null && (() => {
+                                                    const textAnnotations = normalizeTextExtractionAnnotations(item.extraction);
+                                                    if (textAnnotations.length === 0) return null;
+                                                    const isExpanded = expandedTextReviewId === item.id;
+                                                    return (
+                                                        <div className="mt-3 rounded-md border border-slate-200 bg-slate-50 p-2 dark:border-slate-800 dark:bg-slate-950/50">
+                                                            <div className="flex flex-wrap items-center gap-2">
+                                                                <div className="font-semibold text-slate-900 dark:text-slate-100">Text Review</div>
+                                                                <span className="text-slate-500 dark:text-slate-400">{textAnnotations.length} extracted text box{textAnnotations.length === 1 ? "" : "es"}</span>
+                                                                <button
+                                                                    type="button"
+                                                                    className="ml-auto rounded border border-gray-300 px-2 py-1 text-xs font-medium text-slate-700 hover:bg-white dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                                                                    onClick={() => setExpandedTextReviewId(isExpanded ? null : item.id)}
+                                                                >
+                                                                    {isExpanded ? "Hide View" : "Open View"}
+                                                                </button>
+                                                            </div>
+                                                            {isExpanded && (
+                                                                <IiifImageViewer
+                                                                    infoUrl={item.artifacts.iiifInfoUrl}
+                                                                    textAnnotations={textAnnotations}
+                                                                    heightClassName="h-[460px]"
+                                                                    className="mt-2 rounded-md"
+                                                                />
+                                                            )}
+                                                        </div>
+                                                    );
+                                                })()}
+                                                {item.milestones && item.milestones.length > 0 && (
+                                                    <div className="mt-3 max-h-36 overflow-auto rounded border border-gray-100 bg-gray-50/70 dark:border-slate-800 dark:bg-slate-950/50">
+                                                        {item.milestones.map((milestone) => (
+                                                            <div key={milestone.id} className="grid grid-cols-[72px_54px_minmax(0,1fr)] gap-2 border-b border-gray-100 px-2 py-1.5 last:border-b-0 dark:border-slate-800">
+                                                                <span className="text-slate-500 dark:text-slate-400">{milestone.at}</span>
+                                                                <span className={`font-medium ${milestone.status === "error" ? "text-red-600 dark:text-red-300" : milestone.status === "active" ? "text-indigo-700 dark:text-indigo-300" : "text-emerald-700 dark:text-emerald-300"}`}>{milestone.status}</span>
+                                                                <span className="min-w-0">
+                                                                    <span className="font-medium">{milestone.label}</span>
+                                                                    {milestone.detail && <span className="ml-2 break-words text-slate-500 dark:text-slate-400">{milestone.detail}</span>}
+                                                                </span>
+                                                            </div>
+                                                        ))}
+                                                    </div>
+                                                )}
+                                            </div>
+                                            <button type="button" onClick={() => removeUploadItem(item.id)} disabled={isUploading && ["hashing", "processing", "publishing"].includes(item.status)} className="rounded border border-gray-300 px-2 py-1 text-xs disabled:opacity-40 dark:border-slate-700">Remove</button>
+                                        </div>
+                                    </div>
+                                ))}
+                                {uploadItems.length === 0 && (
+                                    <div className="p-8 text-center text-xs text-slate-500 dark:text-slate-400">No upload jobs queued.</div>
+                                )}
+                            </div>
+                        </section>
+                    </div>
+                </div>
+            )}
+
             {activePanel === "config" && (
-                <div className="grid min-h-0 grid-cols-1 gap-4 overflow-auto lg:grid-cols-2">
+                <div className="grid min-h-0 grid-cols-1 gap-4 overflow-auto xl:grid-cols-3">
                     <section className="rounded-lg border border-gray-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
                         <div className="mb-3 flex items-center justify-between">
                             <h2 className="text-sm font-semibold">S3-Compatible Storage Profiles</h2>
@@ -362,10 +1441,13 @@ export const EnrichmentWorkbench: React.FC = () => {
                             <input className="rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950" value={storageDraft.bucket} onChange={(e) => setStorageDraft({ ...storageDraft, bucket: e.target.value })} placeholder="Bucket" />
                             <input className="rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950" value={(storageDraft.prefixes || []).join("\n")} onChange={(e) => setStorageDraft({ ...storageDraft, prefixes: e.target.value.split(/\n|,/).map((v) => v.trim()) })} placeholder="Prefixes, comma or newline separated" />
                             <input className="rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950" value={storageDraft.publicBaseUrl || ""} onChange={(e) => setStorageDraft({ ...storageDraft, publicBaseUrl: e.target.value })} placeholder="Optional public base URL" />
+                            <p className="rounded-md bg-amber-50 px-2 py-1.5 text-[11px] text-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
+                                Enter environment variable names here, not secret values. Put actual credentials in web/.env or the shell that starts the proxy.
+                            </p>
                             <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
-                                <input className="rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950" value={storageDraft.accessKeyIdEnv || ""} onChange={(e) => setStorageDraft({ ...storageDraft, accessKeyIdEnv: e.target.value })} placeholder="Access key env" />
-                                <input className="rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950" value={storageDraft.secretAccessKeyEnv || ""} onChange={(e) => setStorageDraft({ ...storageDraft, secretAccessKeyEnv: e.target.value })} placeholder="Secret key env" />
-                                <input className="rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950" value={storageDraft.sessionTokenEnv || ""} onChange={(e) => setStorageDraft({ ...storageDraft, sessionTokenEnv: e.target.value })} placeholder="Session token env" />
+                                <input className="rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950" value={storageDraft.accessKeyIdEnv || ""} onChange={(e) => setStorageDraft({ ...storageDraft, accessKeyIdEnv: e.target.value })} placeholder="AWS_ACCESS_KEY_ID" aria-label="S3 access key environment variable name" />
+                                <input className="rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950" value={storageDraft.secretAccessKeyEnv || ""} onChange={(e) => setStorageDraft({ ...storageDraft, secretAccessKeyEnv: e.target.value })} placeholder="AWS_SECRET_ACCESS_KEY" aria-label="S3 secret access key environment variable name" />
+                                <input className="rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950" value={storageDraft.sessionTokenEnv || ""} onChange={(e) => setStorageDraft({ ...storageDraft, sessionTokenEnv: e.target.value })} placeholder="AWS_SESSION_TOKEN" aria-label="S3 session token environment variable name" />
                             </div>
                             <label className="flex items-center gap-2">
                                 <input type="checkbox" checked={storageDraft.forcePathStyle !== false} onChange={(e) => setStorageDraft({ ...storageDraft, forcePathStyle: e.target.checked })} />
@@ -375,7 +1457,7 @@ export const EnrichmentWorkbench: React.FC = () => {
                         <div className="mt-3 flex gap-2">
                             <button type="button" onClick={saveStorageProfile} className="rounded bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white">Save</button>
                             <button type="button" onClick={deleteStorageProfile} disabled={!selectedStorageId} className="rounded border border-red-200 px-3 py-1.5 text-xs text-red-700 disabled:opacity-40 dark:border-red-800 dark:text-red-200">Delete</button>
-                            <button type="button" onClick={async () => selectedStorageId && setStatus((await enrichmentProxyClient.testStorageProfile(selectedStorageId)).message)} disabled={!selectedStorageId} className="rounded border border-gray-300 px-3 py-1.5 text-xs disabled:opacity-40 dark:border-slate-700">Test</button>
+                            <button type="button" onClick={testStorageProfile} disabled={!selectedStorageId} className="rounded border border-gray-300 px-3 py-1.5 text-xs disabled:opacity-40 dark:border-slate-700">Test</button>
                         </div>
                     </section>
 
@@ -390,14 +1472,49 @@ export const EnrichmentWorkbench: React.FC = () => {
                         </select>
                         <div className="grid grid-cols-1 gap-2 text-xs">
                             <input className="rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950" value={modelDraft.name} onChange={(e) => setModelDraft({ ...modelDraft, name: e.target.value })} placeholder="Profile name" />
-                            <input className="rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950" value={modelDraft.apiKeyEnv} onChange={(e) => setModelDraft({ ...modelDraft, apiKeyEnv: e.target.value })} placeholder="API key env var" />
+                            <p className="rounded-md bg-amber-50 px-2 py-1.5 text-[11px] text-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
+                                Env var name only. Put the OpenAI API key value in web/.env or the shell, then reference it here.
+                            </p>
+                            <input className="rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950" value={modelDraft.apiKeyEnv} onChange={(e) => setModelDraft({ ...modelDraft, apiKeyEnv: e.target.value })} placeholder="OPENAI_API_KEY" aria-label="OpenAI API key environment variable name" />
                             <input className="rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950" value={modelDraft.defaultModel} onChange={(e) => setModelDraft({ ...modelDraft, defaultModel: e.target.value })} placeholder="Default model" />
                             <textarea className="h-28 rounded border px-2 py-1 font-mono text-xs dark:border-slate-700 dark:bg-slate-950" value={pretty(modelDraft.modelParams ?? {})} onChange={(e) => setModelDraft({ ...modelDraft, modelParams: parseJsonField(e.target.value, {}) })} />
                         </div>
                         <div className="mt-3 flex gap-2">
                             <button type="button" onClick={saveModelProfile} className="rounded bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white">Save</button>
                             <button type="button" onClick={deleteModelProfile} disabled={!selectedModelId} className="rounded border border-red-200 px-3 py-1.5 text-xs text-red-700 disabled:opacity-40 dark:border-red-800 dark:text-red-200">Delete</button>
-                            <button type="button" onClick={async () => selectedModelId && setStatus((await enrichmentProxyClient.testModelProfile(selectedModelId)).message)} disabled={!selectedModelId} className="rounded border border-gray-300 px-3 py-1.5 text-xs disabled:opacity-40 dark:border-slate-700">Test</button>
+                            <button type="button" onClick={testModelProfile} disabled={!selectedModelId} className="rounded border border-gray-300 px-3 py-1.5 text-xs disabled:opacity-40 dark:border-slate-700">Test</button>
+                        </div>
+                    </section>
+
+                    <section className="rounded-lg border border-gray-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
+                        <div className="mb-3 flex items-center justify-between">
+                            <h2 className="text-sm font-semibold">Google Vision OCR Profiles</h2>
+                            <button type="button" className="rounded bg-slate-100 px-2 py-1 text-xs dark:bg-slate-800" onClick={() => setVisionDraft(blankVisionProfile())}>New</button>
+                        </div>
+                        <select className="mb-3 w-full rounded border border-gray-300 bg-white px-2 py-1 text-sm dark:border-slate-700 dark:bg-slate-950" value={selectedVisionId} onChange={(e) => setSelectedVisionId(e.target.value)}>
+                            <option value="">Choose profile...</option>
+                            {config.visionProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name} - {profile.featureType || "DOCUMENT_TEXT_DETECTION"}</option>)}
+                        </select>
+                        <div className="grid grid-cols-1 gap-2 text-xs">
+                            <input className="rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950" value={visionDraft.name} onChange={(e) => setVisionDraft({ ...visionDraft, name: e.target.value })} placeholder="Profile name" />
+                            <p className="rounded-md bg-amber-50 px-2 py-1.5 text-[11px] text-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
+                                Env var name only. Put the Google Cloud Vision API key value in web/.env or the shell, then reference it here.
+                            </p>
+                            <input className="rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950" value={visionDraft.apiKeyEnv} onChange={(e) => setVisionDraft({ ...visionDraft, apiKeyEnv: e.target.value })} placeholder="GOOGLE_CLOUD_VISION_API_KEY" aria-label="Google Cloud Vision API key environment variable name" />
+                            <input className="rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950" value={visionDraft.endpoint || ""} onChange={(e) => setVisionDraft({ ...visionDraft, endpoint: e.target.value })} placeholder="https://vision.googleapis.com/v1/images:annotate" />
+                            <select className="rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950" value={visionDraft.featureType || "DOCUMENT_TEXT_DETECTION"} onChange={(e) => setVisionDraft({ ...visionDraft, featureType: e.target.value as ProxyVisionProfile["featureType"] })}>
+                                <option value="DOCUMENT_TEXT_DETECTION">DOCUMENT_TEXT_DETECTION</option>
+                                <option value="TEXT_DETECTION">TEXT_DETECTION</option>
+                            </select>
+                            <input className="rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950" value={(visionDraft.languageHints || []).join(", ")} onChange={(e) => setVisionDraft({ ...visionDraft, languageHints: e.target.value.split(/[\s,]+/).map((hint) => hint.trim()).filter(Boolean) })} placeholder="Optional language hints, e.g. en, fr" />
+                            <p className="rounded-md bg-slate-50 px-2 py-1.5 text-[11px] text-slate-600 dark:bg-slate-950/60 dark:text-slate-300">
+                                Leave OCR unselected to use OpenAI for extraction. Choose a Vision profile to let Google produce the extracted text boxes before OpenAI writes the Aardvark record.
+                            </p>
+                        </div>
+                        <div className="mt-3 flex gap-2">
+                            <button type="button" onClick={saveVisionProfile} className="rounded bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white">Save</button>
+                            <button type="button" onClick={deleteVisionProfile} disabled={!selectedVisionId} className="rounded border border-red-200 px-3 py-1.5 text-xs text-red-700 disabled:opacity-40 dark:border-red-800 dark:text-red-200">Delete</button>
+                            <button type="button" onClick={testVisionProfile} disabled={!selectedVisionId} className="rounded border border-gray-300 px-3 py-1.5 text-xs disabled:opacity-40 dark:border-slate-700">Test</button>
                         </div>
                     </section>
                 </div>
@@ -410,90 +1527,88 @@ export const EnrichmentWorkbench: React.FC = () => {
                             <option value="">Storage profile...</option>
                             {config.storageProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}
                         </select>
-                        <button type="button" onClick={syncInventory} disabled={busy || !selectedStorageId} className="rounded bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white disabled:opacity-40">Sync Inventory</button>
-                        <button type="button" onClick={() => setSelectedAssetIds(new Set(assets.filter((a) => a.status === "ready").map((a) => a.id)))} className="rounded border border-gray-300 px-3 py-1.5 text-xs dark:border-slate-700">Select Ready</button>
-                        <span className="text-xs text-slate-500">{selectedAssetIds.size} selected</span>
+                        <input
+                            value={inventoryQuery}
+                            onChange={(event) => setInventoryQuery(event.target.value)}
+                            className="min-w-56 flex-1 rounded border border-gray-300 bg-white px-2 py-1 text-sm dark:border-slate-700 dark:bg-slate-950"
+                            placeholder="Find UUID, file, or prefix..."
+                        />
+                        <button type="button" onClick={() => refreshS3Inventory()} disabled={isInventoryLoading || !selectedStorageId} className="rounded bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white disabled:opacity-40">{isInventoryLoading ? "Refreshing..." : "Refresh Bucket"}</button>
+                        {isInventoryLoading && <button type="button" onClick={cancelInventoryRefresh} className="rounded border border-amber-300 px-3 py-1.5 text-xs text-amber-800 dark:border-amber-700 dark:text-amber-200">Cancel</button>}
+                        <span className="ml-auto text-xs text-slate-500 dark:text-slate-400">{inventoryStatus || (inventoryLoadedAt ? `Loaded ${formatDateTime(inventoryLoadedAt)}` : "Bucket not loaded")}</span>
+                    </div>
+                    <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+                        <div className="rounded-lg border border-gray-200 bg-white p-3 dark:border-slate-800 dark:bg-slate-900">
+                            <div className="text-[11px] font-semibold uppercase text-slate-500 dark:text-slate-400">UUIDs</div>
+                            <div className="mt-1 text-2xl font-semibold text-slate-900 dark:text-slate-100">{inventoryResources.length.toLocaleString()}</div>
+                        </div>
+                        <div className="rounded-lg border border-gray-200 bg-white p-3 dark:border-slate-800 dark:bg-slate-900">
+                            <div className="text-[11px] font-semibold uppercase text-slate-500 dark:text-slate-400">Complete</div>
+                            <div className="mt-1 text-2xl font-semibold text-emerald-700 dark:text-emerald-300">{inventoryCompleteCount.toLocaleString()}</div>
+                        </div>
+                        <div className="rounded-lg border border-gray-200 bg-white p-3 dark:border-slate-800 dark:bg-slate-900">
+                            <div className="text-[11px] font-semibold uppercase text-slate-500 dark:text-slate-400">Needs Attention</div>
+                            <div className="mt-1 text-2xl font-semibold text-amber-700 dark:text-amber-300">{inventoryMissingCount.toLocaleString()}</div>
+                        </div>
                     </div>
                     <div className="min-h-0 overflow-auto rounded-lg border border-gray-200 dark:border-slate-800">
                         <table className="w-full text-left text-xs">
                             <thead className="sticky top-0 bg-gray-50 dark:bg-slate-900">
-                                <tr><th className="p-2">Run</th><th className="p-2">Status</th><th className="p-2">Object</th><th className="p-2">Size</th><th className="p-2">Updated</th></tr>
+                                <tr>
+                                    <th className="p-2">UUID</th>
+                                    <th className="p-2">Files</th>
+                                    <th className="p-2">Original</th>
+                                    <th className="p-2">Size</th>
+                                    <th className="p-2">Updated</th>
+                                    <th className="p-2">Prefix</th>
+                                </tr>
                             </thead>
                             <tbody>
-                                {assets.map((asset) => (
-                                    <tr key={asset.id} className="border-t border-gray-100 dark:border-slate-800">
-                                        <td className="p-2"><input type="checkbox" checked={selectedAssetIds.has(asset.id)} disabled={asset.status !== "ready"} onChange={() => toggleAsset(asset.id)} /></td>
-                                        <td className="p-2">{asset.status}</td>
-                                        <td className="max-w-xl truncate p-2 font-mono">{asset.object_key}</td>
-                                        <td className="p-2">{asset.size_bytes ? Number(asset.size_bytes).toLocaleString() : ""}</td>
-                                        <td className="p-2">{asset.last_modified}</td>
+                                {inventoryRows.map((resource) => {
+                                    const fileFlags = [
+                                        { key: "original", ok: Boolean(resource.originalKey), href: resource.artifacts.originalUrl },
+                                        { key: "thumbnail", ok: resource.hasThumbnail, href: resource.artifacts.thumbnailUrl },
+                                        { key: "iiif", ok: resource.hasIiif, href: resource.artifacts.iiifInfoUrl },
+                                        { key: "extraction", ok: resource.hasExtraction, href: resource.artifacts.extractionUrl },
+                                        { key: "aardvark", ok: resource.hasAardvark, href: resource.artifacts.aardvarkUrl },
+                                    ];
+                                    return (
+                                        <tr key={resource.root} className="border-t border-gray-100 align-top dark:border-slate-800">
+                                            <td className="max-w-64 p-2 font-mono">
+                                                <div className="truncate" title={resource.resourceId}>{resource.resourceId}</div>
+                                                {resource.metadataSourceCount > 0 && <div className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">{resource.metadataSourceCount} metadata file(s)</div>}
+                                            </td>
+                                            <td className="p-2">
+                                                <div className="flex max-w-md flex-wrap gap-1">
+                                                    {fileFlags.map((flag) => flag.ok ? (
+                                                        <a key={flag.key} href={flag.href} target="_blank" rel="noreferrer" className="rounded border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700 hover:bg-emerald-100 dark:border-emerald-900 dark:bg-emerald-950/30 dark:text-emerald-200">
+                                                            {flag.key}
+                                                        </a>
+                                                    ) : (
+                                                        <span key={flag.key} className="rounded border border-amber-200 bg-amber-50 px-2 py-0.5 text-[11px] font-medium text-amber-700 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
+                                                            missing {flag.key}
+                                                        </span>
+                                                    ))}
+                                                </div>
+                                            </td>
+                                            <td className="max-w-64 truncate p-2 font-mono" title={resource.originalKey || resource.fileName}>{resource.fileName || resource.originalKey || ""}</td>
+                                            <td className="p-2">{resource.sizeBytes ? formatBytes(resource.sizeBytes) : ""}</td>
+                                            <td className="p-2 whitespace-nowrap">{resource.updatedAt ? formatDateTime(resource.updatedAt) : ""}</td>
+                                            <td className="max-w-sm truncate p-2 font-mono" title={resource.root}>{resource.root}</td>
+                                        </tr>
+                                    );
+                                })}
+                                {inventoryRows.length === 0 && (
+                                    <tr>
+                                        <td colSpan={6} className="p-6 text-center text-slate-500">{isInventoryLoading ? "Loading S3 inventory..." : "No S3 upload folders found."}</td>
                                     </tr>
-                                ))}
+                                )}
                             </tbody>
                         </table>
-                    </div>
-                    <div className="rounded-lg border border-gray-200 bg-white p-3 dark:border-slate-800 dark:bg-slate-900">
-                        <div className="mb-2 flex flex-wrap items-center gap-3">
-                            <select value={selectedModelId} onChange={(e) => setSelectedModelId(e.target.value)} className="rounded border border-gray-300 bg-white px-2 py-1 text-sm dark:border-slate-700 dark:bg-slate-950">
-                                <option value="">OpenAI profile...</option>
-                                {config.modelProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}
-                            </select>
-                            <label className="text-xs">Auto-draft threshold <input type="number" min="0" max="1" step="0.01" value={threshold} onChange={(e) => setThreshold(Number(e.target.value))} className="ml-2 w-20 rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950" /></label>
-                            <button type="button" onClick={runBatch} disabled={busy || selectedAssetIds.size === 0} className="rounded bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white disabled:opacity-40">{busy ? "Running..." : "Run Historical Map Extraction"}</button>
-                        </div>
-                        <textarea value={batchDefaultsText} onChange={(e) => setBatchDefaultsText(e.target.value)} className="h-36 w-full rounded border px-2 py-1 font-mono text-xs dark:border-slate-700 dark:bg-slate-950" />
                     </div>
                 </div>
             )}
 
-            {activePanel === "runs" && (
-                <div className="grid min-h-0 grid-cols-1 gap-4 lg:grid-cols-2">
-                    <div className="min-h-0 overflow-auto rounded-lg border border-gray-200 dark:border-slate-800">
-                        <table className="w-full text-left text-xs">
-                            <thead className="sticky top-0 bg-gray-50 dark:bg-slate-900"><tr><th className="p-2">Status</th><th className="p-2">Confidence</th><th className="p-2">Asset</th></tr></thead>
-                            <tbody>
-                                {runs.map((run) => (
-                                    <tr key={run.id} onClick={() => setSelectedRunId(run.id)} className={`cursor-pointer border-t border-gray-100 dark:border-slate-800 ${selectedRunId === run.id ? "bg-indigo-50 dark:bg-indigo-950/40" : ""}`}>
-                                        <td className="p-2">{run.status}</td>
-                                        <td className="p-2">{run.confidence ?? ""}</td>
-                                        <td className="max-w-sm truncate p-2 font-mono">{run.asset_id}</td>
-                                    </tr>
-                                ))}
-                            </tbody>
-                        </table>
-                    </div>
-                    <div className="min-h-0 overflow-auto rounded-lg border border-gray-200 bg-white p-3 dark:border-slate-800 dark:bg-slate-900">
-                        <div className="mb-2 flex items-center justify-between">
-                            <h2 className="text-sm font-semibold">Response</h2>
-                            <button type="button" onClick={createDraftForSelectedRun} disabled={!selectedRun || selectedRun.status !== "completed"} className="rounded bg-emerald-600 px-3 py-1.5 text-xs text-white disabled:opacity-40">Create Draft</button>
-                        </div>
-                        <pre className="whitespace-pre-wrap text-xs">{selectedRun ? pretty(parseJsonField(selectedRun.parsed_response_json || selectedRun.raw_response_json || "{}", {})) : "Select a run."}</pre>
-                    </div>
-                </div>
-            )}
-
-            {activePanel === "drafts" && (
-                <div className="grid min-h-0 grid-cols-1 gap-4 lg:grid-cols-[360px_1fr]">
-                    <div className="min-h-0 overflow-auto rounded-lg border border-gray-200 dark:border-slate-800">
-                        {drafts.map((draft) => (
-                            <button key={draft.id} type="button" onClick={() => setSelectedDraftId(draft.id)} className={`block w-full border-b border-gray-100 p-3 text-left text-xs dark:border-slate-800 ${selectedDraftId === draft.id ? "bg-indigo-50 dark:bg-indigo-950/40" : ""}`}>
-                                <div className="font-medium">{draft.status} · {draft.confidence}</div>
-                                <div className="truncate font-mono text-slate-500">{draft.id}</div>
-                                {draft.published_resource_id && <div className="truncate text-emerald-600">{draft.published_resource_id}</div>}
-                            </button>
-                        ))}
-                    </div>
-                    <div className="flex min-h-0 flex-col gap-2 rounded-lg border border-gray-200 bg-white p-3 dark:border-slate-800 dark:bg-slate-900">
-                        <div className="flex items-center gap-2">
-                            <h2 className="text-sm font-semibold">Aardvark Draft</h2>
-                            <button type="button" onClick={saveSelectedDraft} disabled={!selectedDraft || selectedDraft.status !== "draft"} className="ml-auto rounded border border-gray-300 px-3 py-1.5 text-xs disabled:opacity-40 dark:border-slate-700">Save Draft</button>
-                            <button type="button" onClick={() => selectedDraft && updateAardvarkDraft(selectedDraft.id, { status: "rejected" }).then(refreshLocal)} disabled={!selectedDraft || selectedDraft.status !== "draft"} className="rounded border border-red-200 px-3 py-1.5 text-xs text-red-700 disabled:opacity-40 dark:border-red-800 dark:text-red-200">Reject</button>
-                            <button type="button" onClick={publishSelectedDraft} disabled={!selectedDraft || selectedDraft.status !== "draft"} className="rounded bg-emerald-600 px-3 py-1.5 text-xs text-white disabled:opacity-40">Publish</button>
-                        </div>
-                        <textarea value={draftEditor} onChange={(e) => setDraftEditor(e.target.value)} className="min-h-0 flex-1 rounded border px-2 py-1 font-mono text-xs dark:border-slate-700 dark:bg-slate-950" placeholder="Select a draft." />
-                    </div>
-                </div>
-            )}
         </div>
     );
 };

@@ -2,7 +2,6 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { importCsv, importJsonData, importDuckDbFile } from './import';
 import * as dbInit from './dbInit';
 import * as lifecycle from './lifecycle';
-import * as mutations from './mutations';
 
 // Mock dependencies
 vi.mock('./dbInit', () => ({
@@ -15,6 +14,7 @@ vi.mock('./lifecycle', () => ({
 
 vi.mock('./mutations', () => ({
     upsertResource: vi.fn(),
+    parseCentroidForH3: vi.fn(() => null),
 }));
 
 vi.mock('@duckdb/duckdb-wasm', () => ({
@@ -40,6 +40,7 @@ describe('DuckDB Import', () => {
         vi.clearAllMocks();
         vi.mocked(dbInit.getDuckDbContext).mockResolvedValue(mockCtx as any);
         mockConn.query.mockReset();
+        mockConn.query.mockResolvedValue({ toArray: () => [], numRows: 0 });
         mockConn.prepare.mockReset();
     });
 
@@ -53,24 +54,30 @@ describe('DuckDB Import', () => {
             const count = await importJsonData(data);
 
             expect(count).toBe(2);
-            expect(mutations.upsertResource).toHaveBeenCalledTimes(2);
+            expect(mockConn.query).toHaveBeenCalledWith('BEGIN TRANSACTION');
+            expect(mockConn.query).toHaveBeenCalledWith(expect.stringContaining('INSERT INTO resources'));
+            expect(mockConn.query).toHaveBeenCalledWith(expect.stringContaining('INSERT INTO search_index'));
+            expect(mockConn.query).toHaveBeenCalledWith('COMMIT');
             expect(lifecycle.saveDb).toHaveBeenCalled();
         });
 
         it('handles single object', async () => {
             const data = { id: '1', dct_title_s: 'One' };
-            await importJsonData(data);
-            expect(mutations.upsertResource).toHaveBeenCalledTimes(1);
+            const count = await importJsonData(data);
+
+            expect(count).toBe(1);
+            expect(mockConn.query).toHaveBeenCalledWith(expect.stringContaining('INSERT INTO resources'));
         });
 
         it('normalizes list fields', async () => {
-            const data = { id: '1', dct_subject_sm: 'History' }; // string instead of array
+            const data = { id: '1', dct_language_sm: '[eng]' };
             await importJsonData(data);
 
-            expect(mutations.upsertResource).toHaveBeenCalledWith(
-                expect.objectContaining({ dct_subject_sm: ['History'] }),
-                expect.any(Array),
-                expect.any(Object)
+            expect(mockConn.query).toHaveBeenCalledWith(
+                expect.stringContaining("INSERT INTO resources_mv")
+            );
+            expect(mockConn.query).toHaveBeenCalledWith(
+                expect.stringContaining("'dct_language_sm','eng'")
             );
         });
     });
@@ -98,8 +105,14 @@ describe('DuckDB Import', () => {
                 .mockResolvedValueOnce(undefined)
                 // Geom Update
                 .mockResolvedValueOnce(undefined)
+                // Centroid update
+                .mockResolvedValueOnce(undefined)
+                // H3 select
+                .mockResolvedValueOnce({ toArray: () => [] })
                 // Count
-                .mockResolvedValueOnce({ toArray: () => [{ count: 1 }] });
+                .mockResolvedValueOnce({ toArray: () => [{ count: 1 }] })
+                // Drop temp table
+                .mockResolvedValueOnce(undefined);
 
             const result = await importCsv(file);
 

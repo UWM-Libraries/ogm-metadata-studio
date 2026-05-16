@@ -4,6 +4,7 @@ import { resourceToJson } from "../aardvark/model";
 import { getDuckDbContext } from "./dbInit";
 import { upsertResource } from "./mutations";
 import { saveDb } from "./lifecycle";
+import { safeJsonStringify } from "./json";
 import {
     AARDVARK_DRAFTS_TABLE,
     ENRICHMENT_BATCHES_TABLE,
@@ -43,6 +44,16 @@ export interface ProxyModelProfile {
     apiKeyEnv: string;
     defaultModel: string;
     modelParams?: Record<string, unknown>;
+}
+
+export interface ProxyVisionProfile {
+    id: string;
+    name: string;
+    provider: "google_cloud_vision";
+    apiKeyEnv: string;
+    endpoint?: string;
+    featureType?: "DOCUMENT_TEXT_DETECTION" | "TEXT_DETECTION";
+    languageHints?: string[];
 }
 
 export interface StagedAsset {
@@ -122,6 +133,10 @@ const HISTORICAL_MAP_PROMPT_VERSION_ID = "prompt-version-historical-map-extracti
 const HISTORICAL_MAP_DEFINITION_ID = "definition-historical-map-extraction";
 const DEFAULT_MODEL_PROFILE_ID = "model-profile-openai-default";
 
+function defaultHistoricalMapModelParams(): Record<string, unknown> {
+    return {};
+}
+
 export const HISTORICAL_MAP_EXTRACTION_SCHEMA = {
     type: "object",
     additionalProperties: false,
@@ -182,7 +197,8 @@ export const HISTORICAL_MAP_EXTRACTION_SCHEMA = {
         description: { type: "string" },
         debug: {
             type: "object",
-            additionalProperties: true,
+            additionalProperties: false,
+            required: ["ocr_strategy", "placename_extraction_strategy", "bbox_inference_strategy", "limitations"],
             properties: {
                 ocr_strategy: { type: "string" },
                 placename_extraction_strategy: { type: "string" },
@@ -246,7 +262,34 @@ export async function ensureDefaultEnrichmentData(connOverride?: Conn): Promise<
     if (!conn) return;
 
     const existing = await conn.query(`SELECT id FROM ${PROMPTS_TABLE} WHERE id = ${sqlLiteral(HISTORICAL_MAP_PROMPT_ID)}`);
-    if (existing.numRows > 0) return;
+    if (existing.numRows > 0) {
+        const schemaJson = sqlLiteral(safeJsonStringify(HISTORICAL_MAP_EXTRACTION_SCHEMA));
+        const variablesSchemaJson = sqlLiteral(safeJsonStringify({ type: "object", properties: { asset_id: { type: "string" } } }));
+        const modelDefaultsJson = sqlLiteral(safeJsonStringify({ detail: "high" }));
+        const defaultModelParamsJson = sqlLiteral(safeJsonStringify(defaultHistoricalMapModelParams()));
+        const updatedAt = sqlLiteral(nowIso());
+        await conn.query(`
+            UPDATE ${MODEL_PROFILES_TABLE}
+            SET model_params_json = ${defaultModelParamsJson},
+                updated_at = ${updatedAt}
+            WHERE id = ${sqlLiteral(DEFAULT_MODEL_PROFILE_ID)}
+        `);
+        await conn.query(`
+            UPDATE ${PROMPT_VERSIONS_TABLE}
+            SET output_schema_json = ${schemaJson},
+                variables_schema_json = ${variablesSchemaJson},
+                model_defaults_json = ${modelDefaultsJson}
+            WHERE id = ${sqlLiteral(HISTORICAL_MAP_PROMPT_VERSION_ID)}
+        `);
+        await conn.query(`
+            UPDATE ${ENRICHMENT_DEFINITIONS_TABLE}
+            SET output_schema_json = ${schemaJson},
+                model_params_json = ${defaultModelParamsJson},
+                updated_at = ${updatedAt}
+            WHERE id = ${sqlLiteral(HISTORICAL_MAP_DEFINITION_ID)}
+        `);
+        return;
+    }
 
     const createdAt = nowIso();
     await insertRow(conn, MODEL_PROFILES_TABLE, {
@@ -255,7 +298,7 @@ export async function ensureDefaultEnrichmentData(connOverride?: Conn): Promise<
         provider: "openai",
         api_key_env: "OPENAI_API_KEY",
         default_model: "gpt-5.5",
-        model_params_json: JSON.stringify({ temperature: 0 }),
+        model_params_json: safeJsonStringify(defaultHistoricalMapModelParams()),
         created_at: createdAt,
         updated_at: createdAt,
     });
@@ -275,9 +318,9 @@ export async function ensureDefaultEnrichmentData(connOverride?: Conn): Promise<
         version: "1",
         system_prompt: "You are a geospatial metadata assistant for historical map collections. Extract only visible printed cartographic and marginal text from the supplied map image derivatives. Return strict JSON matching the provided schema. Use normalized 0-1 image-space bounding boxes from the upper-left corner.",
         user_prompt_template: "Analyze the map image derivatives for staged asset {{asset_id}}. Preserve spaced labels, classify text roles, identify placenames, infer the map bounding box from printed graticule/coordinate evidence when present, and describe the map for an OpenGeoMetadata Aardvark draft.",
-        output_schema_json: JSON.stringify(HISTORICAL_MAP_EXTRACTION_SCHEMA),
-        variables_schema_json: JSON.stringify({ type: "object", properties: { asset_id: { type: "string" } } }),
-        model_defaults_json: JSON.stringify({ detail: "high" }),
+        output_schema_json: safeJsonStringify(HISTORICAL_MAP_EXTRACTION_SCHEMA),
+        variables_schema_json: safeJsonStringify({ type: "object", properties: { asset_id: { type: "string" } } }),
+        model_defaults_json: safeJsonStringify({ detail: "high" }),
         changelog: "Initial canonical extraction schema from Reno sheet workflow.",
         created_by: "system",
         created_at: createdAt,
@@ -290,8 +333,8 @@ export async function ensureDefaultEnrichmentData(connOverride?: Conn): Promise<
         model_profile_id: DEFAULT_MODEL_PROFILE_ID,
         model_provider: "openai",
         model_name: "gpt-5.5",
-        model_params_json: JSON.stringify({ temperature: 0 }),
-        output_schema_json: JSON.stringify(HISTORICAL_MAP_EXTRACTION_SCHEMA),
+        model_params_json: safeJsonStringify(defaultHistoricalMapModelParams()),
+        output_schema_json: safeJsonStringify(HISTORICAL_MAP_EXTRACTION_SCHEMA),
         active: true,
         created_at: createdAt,
         updated_at: createdAt,
@@ -311,7 +354,7 @@ export async function syncProxyProfilesToDuckDb(storageProfiles: ProxyStoragePro
             endpoint: profile.endpoint,
             region: profile.region ?? "us-east-1",
             bucket: profile.bucket,
-            prefixes_json: JSON.stringify(profile.prefixes ?? []),
+            prefixes_json: safeJsonStringify(profile.prefixes ?? []),
             force_path_style: profile.forcePathStyle ?? true,
             public_base_url: profile.publicBaseUrl ?? null,
             access_key_id_env: profile.accessKeyIdEnv ?? null,
@@ -330,12 +373,12 @@ export async function syncProxyProfilesToDuckDb(storageProfiles: ProxyStoragePro
             provider: profile.provider,
             api_key_env: profile.apiKeyEnv,
             default_model: profile.defaultModel,
-            model_params_json: JSON.stringify(profile.modelParams ?? {}),
+            model_params_json: safeJsonStringify(profile.modelParams ?? {}),
             created_at: at,
             updated_at: at,
         });
     }
-    await saveDb();
+    await saveDb({ resourcesDirty: false });
 }
 
 export async function upsertStagedAssets(storageProfileId: string, assets: Partial<StagedAsset>[]): Promise<number> {
@@ -364,7 +407,7 @@ export async function upsertStagedAssets(storageProfileId: string, assets: Parti
             last_synced_at: syncedAt,
         });
     }
-    await saveDb();
+    await saveDb({ resourcesDirty: false });
     return assets.length;
 }
 
@@ -431,12 +474,12 @@ export async function createEnrichmentBatch(args: {
         completed_count: 0,
         failed_count: 0,
         auto_create_threshold: args.autoCreateThreshold,
-        batch_defaults_json: JSON.stringify(args.batchDefaults),
+        batch_defaults_json: safeJsonStringify(args.batchDefaults),
         created_at: at,
         started_at: at,
         completed_at: null,
     });
-    await saveDb();
+    await saveDb({ resourcesDirty: false });
     return id;
 }
 
@@ -464,7 +507,7 @@ export async function createPendingRun(args: {
         rendered_user_prompt: args.renderedUserPrompt,
         model_name: args.definition.model_name,
         model_params_json: args.definition.model_params_json,
-        input_snapshot_json: JSON.stringify(args.asset),
+        input_snapshot_json: safeJsonStringify(args.asset),
         derivatives_json: null,
         raw_response_json: null,
         parsed_response_json: null,
@@ -476,7 +519,7 @@ export async function createPendingRun(args: {
         created_at: at,
         completed_at: null,
     });
-    await saveDb();
+    await saveDb({ resourcesDirty: false });
     return id;
 }
 
@@ -495,17 +538,17 @@ export async function completeRun(runId: string, response: {
     await ctx.conn.query(`
         UPDATE ${ENRICHMENT_RUNS_TABLE}
         SET status = ${sqlLiteral(status)},
-            derivatives_json = ${sqlLiteral(JSON.stringify(response.derivatives ?? []))},
-            raw_response_json = ${sqlLiteral(JSON.stringify(response.rawResponse ?? response.parsedResponse ?? null))},
-            parsed_response_json = ${sqlLiteral(JSON.stringify(response.parsedResponse ?? null))},
+            derivatives_json = ${sqlLiteral(safeJsonStringify(response.derivatives ?? []))},
+            raw_response_json = ${sqlLiteral(safeJsonStringify(response.rawResponse ?? response.parsedResponse ?? null))},
+            parsed_response_json = ${sqlLiteral(safeJsonStringify(response.parsedResponse ?? null))},
             confidence = ${sqlLiteral(response.confidence ?? null)},
-            validation_errors_json = ${sqlLiteral(JSON.stringify(response.validationErrors ?? []))},
-            usage_json = ${sqlLiteral(JSON.stringify(response.usage ?? null))},
+            validation_errors_json = ${sqlLiteral(safeJsonStringify(response.validationErrors ?? []))},
+            usage_json = ${sqlLiteral(safeJsonStringify(response.usage ?? null))},
             error = ${sqlLiteral(response.error ?? null)},
             completed_at = ${sqlLiteral(nowIso())}
         WHERE id = ${sqlLiteral(runId)}
     `);
-    await saveDb();
+    await saveDb({ resourcesDirty: false });
 }
 
 export function buildAardvarkDraftFromExtraction(args: {
@@ -531,7 +574,7 @@ export function buildAardvarkDraftFromExtraction(args: {
         ? `ENVELOPE(${bbox.west},${bbox.east},${bbox.north},${bbox.south})`
         : "";
     const locnGeometry = bboxString
-        ? JSON.stringify({
+        ? safeJsonStringify({
             type: "Polygon",
             coordinates: [[
                 [bbox.west, bbox.north],
@@ -543,7 +586,7 @@ export function buildAardvarkDraftFromExtraction(args: {
         })
         : "";
     const centroid = bboxString
-        ? JSON.stringify({ type: "Point", coordinates: [(bbox.west + bbox.east) / 2, (bbox.north + bbox.south) / 2] })
+        ? safeJsonStringify({ type: "Point", coordinates: [(bbox.west + bbox.east) / 2, (bbox.north + bbox.south) / 2] })
         : "";
 
     const resource: Resource = {
@@ -617,14 +660,14 @@ export async function createDraftFromRun(runId: string, asset: StagedAsset, batc
         asset_id: asset.id,
         status: "draft",
         confidence,
-        resource_json: JSON.stringify(resourceToJson(resource)),
-        distributions_json: JSON.stringify(distributions),
+        resource_json: safeJsonStringify(resourceToJson(resource)),
+        distributions_json: safeJsonStringify(distributions),
         review_notes: null,
         created_at: at,
         updated_at: at,
         published_resource_id: null,
     });
-    await saveDb();
+    await saveDb({ resourcesDirty: false });
     return id;
 }
 
@@ -647,7 +690,7 @@ export async function publishAardvarkDraft(draftId: string): Promise<string> {
         source_run_id: draft.source_run_id,
         action: "create",
         before_json: null,
-        after_json: JSON.stringify(resourceJson),
+        after_json: safeJsonStringify(resourceJson),
         created_at: at,
     });
     const runRows = await ctx.conn.query(`SELECT * FROM ${ENRICHMENT_RUNS_TABLE} WHERE id = ${sqlLiteral(draft.source_run_id)}`);
@@ -666,7 +709,7 @@ export async function publishAardvarkDraft(draftId: string): Promise<string> {
             published_resource_id = ${sqlLiteral(resource.id)}
         WHERE id = ${sqlLiteral(draftId)}
     `);
-    await saveDb();
+    await saveDb({ resourcesDirty: false });
     return resource.id;
 }
 
@@ -679,12 +722,12 @@ export async function updateAardvarkDraft(draftId: string, updates: {
     const ctx = await getDuckDbContext();
     if (!ctx) return;
     const assignments: string[] = [`updated_at = ${sqlLiteral(nowIso())}`];
-    if (updates.resourceJson !== undefined) assignments.push(`resource_json = ${sqlLiteral(JSON.stringify(updates.resourceJson))}`);
-    if (updates.distributionsJson !== undefined) assignments.push(`distributions_json = ${sqlLiteral(JSON.stringify(updates.distributionsJson))}`);
+    if (updates.resourceJson !== undefined) assignments.push(`resource_json = ${sqlLiteral(safeJsonStringify(updates.resourceJson))}`);
+    if (updates.distributionsJson !== undefined) assignments.push(`distributions_json = ${sqlLiteral(safeJsonStringify(updates.distributionsJson))}`);
     if (updates.reviewNotes !== undefined) assignments.push(`review_notes = ${sqlLiteral(updates.reviewNotes)}`);
     if (updates.status !== undefined) assignments.push(`status = ${sqlLiteral(updates.status)}`);
     await ctx.conn.query(`UPDATE ${AARDVARK_DRAFTS_TABLE} SET ${assignments.join(", ")} WHERE id = ${sqlLiteral(draftId)}`);
-    await saveDb();
+    await saveDb({ resourcesDirty: false });
 }
 
 export async function getEnrichmentSnapshot(connOverride?: Conn): Promise<EnrichmentSnapshot> {

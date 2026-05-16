@@ -42,6 +42,74 @@ describe('viewerConfig', () => {
             });
         });
 
+        it('detects IIIF Image API service', () => {
+            const resource = {
+                ...baseResource,
+                dct_references_s: JSON.stringify({ "http://iiif.io/api/image": "http://example.com/iiif" })
+            };
+            expect(detectViewerConfig(resource)).toEqual({
+                protocol: "iiif_image",
+                endpoint: "http://example.com/iiif/info.json"
+            });
+        });
+
+        it('detects IIIF Image API info.json', () => {
+            const resource = {
+                ...baseResource,
+                dct_references_s: JSON.stringify({ "http://iiif.io/api/image": "http://example.com/iiif/info.json" })
+            };
+            expect(detectViewerConfig(resource)).toEqual({
+                protocol: "iiif_image",
+                endpoint: "http://example.com/iiif/info.json",
+            });
+        });
+
+        it('derives upload extraction JSON from IIIF Image API service when no extraction reference is saved', () => {
+            const resource = {
+                ...baseResource,
+                dct_references_s: JSON.stringify({ "http://iiif.io/api/image": "http://example.com/uploads/abc/iiif" })
+            };
+            expect(detectViewerConfig(resource)).toEqual({
+                protocol: "iiif_image",
+                endpoint: "http://example.com/uploads/abc/iiif/info.json",
+                textExtractionEndpoint: "http://example.com/uploads/abc/enrichment_response.json",
+            });
+        });
+
+        it('attaches extraction JSON to IIIF Image API viewers', () => {
+            const resource = {
+                ...baseResource,
+                dct_references_s: JSON.stringify({
+                    "http://iiif.io/api/image": "http://example.com/iiif",
+                    "https://opengeometadata.org/reference/enrichment-response": "http://example.com/extraction.json",
+                })
+            };
+            expect(detectViewerConfig(resource)).toEqual({
+                protocol: "iiif_image",
+                endpoint: "http://example.com/iiif/info.json",
+                textExtractionEndpoint: "http://example.com/extraction.json",
+            });
+        });
+
+        it('detects IIIF image and extraction URLs from distributions', () => {
+            expect(detectViewerConfig(baseResource, [
+                {
+                    resource_id: baseResource.id,
+                    relation_key: "http://iiif.io/api/image",
+                    url: "http://example.com/iiif",
+                },
+                {
+                    resource_id: baseResource.id,
+                    relation_key: "https://opengeometadata.org/reference/enrichment-response",
+                    url: "http://example.com/extraction.json",
+                },
+            ])).toEqual({
+                protocol: "iiif_image",
+                endpoint: "http://example.com/iiif/info.json",
+                textExtractionEndpoint: "http://example.com/extraction.json",
+            });
+        });
+
         it('detects WMS', () => {
             const resource = {
                 ...baseResource,

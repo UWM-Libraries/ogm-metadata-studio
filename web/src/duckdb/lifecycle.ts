@@ -1,19 +1,26 @@
 import { resourceToJson } from "../aardvark/model";
 import { queryResources } from "./queries";
-import { getDuckDbContext, INDEXEDDB_NAME, replaceRecordsInIndexedDB, saveEnrichmentSnapshotToIndexedDB } from "./dbInit";
+import { getDuckDbContext, INDEXEDDB_NAME, replaceRecordsInIndexedDB, saveEnrichmentSnapshotToIndexedDB, waitForDuckDbRestore } from "./dbInit";
 import { ENRICHMENT_TABLES } from "./schema";
 
-export async function saveDb() {
+export async function saveDb(options: { resourcesDirty?: boolean } = {}) {
     const ctx = await getDuckDbContext();
     if (!ctx) return;
+    await waitForDuckDbRestore();
 
-    const resources = await queryResources();
-    const snapshot = resources.map((resource) => resourceToJson(resource));
-    await replaceRecordsInIndexedDB(snapshot);
+    const resourcesDirty = options.resourcesDirty ?? true;
+    if (resourcesDirty) {
+        const resources = await queryResources();
+        const snapshot = resources.map((resource) => resourceToJson(resource));
+        await replaceRecordsInIndexedDB(snapshot, { dirty: true, source: "resource-save" });
+    }
+
     const { getEnrichmentSnapshot } = await import("./enrichments");
     const enrichmentSnapshot = await getEnrichmentSnapshot(ctx.conn);
     await saveEnrichmentSnapshotToIndexedDB(enrichmentSnapshot);
-    console.log("Persisted structured IndexedDB records and enrichment workbench snapshot.");
+    console.log(resourcesDirty
+        ? "Persisted structured IndexedDB records and enrichment workbench snapshot."
+        : "Persisted enrichment workbench snapshot.");
 }
 
 export async function exportDbBlob(): Promise<Blob | null> {

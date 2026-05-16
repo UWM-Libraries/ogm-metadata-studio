@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildAardvarkDraftFromExtraction, HISTORICAL_MAP_EXTRACTION_SCHEMA, StagedAsset } from "./enrichments";
+import { safeJsonStringify } from "./json";
 
 const RENO_EXTRACTION_SAMPLE = {
     text: [
@@ -74,6 +75,13 @@ describe("enrichment schema and draft mapping", () => {
         const bboxItems = (HISTORICAL_MAP_EXTRACTION_SCHEMA.properties.text.items.properties.approx_bbox as any).items;
         expect(bboxItems.minimum).toBe(0);
         expect(bboxItems.maximum).toBe(1);
+        expect(HISTORICAL_MAP_EXTRACTION_SCHEMA.properties.debug.additionalProperties).toBe(false);
+        expect(HISTORICAL_MAP_EXTRACTION_SCHEMA.properties.debug.required).toEqual([
+            "ocr_strategy",
+            "placename_extraction_strategy",
+            "bbox_inference_strategy",
+            "limitations",
+        ]);
         expect(RENO_EXTRACTION_SAMPLE.text[0].approx_bbox).toHaveLength(4);
     });
 
@@ -102,5 +110,15 @@ describe("enrichment schema and draft mapping", () => {
             url: "https://example.test/usgs/reno.tif",
             label: "Source image",
         });
+    });
+
+    it("serializes DuckDB BigInt values in enrichment snapshots", () => {
+        const json = safeJsonStringify({
+            tables: {
+                staged_assets: [{ id: "asset-1", size_bytes: 10_470_250n }],
+            },
+        });
+
+        expect(JSON.parse(json).tables.staged_assets[0].size_bytes).toBe(10470250);
     });
 });

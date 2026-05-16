@@ -1,6 +1,7 @@
 import { generateDistributionsParquet, generateParquet } from "../duckdb/export";
 import { queryAllDistributions, queryResources } from "../duckdb/queries";
 import { databaseService } from "../services/DatabaseService";
+import { replaceRecordsInIndexedDB, waitForDuckDbRestore } from "../duckdb/dbInit";
 
 type DirectoryHandleLike = any;
 
@@ -27,6 +28,8 @@ async function writeBinaryFile(
 export async function publishCurrentDataToRepoRoot(
   repoRootHandle: DirectoryHandleLike
 ): Promise<PublishToRepoResult> {
+  await waitForDuckDbRestore();
+
   const [resources, distributions] = await Promise.all([
     queryResources(),
     queryAllDistributions(),
@@ -57,6 +60,12 @@ export async function publishCurrentDataToRepoRoot(
     const duckdbArray = new Uint8Array(await duckdbBlob.arrayBuffer());
     await writeBinaryFile(publicDir, duckdbFileName, duckdbArray);
   }
+
+  await replaceRecordsInIndexedDB([], {
+    dirty: false,
+    source: "published-parquet-baseline",
+    mode: "full",
+  });
 
   return {
     resourceCount: resources.length,

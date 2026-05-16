@@ -7,6 +7,7 @@ import type { AardvarkJson } from "../aardvark/model";
 import { ensureSchema, DISTRIBUTIONS_TABLE, RESOURCES_MV_TABLE, RESOURCES_TABLE } from "./schema";
 import { REPEATABLE_STRING_FIELDS } from "../aardvark/model";
 import { backfillCentroidAndH3 } from "./backfill";
+import { safeJsonStringify } from "./json";
 
 export const DB_FILENAME = "records.duckdb";
 export const INDEXEDDB_NAME = "aardvark-duckdb";
@@ -14,6 +15,8 @@ export const INDEXEDDB_STORE = "database";
 export const INDEXEDDB_RECORDS_STORE = "records";
 export const SNAPSHOT_KEY = "records.snapshot.json";
 export const ENRICHMENT_SNAPSHOT_KEY = "enrichments.snapshot.json";
+export const RECORDS_META_KEY = "records.meta.json";
+export const DELETED_RECORD_IDS_KEY = "records.deleted.ids.json";
 const INDEXEDDB_VERSION = 2;
 export const DUCKDB_RESTORE_PROGRESS_EVENT = "duckdb-restore-progress";
 export const DUCKDB_RESTORED_EVENT = "duckdb-restored";
@@ -22,6 +25,14 @@ interface RestoreStatus {
     inProgress: boolean;
     processed: number;
     total: number;
+}
+
+export interface RecordsCacheMeta {
+    dirty: boolean;
+    count: number;
+    savedAt: string;
+    source: string;
+    mode?: "full" | "overlay";
 }
 
 export interface DuckDbContext {
@@ -53,16 +64,31 @@ export function getDuckDbRestoreStatus(): RestoreStatus {
     return restoreStatus;
 }
 
-async function startBackgroundRestore(db: duckdb.AsyncDuckDB): Promise<void> {
+export async function waitForDuckDbRestore(): Promise<void> {
+    if (restorePromise) await restorePromise;
+}
+
+async function startBackgroundRestore(db: duckdb.AsyncDuckDB, options: { loadedFromParquet: boolean }): Promise<void> {
     if (restorePromise) return restorePromise;
 
     restorePromise = (async () => {
-        let records = await loadRecordsFromIndexedDB();
-        if (records.length === 0) {
+        const recordsMeta = await loadRecordsMetaFromIndexedDB();
+        let recordsMode = recordsMeta?.mode;
+        const shouldRestoreRecords = !options.loadedFromParquet || recordsMeta?.dirty === true || recordsMeta === null;
+        let records: AardvarkJson[] = [];
+
+        if (shouldRestoreRecords) {
+            records = await loadRecordsFromIndexedDB();
+        } else {
+            console.log("[IndexedDB] Skipping resource record restore; published Parquet is the fast startup baseline.");
+            updateRestoreStatus({ inProgress: false, processed: 0, total: 0 });
+        }
+
+        if (shouldRestoreRecords && records.length === 0) {
             const snapshot = await loadSnapshotFromIndexedDB();
             if (snapshot !== null && snapshot.length > 0) {
                 console.log(`[IndexedDB] Migrating ${snapshot.length} resources from legacy JSON snapshot...`);
-                await replaceRecordsInIndexedDB(snapshot);
+                await replaceRecordsInIndexedDB(snapshot, { dirty: true, source: "legacy-snapshot" });
                 await clearLegacySnapshot();
                 records = snapshot;
             }
@@ -70,20 +96,44 @@ async function startBackgroundRestore(db: duckdb.AsyncDuckDB): Promise<void> {
 
         const restoreConn = await db.connect();
         try {
+            if (options.loadedFromParquet && recordsMode !== "overlay" && records.length > 0) {
+                const localOnlyRecords = await localOnlyRecordsFromPublishedBaseline(restoreConn, records);
+                if (localOnlyRecords.length < records.length) {
+                    console.log(`[IndexedDB] Migrating full local snapshot to overlay: ${localOnlyRecords.length} local-only resources kept from ${records.length}.`);
+                    records = localOnlyRecords;
+                }
+                await replaceRecordsInIndexedDB(records, {
+                    dirty: records.length > 0,
+                    source: "published-baseline-overlay-migration",
+                    mode: "overlay",
+                });
+                recordsMode = "overlay";
+            }
+
             if (records.length > 0) {
                 console.log(`[IndexedDB] Restoring ${records.length} resources from IndexedDB records...`);
                 updateRestoreStatus({ inProgress: true, processed: 0, total: records.length });
-                const { replaceAllJsonData } = await import("./import");
-                await replaceAllJsonData(records, {
+                const { importJsonData, replaceAllJsonData } = await import("./import");
+                const recordsIncludeReferences = records.some((record) => (
+                    typeof record?.dct_references_s === "string" && record.dct_references_s.trim() !== ""
+                ));
+                const restoreAsOverlay = options.loadedFromParquet && recordsMode === "overlay";
+                const restoreFn = restoreAsOverlay ? importJsonData : replaceAllJsonData;
+                await restoreFn(records, {
                     skipSave: true,
                     connOverride: restoreConn,
                     onProgress: (processed, total) => updateRestoreStatus({ inProgress: true, processed, total }),
-                    // IndexedDB persistence currently stores resources only. Preserve any distributions
-                    // loaded from Parquet (or created via other means) so we don't wipe them out.
-                    preserveDistributions: true,
+                    // Current IndexedDB records include dct_references_s, so rebuild distributions
+                    // from the local snapshot. Older resource-only snapshots keep Parquet distributions.
+                    preserveDistributions: restoreAsOverlay ? false : !recordsIncludeReferences,
                 });
             } else {
                 updateRestoreStatus({ inProgress: false, processed: 0, total: 0 });
+            }
+
+            const deletedIds = await loadDeletedResourceIdsFromIndexedDB();
+            if (deletedIds.length > 0) {
+                await deleteResourceIdsFromDuckDb(restoreConn, deletedIds);
             }
 
             const enrichmentSnapshot = await loadEnrichmentSnapshotFromIndexedDB();
@@ -104,9 +154,13 @@ async function startBackgroundRestore(db: duckdb.AsyncDuckDB): Promise<void> {
             }
         }
 
-        backfillCentroidAndH3().then(({ h3Filled }) => {
-            if (h3Filled > 0) console.log(`[Backfill] Centroid/H3: ${h3Filled} resources updated for map hexagons.`);
-        }).catch((e) => console.warn("[Backfill] Failed:", e));
+        if (!options.loadedFromParquet) {
+            backfillCentroidAndH3().then(({ h3Filled }) => {
+                if (h3Filled > 0) console.log(`[Backfill] Centroid/H3: ${h3Filled} resources updated for map hexagons.`);
+            }).catch((e) => console.warn("[Backfill] Failed:", e));
+        } else {
+            console.log("[Backfill] Skipping automatic full-catalog centroid/H3 backfill for published Parquet startup.");
+        }
 
         notifyRestoreFinished();
     })().catch((error) => {
@@ -116,6 +170,36 @@ async function startBackgroundRestore(db: duckdb.AsyncDuckDB): Promise<void> {
     });
 
     return restorePromise;
+}
+
+async function localOnlyRecordsFromPublishedBaseline(conn: duckdb.AsyncDuckDBConnection, records: AardvarkJson[]): Promise<AardvarkJson[]> {
+    try {
+        const result = await conn.query(`SELECT id FROM ${RESOURCES_TABLE}`);
+        const publishedIds = new Set(result.toArray().map((row: any) => String(row.id)));
+        return records.filter((record) => record?.id && !publishedIds.has(String(record.id)));
+    } catch (e) {
+        console.warn("[IndexedDB] Could not compare local snapshot to published baseline.", e);
+        return records;
+    }
+}
+
+async function deleteResourceIdsFromDuckDb(conn: duckdb.AsyncDuckDBConnection, ids: string[]): Promise<void> {
+    for (const group of chunk(ids, 500)) {
+        const idList = group.map((id) => `'${String(id).replace(/'/g, "''")}'`).join(",");
+        if (!idList) continue;
+        await conn.query(`DELETE FROM resources WHERE id IN (${idList})`);
+        await conn.query(`DELETE FROM resources_mv WHERE id IN (${idList})`);
+        await conn.query(`DELETE FROM distributions WHERE resource_id IN (${idList})`);
+        await conn.query(`DELETE FROM search_index WHERE id IN (${idList})`);
+    }
+}
+
+function chunk<T>(values: T[], size: number): T[][] {
+    const out: T[][] = [];
+    for (let i = 0; i < values.length; i += size) {
+        out.push(values.slice(i, i + size));
+    }
+    return out;
 }
 
 async function loadInitialDataFromParquet(
@@ -156,6 +240,7 @@ async function loadInitialDataFromParquet(
         }
 
         const tasks: Promise<void>[] = [];
+        let loadedResources = false;
 
         if (resourcesBuf) {
             tasks.push(
@@ -165,9 +250,15 @@ async function loadInitialDataFromParquet(
                     await conn.query(
                         `CREATE OR REPLACE TABLE ${RESOURCES_TABLE} AS SELECT * FROM read_parquet('${fileName}')`,
                     );
+                    const countResult = await conn.query(`SELECT count(*) as c FROM ${RESOURCES_TABLE}`);
+                    const count = Number(countResult.toArray()[0]?.c ?? 0);
+                    loadedResources = count > 0;
+                    console.log(`[Parquet bootstrap] Loaded ${count.toLocaleString()} resources from published Parquet.`);
                     await db.dropFile(fileName);
                 })(),
             );
+        } else {
+            console.warn("[Parquet bootstrap] resources.parquet was not available; local overlay will not be treated as a published baseline.");
         }
 
         if (distributionsBuf) {
@@ -185,7 +276,7 @@ async function loadInitialDataFromParquet(
 
         await Promise.all(tasks);
         console.log("[Parquet bootstrap] Loaded initial data from published Parquet artifacts.");
-        return true;
+        return loadedResources;
     } catch (e) {
         console.warn("[Parquet bootstrap] Failed to load initial data from Parquet.", e);
         return false;
@@ -194,59 +285,54 @@ async function loadInitialDataFromParquet(
 
 async function rebuildDerivedIndexesFromResources(conn: duckdb.AsyncDuckDBConnection): Promise<void> {
     try {
-        const res = await conn.query(`SELECT * FROM ${RESOURCES_TABLE}`);
-        const rows = res.toArray() as any[];
-        if (rows.length === 0) return;
+        const resInfo = await conn.query(`DESCRIBE ${RESOURCES_TABLE}`);
+        const columnTypes = new Map<string, string>();
+        for (const row of resInfo.toArray() as any[]) {
+            columnTypes.set(String(row.column_name), String(row.column_type ?? ""));
+        }
+        if (!columnTypes.has("id")) return;
 
         await conn.query(`DELETE FROM ${RESOURCES_MV_TABLE}`);
         await conn.query(`DELETE FROM search_index`);
 
-        const mvValues: string[] = [];
-        const searchValues: string[] = [];
+        for (const field of REPEATABLE_STRING_FIELDS) {
+            const columnType = columnTypes.get(field);
+            if (!columnType) continue;
+            const safeField = field.replace(/'/g, "''");
+            const quotedField = `"${field.replace(/"/g, '""')}"`;
+            const isList = columnType.includes("[]") || columnType.toUpperCase().includes("LIST");
 
-        for (const row of rows) {
-            const id = row.id;
-            if (!id) continue;
-            const safeId = String(id).replace(/'/g, "''");
-
-            for (const field of REPEATABLE_STRING_FIELDS) {
-                const raw = (row as any)[field];
-                const values = Array.isArray(raw) ? raw : raw != null ? [raw] : [];
-                for (const value of values) {
-                    const s = String(value);
-                    if (!s) continue;
-                    const safeField = field.replace(/'/g, "''");
-                    const safeVal = s.replace(/'/g, "''");
-                    mvValues.push(`('${safeId}','${safeField}','${safeVal}')`);
-                }
+            if (isList) {
+                await conn.query(`
+                    INSERT INTO ${RESOURCES_MV_TABLE} (id, field, val)
+                    SELECT id, '${safeField}', CAST(val AS VARCHAR)
+                    FROM ${RESOURCES_TABLE}, UNNEST(${quotedField}) AS t(val)
+                    WHERE id IS NOT NULL
+                      AND val IS NOT NULL
+                      AND CAST(val AS VARCHAR) != ''
+                `);
+            } else {
+                await conn.query(`
+                    INSERT INTO ${RESOURCES_MV_TABLE} (id, field, val)
+                    SELECT id, '${safeField}', CAST(${quotedField} AS VARCHAR)
+                    FROM ${RESOURCES_TABLE}
+                    WHERE id IS NOT NULL
+                      AND ${quotedField} IS NOT NULL
+                      AND trim(CAST(${quotedField} AS VARCHAR)) != ''
+                `);
             }
-
-            const parts: string[] = [];
-            if (row.dct_title_s) parts.push(String(row.dct_title_s));
-            if (Array.isArray(row.dct_description_sm)) parts.push(...row.dct_description_sm.map((v: any) => String(v)));
-            if (Array.isArray(row.dct_subject_sm)) parts.push(...row.dct_subject_sm.map((v: any) => String(v)));
-            if (Array.isArray(row.dcat_keyword_sm)) parts.push(...row.dcat_keyword_sm.map((v: any) => String(v)));
-            const content = parts.join(" ").replace(/\n/g, " ");
-            const safeContent = content.replace(/'/g, "''");
-            searchValues.push(`('${safeId}','${safeContent}')`);
         }
 
-        const chunkSize = 500;
-        for (let i = 0; i < mvValues.length; i += chunkSize) {
-            const chunk = mvValues.slice(i, i + chunkSize);
-            if (chunk.length === 0) continue;
-            await conn.query(
-                `INSERT INTO ${RESOURCES_MV_TABLE} (id, field, val) VALUES ${chunk.join(",")}`
-            );
-        }
-
-        for (let i = 0; i < searchValues.length; i += chunkSize) {
-            const chunk = searchValues.slice(i, i + chunkSize);
-            if (chunk.length === 0) continue;
-            await conn.query(
-                `INSERT INTO search_index (id, content) VALUES ${chunk.join(",")}`
-            );
-        }
+        const searchFields = ["dct_title_s", "dct_description_sm", "dct_subject_sm", "dcat_keyword_sm"]
+            .filter((field) => columnTypes.has(field))
+            .map((field) => `COALESCE(CAST("${field.replace(/"/g, '""')}" AS VARCHAR), '')`);
+        const searchExpression = searchFields.length > 0 ? `CONCAT_WS(' ', ${searchFields.join(", ")})` : "''";
+        await conn.query(`
+            INSERT INTO search_index (id, content)
+            SELECT id, replace(replace(replace(${searchExpression}, '[', ' '), ']', ' '), '"', ' ')
+            FROM ${RESOURCES_TABLE}
+            WHERE id IS NOT NULL
+        `);
 
         console.log("[Parquet bootstrap] Rebuilt resources_mv and search_index from resources.");
     } catch (e) {
@@ -281,7 +367,7 @@ export async function getDuckDbContext(): Promise<DuckDbContext | null> {
             if (loadedFromParquet) {
                 await rebuildDerivedIndexesFromResources(conn);
             }
-            void startBackgroundRestore(db);
+            void startBackgroundRestore(db, { loadedFromParquet });
             return { db, conn };
         } catch (err: any) {
             console.error("DuckDB initialization failed", err);
@@ -426,14 +512,18 @@ export async function saveSnapshotToIndexedDB(snapshot: AardvarkJson[]): Promise
             if (!db.objectStoreNames.contains(INDEXEDDB_RECORDS_STORE)) db.createObjectStore(INDEXEDDB_RECORDS_STORE, { keyPath: "id" });
         };
         req.onsuccess = (e: any) => {
-            const db = e.target.result;
-            const tx = db.transaction([INDEXEDDB_STORE], "readwrite");
-            const put = tx.objectStore(INDEXEDDB_STORE).put(JSON.stringify(snapshot), SNAPSHOT_KEY);
-            put.onsuccess = () => {
-                console.log(`[IndexedDB] Snapshot saved (${snapshot.length} resources).`);
-                resolve();
-            };
-            put.onerror = () => reject(put.error);
+            try {
+                const db = e.target.result;
+                const tx = db.transaction([INDEXEDDB_STORE], "readwrite");
+                const put = tx.objectStore(INDEXEDDB_STORE).put(safeJsonStringify(snapshot), SNAPSHOT_KEY);
+                put.onsuccess = () => {
+                    console.log(`[IndexedDB] Snapshot saved (${snapshot.length} resources).`);
+                    resolve();
+                };
+                put.onerror = () => reject(put.error);
+            } catch (error) {
+                reject(error);
+            }
         };
         req.onerror = () => reject(req.error);
     });
@@ -484,14 +574,18 @@ export async function saveEnrichmentSnapshotToIndexedDB(snapshot: unknown): Prom
             if (!db.objectStoreNames.contains(INDEXEDDB_RECORDS_STORE)) db.createObjectStore(INDEXEDDB_RECORDS_STORE, { keyPath: "id" });
         };
         req.onsuccess = (e: any) => {
-            const db = e.target.result;
-            const tx = db.transaction([INDEXEDDB_STORE], "readwrite");
-            const put = tx.objectStore(INDEXEDDB_STORE).put(JSON.stringify(snapshot), ENRICHMENT_SNAPSHOT_KEY);
-            put.onsuccess = () => {
-                console.log("[IndexedDB] Enrichment snapshot saved.");
-                resolve();
-            };
-            put.onerror = () => reject(put.error);
+            try {
+                const db = e.target.result;
+                const tx = db.transaction([INDEXEDDB_STORE], "readwrite");
+                const put = tx.objectStore(INDEXEDDB_STORE).put(safeJsonStringify(snapshot), ENRICHMENT_SNAPSHOT_KEY);
+                put.onsuccess = () => {
+                    console.log("[IndexedDB] Enrichment snapshot saved.");
+                    resolve();
+                };
+                put.onerror = () => reject(put.error);
+            } catch (error) {
+                reject(error);
+            }
         };
         req.onerror = () => reject(req.error);
     });
@@ -525,7 +619,79 @@ export async function loadRecordsFromIndexedDB(): Promise<AardvarkJson[]> {
     });
 }
 
-export async function replaceRecordsInIndexedDB(records: AardvarkJson[]): Promise<void> {
+export async function loadDeletedResourceIdsFromIndexedDB(): Promise<string[]> {
+    return new Promise((resolve) => {
+        const req = indexedDB.open(INDEXEDDB_NAME, INDEXEDDB_VERSION);
+        req.onupgradeneeded = (e: any) => {
+            const db = e.target.result as IDBDatabase;
+            if (!db.objectStoreNames.contains(INDEXEDDB_STORE)) db.createObjectStore(INDEXEDDB_STORE);
+            if (!db.objectStoreNames.contains(INDEXEDDB_RECORDS_STORE)) db.createObjectStore(INDEXEDDB_RECORDS_STORE, { keyPath: "id" });
+        };
+        req.onsuccess = (e: any) => {
+            const db = e.target.result as IDBDatabase;
+            const tx = db.transaction([INDEXEDDB_STORE], "readonly");
+            const get = tx.objectStore(INDEXEDDB_STORE).get(DELETED_RECORD_IDS_KEY);
+            get.onsuccess = () => {
+                try {
+                    const raw = get.result;
+                    const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+                    resolve(Array.isArray(parsed) ? parsed.map(String).filter(Boolean) : []);
+                } catch {
+                    resolve([]);
+                }
+            };
+            get.onerror = () => {
+                console.warn("[IndexedDB] Failed to load deleted resource ids", get.error);
+                resolve([]);
+            };
+        };
+        req.onerror = () => {
+            console.warn("[IndexedDB] Failed to open DB for deleted resource ids", req.error);
+            resolve([]);
+        };
+    });
+}
+
+export async function loadRecordsMetaFromIndexedDB(): Promise<RecordsCacheMeta | null> {
+    return new Promise((resolve) => {
+        const req = indexedDB.open(INDEXEDDB_NAME, INDEXEDDB_VERSION);
+        req.onupgradeneeded = (e: any) => {
+            const db = e.target.result as IDBDatabase;
+            if (!db.objectStoreNames.contains(INDEXEDDB_STORE)) db.createObjectStore(INDEXEDDB_STORE);
+            if (!db.objectStoreNames.contains(INDEXEDDB_RECORDS_STORE)) db.createObjectStore(INDEXEDDB_RECORDS_STORE, { keyPath: "id" });
+        };
+        req.onsuccess = (e: any) => {
+            const db = e.target.result as IDBDatabase;
+            const tx = db.transaction([INDEXEDDB_STORE], "readonly");
+            const get = tx.objectStore(INDEXEDDB_STORE).get(RECORDS_META_KEY);
+            get.onsuccess = () => {
+                try {
+                    const raw = get.result;
+                    if (!raw) {
+                        resolve(null);
+                        return;
+                    }
+                    resolve(typeof raw === "string" ? JSON.parse(raw) as RecordsCacheMeta : raw as RecordsCacheMeta);
+                } catch {
+                    resolve(null);
+                }
+            };
+            get.onerror = () => {
+                console.warn("[IndexedDB] Failed to load records metadata", get.error);
+                resolve(null);
+            };
+        };
+        req.onerror = () => {
+            console.warn("[IndexedDB] Failed to open DB for records metadata", req.error);
+            resolve(null);
+        };
+    });
+}
+
+export async function replaceRecordsInIndexedDB(
+    records: AardvarkJson[],
+    options: { dirty?: boolean; source?: string; mode?: "full" | "overlay" } = {},
+): Promise<void> {
     return new Promise((resolve, reject) => {
         const req = indexedDB.open(INDEXEDDB_NAME, INDEXEDDB_VERSION);
         req.onupgradeneeded = (e: any) => {
@@ -546,14 +712,135 @@ export async function replaceRecordsInIndexedDB(records: AardvarkJson[]): Promis
                     if (!record?.id) continue;
                     recordsStore.put(record);
                 }
+                const meta: RecordsCacheMeta = {
+                    dirty: options.dirty ?? true,
+                    count: records.length,
+                    savedAt: new Date().toISOString(),
+                    source: options.source ?? "local-save",
+                    mode: options.mode ?? "full",
+                };
+                legacyStore.put(safeJsonStringify(meta), RECORDS_META_KEY);
                 legacyStore.delete(SNAPSHOT_KEY);
                 legacyStore.delete(DB_FILENAME);
+                if ((options.mode ?? "full") === "full") {
+                    legacyStore.delete(DELETED_RECORD_IDS_KEY);
+                }
             };
 
             tx.oncomplete = () => {
                 console.log(`[IndexedDB] Saved ${records.length} records to structured store.`);
                 resolve();
             };
+            tx.onerror = () => reject(tx.error);
+            tx.onabort = () => reject(tx.error);
+        };
+        req.onerror = () => reject(req.error);
+    });
+}
+
+export async function saveResourceOverlayToIndexedDB(
+    record: AardvarkJson,
+    options: { source?: string } = {},
+): Promise<void> {
+    if (!record?.id) return;
+    return new Promise((resolve, reject) => {
+        const req = indexedDB.open(INDEXEDDB_NAME, INDEXEDDB_VERSION);
+        req.onupgradeneeded = (e: any) => {
+            const db = e.target.result as IDBDatabase;
+            if (!db.objectStoreNames.contains(INDEXEDDB_STORE)) db.createObjectStore(INDEXEDDB_STORE);
+            if (!db.objectStoreNames.contains(INDEXEDDB_RECORDS_STORE)) db.createObjectStore(INDEXEDDB_RECORDS_STORE, { keyPath: "id" });
+        };
+        req.onsuccess = (e: any) => {
+            const db = e.target.result as IDBDatabase;
+            const tx = db.transaction([INDEXEDDB_RECORDS_STORE, INDEXEDDB_STORE], "readwrite");
+            const recordsStore = tx.objectStore(INDEXEDDB_RECORDS_STORE);
+            const legacyStore = tx.objectStore(INDEXEDDB_STORE);
+            recordsStore.put(record);
+
+            const deletedGet = legacyStore.get(DELETED_RECORD_IDS_KEY);
+            deletedGet.onsuccess = () => {
+                let deletedIds: string[] = [];
+                try {
+                    const raw = deletedGet.result;
+                    const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+                    deletedIds = Array.isArray(parsed) ? parsed.map(String) : [];
+                } catch {
+                    deletedIds = [];
+                }
+                deletedIds = deletedIds.filter((id) => id !== String(record.id));
+                legacyStore.put(safeJsonStringify(deletedIds), DELETED_RECORD_IDS_KEY);
+            };
+
+            const countReq = recordsStore.count();
+            countReq.onsuccess = () => {
+                const meta: RecordsCacheMeta = {
+                    dirty: true,
+                    count: Number(countReq.result || 0),
+                    savedAt: new Date().toISOString(),
+                    source: options.source ?? "resource-overlay-save",
+                    mode: "overlay",
+                };
+                legacyStore.put(safeJsonStringify(meta), RECORDS_META_KEY);
+                legacyStore.delete(SNAPSHOT_KEY);
+                legacyStore.delete(DB_FILENAME);
+            };
+
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject(tx.error);
+            tx.onabort = () => reject(tx.error);
+        };
+        req.onerror = () => reject(req.error);
+    });
+}
+
+export async function saveResourceDeleteOverlayToIndexedDB(
+    id: string,
+    options: { source?: string } = {},
+): Promise<void> {
+    if (!id) return;
+    return new Promise((resolve, reject) => {
+        const req = indexedDB.open(INDEXEDDB_NAME, INDEXEDDB_VERSION);
+        req.onupgradeneeded = (e: any) => {
+            const db = e.target.result as IDBDatabase;
+            if (!db.objectStoreNames.contains(INDEXEDDB_STORE)) db.createObjectStore(INDEXEDDB_STORE);
+            if (!db.objectStoreNames.contains(INDEXEDDB_RECORDS_STORE)) db.createObjectStore(INDEXEDDB_RECORDS_STORE, { keyPath: "id" });
+        };
+        req.onsuccess = (e: any) => {
+            const db = e.target.result as IDBDatabase;
+            const tx = db.transaction([INDEXEDDB_RECORDS_STORE, INDEXEDDB_STORE], "readwrite");
+            const recordsStore = tx.objectStore(INDEXEDDB_RECORDS_STORE);
+            const legacyStore = tx.objectStore(INDEXEDDB_STORE);
+            recordsStore.delete(id);
+
+            const deletedGet = legacyStore.get(DELETED_RECORD_IDS_KEY);
+            deletedGet.onsuccess = () => {
+                let deletedIds: string[] = [];
+                try {
+                    const raw = deletedGet.result;
+                    const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+                    deletedIds = Array.isArray(parsed) ? parsed.map(String) : [];
+                } catch {
+                    deletedIds = [];
+                }
+                if (!deletedIds.includes(id)) deletedIds.push(id);
+                legacyStore.put(safeJsonStringify(deletedIds), DELETED_RECORD_IDS_KEY);
+            };
+
+            const countReq = recordsStore.count();
+            countReq.onsuccess = () => {
+                const meta: RecordsCacheMeta = {
+                    dirty: true,
+                    count: Number(countReq.result || 0),
+                    savedAt: new Date().toISOString(),
+                    source: options.source ?? "resource-overlay-delete",
+                    mode: "overlay",
+                };
+                legacyStore.put(safeJsonStringify(meta), RECORDS_META_KEY);
+                legacyStore.delete(SNAPSHOT_KEY);
+                legacyStore.delete(DB_FILENAME);
+            };
+
+            tx.oncomplete = () => resolve();
             tx.onerror = () => reject(tx.error);
             tx.onabort = () => reject(tx.error);
         };

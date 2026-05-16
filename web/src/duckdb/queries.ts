@@ -1,5 +1,5 @@
 import { getDuckDbContext } from "./dbInit";
-import { Resource, SCALAR_FIELDS, Distribution } from "../aardvark/model";
+import { Resource, SCALAR_FIELDS, REPEATABLE_STRING_FIELDS, Distribution } from "../aardvark/model";
 import { resourceFromRow } from "../aardvark/mapping";
 import {
     SearchResult, FacetedSearchRequest, FacetedSearchResponse,
@@ -9,13 +9,16 @@ import {
 import { H3_RES_COLUMNS } from "./schema";
 import * as duckdb from "@duckdb/duckdb-wasm";
 
+const REPEATABLE_FIELD_SET = new Set(REPEATABLE_STRING_FIELDS);
+
 // Helper: Fetch full resource objects by ID
 export async function fetchResourcesByIds(conn: duckdb.AsyncDuckDBConnection, ids: string[]): Promise<Resource[]> {
     if (ids.length === 0) return [];
 
     const idList = ids.map((id: string) => `'${id.replace(/'/g, "''")}'`).join(",");
 
-    const scalarSql = `SELECT * FROM resources WHERE id IN (${idList})`;
+    const scalarColumns = SCALAR_FIELDS.map((field) => `"${field.replace(/"/g, '""')}"`).join(", ");
+    const scalarSql = `SELECT ${scalarColumns} FROM resources WHERE id IN (${idList})`;
     const mvSql = `SELECT * FROM resources_mv WHERE id IN (${idList})`;
     const distSql = `SELECT * FROM distributions WHERE resource_id IN (${idList})`;
     const thumbSql = `SELECT * FROM resources_image_service WHERE id IN (${idList})`;
@@ -64,16 +67,25 @@ export async function fetchResourcesByIds(conn: duckdb.AsyncDuckDBConnection, id
     for (const row of scalarRows) {
         const r: any = { ...row };
         const mvs = mvMap.get(r.id) || [];
+        for (const field of new Set(mvs.map((m) => String(m.field)))) {
+            if (REPEATABLE_FIELD_SET.has(field)) r[field] = [];
+        }
         for (const m of mvs) {
-            const current = r[m.field];
+            const field = String(m.field);
+            if (!REPEATABLE_FIELD_SET.has(field) || m.val === null || m.val === undefined) continue;
+            const value = String(m.val);
+            if (!value) continue;
+            const current = r[field];
             if (!Array.isArray(current)) {
                 if (current === null || current === undefined) {
-                    r[m.field] = [];
+                    r[field] = [];
                 } else {
-                    r[m.field] = [current];
+                    r[field] = [current];
                 }
             }
-            r[m.field].push(m.val);
+            if (!r[field].some((existing: unknown) => String(existing) === value)) {
+                r[field].push(value);
+            }
         }
         const resObj = resourceFromRow(r, distMap.get(r.id) || []);
         // Attach thumbnail if cached

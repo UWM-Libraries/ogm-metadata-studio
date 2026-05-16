@@ -36,88 +36,84 @@ export function useResourceSearch(facetsConfig: FacetConfig[], pageSize: number 
     const [total, setTotal] = useState(0);
     const [loading, setLoading] = useState(true);
 
-    const [state, setState] = useUrlState<SearchState>(
-        DEFAULT_STATE,
-        {
-            toUrl: (s) => {
-                const params = new URLSearchParams();
-                if (s.q) params.set("q", s.q);
-                if (s.page > 1) params.set("page", String(s.page));
-                if (s.sort && s.sort !== "relevance") params.set("sort", s.sort);
-                if (s.bbox) params.set("bbox", s.bbox);
-                if (s.yearRange) params.set("yearRange", s.yearRange);
-                if (s.view && s.view !== 'list') params.set("view", s.view);
+    const urlMapping = useMemo(() => ({
+        toUrl: (s: SearchState) => {
+            const params = new URLSearchParams();
+            if (s.q) params.set("q", s.q);
+            if (s.page > 1) params.set("page", String(s.page));
+            if (s.sort && s.sort !== "relevance") params.set("sort", s.sort);
+            if (s.bbox) params.set("bbox", s.bbox);
+            if (s.yearRange) params.set("yearRange", s.yearRange);
+            if (s.view && s.view !== 'list') params.set("view", s.view);
 
-                for (const [key, vals] of Object.entries(s.facets)) {
-                    if (key.startsWith("-")) {
-                        const field = key.substring(1);
-                        for (const v of vals) {
-                            params.append(`exclude_filters[${field}][]`, v);
-                        }
-                    } else {
-                        for (const v of vals) {
-                            params.append(`include_filters[${key}][]`, v);
-                        }
+            for (const [key, vals] of Object.entries(s.facets)) {
+                if (key.startsWith("-")) {
+                    const field = key.substring(1);
+                    for (const v of vals) {
+                        params.append(`exclude_filters[${field}][]`, v);
+                    }
+                } else {
+                    for (const v of vals) {
+                        params.append(`include_filters[${key}][]`, v);
                     }
                 }
-                return params;
-            },
-            fromUrl: (params) => {
-                const q = params.get("q") || "";
-                const page = Number(params.get("page")) || 1;
-                const sort = params.get("sort") || "relevance";
-                const bbox = params.get("bbox") || undefined;
-                const yearRange = params.get("yearRange") || undefined;
-                const viewParam = params.get("view");
-                const view = (viewParam === 'gallery' || viewParam === 'map') ? (viewParam as 'gallery' | 'map') : 'list';
-
-                const facets: Record<string, string[]> = {};
-                for (const [key, val] of params.entries()) {
-                    // Match include_filters[field][]
-                    const includeMatch = key.match(/^include_filters\[([^\]]+)\]\[\]$/);
-                    if (includeMatch) {
-                        const field = includeMatch[1];
-                        if (!facets[field]) facets[field] = [];
-                        facets[field].push(val);
-                        continue;
-                    }
-
-                    // Match exclude_filters[field][]
-                    const excludeMatch = key.match(/^exclude_filters\[([^\]]+)\]\[\]$/);
-                    if (excludeMatch) {
-                        const field = excludeMatch[1];
-                        const internalKey = `-${field}`;
-                        if (!facets[internalKey]) facets[internalKey] = [];
-                        facets[internalKey].push(val);
-                        continue;
-                    }
-
-                    // Legacy f.field support
-                    if (key.startsWith("f.")) {
-                        const field = key.substring(2).trim();
-                        if (!facets[field]) facets[field] = [];
-                        facets[field].push(val);
-                    }
-                }
-                return { q, page, facets, sort, bbox, yearRange, view };
-            },
-            cleanup: (params) => {
-                params.delete("q");
-                params.delete("page");
-                params.delete("sort");
-                params.delete("bbox");
-                params.delete("yearRange");
-                params.delete("view");
-                const keysToDelete: string[] = [];
-                for (const key of params.keys()) {
-                    if (key.startsWith("include_filters") || key.startsWith("exclude_filters") || key.startsWith("f.")) {
-                        keysToDelete.push(key);
-                    }
-                }
-                keysToDelete.forEach(k => params.delete(k));
             }
+            return params;
+        },
+        fromUrl: (params: URLSearchParams) => {
+            const q = params.get("q") || "";
+            const page = Number(params.get("page")) || 1;
+            const sort = params.get("sort") || "relevance";
+            const bbox = params.get("bbox") || undefined;
+            const yearRange = params.get("yearRange") || undefined;
+            const viewParam = params.get("view");
+            const view: SearchState["view"] = (viewParam === 'gallery' || viewParam === 'map') ? viewParam : 'list';
+
+            const facets: Record<string, string[]> = {};
+            for (const [key, val] of params.entries()) {
+                const includeMatch = key.match(/^include_filters\[([^\]]+)\]\[\]$/);
+                if (includeMatch) {
+                    const field = includeMatch[1];
+                    if (!facets[field]) facets[field] = [];
+                    facets[field].push(val);
+                    continue;
+                }
+
+                const excludeMatch = key.match(/^exclude_filters\[([^\]]+)\]\[\]$/);
+                if (excludeMatch) {
+                    const field = excludeMatch[1];
+                    const internalKey = `-${field}`;
+                    if (!facets[internalKey]) facets[internalKey] = [];
+                    facets[internalKey].push(val);
+                    continue;
+                }
+
+                if (key.startsWith("f.")) {
+                    const field = key.substring(2).trim();
+                    if (!facets[field]) facets[field] = [];
+                    facets[field].push(val);
+                }
+            }
+            return { q, page, facets, sort, bbox, yearRange, view };
+        },
+        cleanup: (params: URLSearchParams) => {
+            params.delete("q");
+            params.delete("page");
+            params.delete("sort");
+            params.delete("bbox");
+            params.delete("yearRange");
+            params.delete("view");
+            const keysToDelete: string[] = [];
+            for (const key of params.keys()) {
+                if (key.startsWith("include_filters") || key.startsWith("exclude_filters") || key.startsWith("f.")) {
+                    keysToDelete.push(key);
+                }
+            }
+            keysToDelete.forEach(k => params.delete(k));
         }
-    );
+    }), []);
+
+    const [state, setState] = useUrlState<SearchState>(DEFAULT_STATE, urlMapping);
 
     const activeFilters = useMemo(() => {
         const filters: Record<string, any> = {};

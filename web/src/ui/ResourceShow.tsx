@@ -1,11 +1,13 @@
 import React, { useEffect, useState } from 'react';
-import { Resource } from '../aardvark/model';
-import { queryResourceById, querySimilarResources, getSearchNeighbors, FacetedSearchRequest } from '../duckdb/duckdbClient';
+import { Distribution, Resource } from '../aardvark/model';
+import { queryResourceById, querySimilarResources, getSearchNeighbors, FacetedSearchRequest, queryDistributionsForResource } from '../duckdb/duckdbClient';
+import { waitForDuckDbRestore } from '../duckdb/dbInit';
 import { ResourceViewer } from './ResourceViewer';
 import { SimilarResourcesCarousel } from './resource/SimilarResourcesCarousel';
 import { ResourceSidebar } from './resource/ResourceSidebar';
 import { ResourceMetadata } from './resource/ResourceMetadata';
 import { ResourceHeader } from './resource/ResourceHeader';
+import { ResourceDistributions } from './resource/ResourceDistributions';
 
 import { databaseService } from '../services/DatabaseService';
 import { useToast } from './shared/ToastContext';
@@ -17,8 +19,32 @@ interface ResourceShowProps {
     onBack: () => void;
 }
 
+function distributionsFromReferences(resource: Resource): Distribution[] {
+    if (!resource.dct_references_s) return [];
+    try {
+        const refs = JSON.parse(resource.dct_references_s);
+        if (!refs || typeof refs !== "object") return [];
+        const distributions: Distribution[] = [];
+        for (const [relation_key, value] of Object.entries(refs)) {
+            const urls = Array.isArray(value) ? value : [value];
+            for (const url of urls) {
+                if (typeof url !== "string" || url.trim() === "") continue;
+                distributions.push({
+                    resource_id: resource.id,
+                    relation_key,
+                    url,
+                });
+            }
+        }
+        return distributions;
+    } catch {
+        return [];
+    }
+}
+
 export const ResourceShow: React.FC<ResourceShowProps> = ({ id, onBack }) => {
     const [resource, setResource] = useState<Resource | null>(null);
+    const [distributions, setDistributions] = useState<Distribution[]>([]);
     const [similarResources, setSimilarResources] = useState<Resource[]>([]);
     const [loading, setLoading] = useState(true);
     const [pagination, setPagination] = useState<{ prevId?: string, nextId?: string, position: number, total: number }>({ position: 0, total: 0 });
@@ -28,10 +54,22 @@ export const ResourceShow: React.FC<ResourceShowProps> = ({ id, onBack }) => {
         const load = async () => {
             setLoading(true);
             try {
-                const r = await queryResourceById(id);
+                let r = await queryResourceById(id);
+                if (!r) {
+                    await waitForDuckDbRestore();
+                    r = await queryResourceById(id);
+                }
                 setResource(r);
 
                 if (r) {
+                    try {
+                        const tableDistributions = await queryDistributionsForResource(r.id);
+                        setDistributions([...tableDistributions, ...distributionsFromReferences(r)]);
+                    } catch (e) {
+                        console.warn("Failed to load resource distributions", e);
+                        setDistributions(distributionsFromReferences(r));
+                    }
+
                     // Fetch similar resources (Metadata Overlap)
                     querySimilarResources(id).then(setSimilarResources);
 
@@ -79,9 +117,12 @@ export const ResourceShow: React.FC<ResourceShowProps> = ({ id, onBack }) => {
                     }
 
                     getSearchNeighbors(req, id).then(setPagination);
+                } else {
+                    setDistributions([]);
                 }
             } catch (e) {
                 console.error("Failed to load resource", e);
+                setDistributions([]);
             } finally {
                 setLoading(false);
             }
@@ -130,8 +171,10 @@ export const ResourceShow: React.FC<ResourceShowProps> = ({ id, onBack }) => {
 
             {/* Resource Viewer */}
             <div className="px-6 pt-6">
-                <ResourceViewer resource={resource} />
+                <ResourceViewer resource={resource} distributions={distributions} />
             </div>
+
+            <ResourceDistributions distributions={distributions} />
 
             <div className="flex flex-col lg:flex-row">
                 <ResourceMetadata resource={resource} />

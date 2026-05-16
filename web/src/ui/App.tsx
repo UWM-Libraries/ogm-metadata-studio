@@ -18,7 +18,7 @@ import { useToast } from "./shared/ToastContext";
 import { GoogleAuthButton } from "./GoogleAuthButton";
 import { useAuth } from "../auth/useAuth";
 import { withBasePath } from "../utils/basePath";
-import { DUCKDB_RESTORED_EVENT, DUCKDB_RESTORE_PROGRESS_EVENT, getDuckDbRestoreStatus } from "../duckdb/dbInit";
+import { DUCKDB_RESTORED_EVENT, DUCKDB_RESTORE_PROGRESS_EVENT, getDuckDbRestoreStatus, waitForDuckDbRestore } from "../duckdb/dbInit";
 
 
 // URL State
@@ -212,7 +212,11 @@ export const App: React.FC = () => {
   useEffect(() => {
     const load = async () => {
       if (view === "edit" && selectedId && (!editing || editing.id !== selectedId)) {
-        const r = await queryResourceById(selectedId);
+        let r = await queryResourceById(selectedId);
+        if (!r) {
+          await waitForDuckDbRestore();
+          r = await queryResourceById(selectedId);
+        }
         if (r) {
           const d = await queryDistributionsForResource(selectedId);
           setEditing(r);

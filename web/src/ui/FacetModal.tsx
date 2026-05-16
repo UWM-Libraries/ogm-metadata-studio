@@ -1,6 +1,7 @@
 
 import React, { useEffect, useState, useCallback } from 'react';
 import { getFacetValues } from '../duckdb/duckdbClient';
+import { displayAardvarkValue } from '../utils/aardvarkDisplay';
 
 interface FacetModalProps {
     field: string;
@@ -173,7 +174,7 @@ export const FacetModal: React.FC<FacetModalProps> = ({
                                                     }`}
                                                 title={item.value}
                                             >
-                                                {item.value || "<Empty>"}
+                                                {item.value ? displayAardvarkValue(field, item.value) : "<Empty>"}
                                             </button>
                                         </div>
 
