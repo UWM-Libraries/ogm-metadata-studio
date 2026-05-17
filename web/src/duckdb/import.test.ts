@@ -80,6 +80,22 @@ describe('DuckDB Import', () => {
                 expect.stringContaining("'dct_language_sm','eng'")
             );
         });
+
+        it('preserves new dct_references_s relation keys as distributions', async () => {
+            const data = {
+                id: 'geo-1',
+                dct_title_s: 'Geo',
+                dct_references_s: JSON.stringify({
+                    pmtiles: { url: 'https://example.com/data.pmtiles', label: 'PMTiles vector tiles' },
+                }),
+            };
+
+            await importJsonData(data);
+
+            expect(mockConn.query).toHaveBeenCalledWith(expect.stringContaining('INSERT INTO distributions'));
+            expect(mockConn.query).toHaveBeenCalledWith(expect.stringContaining("'pmtiles'"));
+            expect(mockConn.query).toHaveBeenCalledWith(expect.stringContaining('https://example.com/data.pmtiles'));
+        });
     });
 
     describe('importCsv', () => {

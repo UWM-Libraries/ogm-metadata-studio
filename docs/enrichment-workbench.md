@@ -61,14 +61,32 @@ Inventory sync has browser and proxy-side timeouts so S3-compatible pagination o
 2. Configure one or more S3-compatible storage profiles.
 3. Configure one or more OpenAI model profiles.
 4. Optionally configure a Google Vision OCR profile.
-5. Drop one or more image assets into the Upload tab.
+5. Drop one or more image assets into the Upload tab, or use `Choose Folder` to queue every supported file in a local directory tree.
 6. Optionally drop companion metadata files (`.txt`, FGDC XML, ISO XML, or generic `.xml`) to improve final Aardvark generation.
 7. Run the upload pipeline.
 
 Each image is checksummed before processing. New images are uploaded to S3 under a UUID resource directory, tiled into a IIIF Level 0 image service, given a 512-ish thumbnail, sent through historical map extraction, passed through a second Aardvark metadata-writing step, published into DuckDB, and written back to S3 as Aardvark JSON. If a Google Vision OCR profile is selected in the Upload tab, Google Cloud Vision performs the text extraction and bounding-box generation first; OpenAI then uses that OCR output to prepare the OpenGeoMetadata Aardvark record. Previously processed checksums reuse the existing S3 artifacts while refreshing the local DuckDB resource. If a Google Vision OCR profile is selected and the cached extraction was not produced by Google Vision, the proxy refreshes `enrichment_response.json` with Google Vision before rewriting Aardvark.
 
-Companion metadata matching is filename-based: `reno.jpg` will use `reno.xml` or `reno.txt`. If exactly one companion metadata file is queued and no filename match exists, the workbench applies it to each image in the batch.
+Companion metadata matching is filename-based: `reno.jpg` will use `reno.xml`, `reno.txt`, or `reno.jpg.xml`. If exactly one companion metadata file is queued and no filename match exists, the workbench applies it to each image in the batch.
 
 Use `Regenerate S3 Aardvark` when the extraction response and derivative assets already exist in S3 but the Aardvark-writing prompt or normalization logic has improved. The workbench scans the selected storage profile's upload directory for UUID resource folders with both `enrichment_response.json` and `aardvark.json`, re-runs only the Aardvark metadata-writing pass, overwrites the S3 `aardvark.json`, and republishes the resource plus distributions into DuckDB.
 
 Inventory sync remains available for staged S3 assets, prompt response review, and draft workflows. Prompt responses and draft provenance are kept in DuckDB/IndexedDB and in `records.duckdb` exports. Aardvark JSON exports remain clean.
+
+## Geospatial Package Uploads
+
+For GIS datasets made of several sibling files, submit one logical package per dataset. A `.zip` file is the canonical format. The browser also accepts loose shapefile sidecars dropped together, such as `.shp`, `.shx`, `.dbf`, `.prj`, `.cpg`, `.sbn`, `.sbx`, `.qix`, and `.shp.xml`; it groups files by basename and creates the ZIP payload before sending it to the proxy.
+
+Directory intake is recursive. Drag a folder onto the drop zone or click `Choose Folder`; the workbench walks the tree, queues supported images, groups shapefile sidecars by relative folder plus basename, groups geospatial rasters with sidecars such as `.tfw`, `.sdw`, `.prj`, `.aux`, `.rrd`, `.ovr`, `.met`, `.tif.xml`, and `.aux.xml`, inspects ZIP contents before queuing them, and stores unmatched `.txt`, `.xml`, `.fgdc`, `.iso`, and `.met` files as companion metadata. ZIP archives that contain shapefiles or georeferenced raster packages are queued for geospatial processing. ZIP archives that only contain metadata are expanded into companion metadata files. System files and unsupported leftovers are ignored with a queue summary instead of blocking the batch.
+
+The proxy currently analyzes zipped shapefiles and geospatial raster packages deterministically, uploads the original ZIP, writes `dataset_manifest.json`, creates a GeoJSON viewer derivative for lon/lat polygon shapefiles, attempts GeoParquet with `ogr2ogr` when GDAL is installed, attempts PMTiles with `tippecanoe` when available, creates Cloud Optimized GeoTIFF derivatives for GDAL-readable georeferenced rasters with `gdal_translate`, and publishes an Aardvark dataset record. Missing derivative tools are recorded in the manifest and display note instead of blocking metadata publication. Single image uploads that GDAL can identify as georeferenced TIFF/JPEG2000 rasters keep the IIIF workflow and also receive a COG derivative.
+
+### Native Geospatial Tools
+
+GeoParquet, PMTiles, and COG derivatives use native command-line tools, not Python packages:
+
+```bash
+brew install gdal tippecanoe
+```
+
+GDAL supplies `ogr2ogr`, `gdalinfo`, and `gdal_translate`; the proxy uses them for GeoParquet, reprojection-friendly GeoJSON, raster georeferencing checks, and COG creation. `tippecanoe` creates PMTiles vector tiles from the GeoJSON derivative. The proxy checks normal `PATH` plus common macOS Homebrew locations (`/opt/homebrew/bin` and `/usr/local/bin`) so it can find these tools even when launched from an app or restricted shell.

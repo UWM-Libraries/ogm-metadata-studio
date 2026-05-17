@@ -4,6 +4,8 @@ import { detectViewerConfig, ViewerConfig } from './resource/viewerConfig';
 import { MapLibreResourceViewer } from './viewers/MapLibreResourceViewer';
 import { CloverViewer } from './viewers/CloverViewer';
 import { IiifImageViewer } from './viewers/IiifImageViewer';
+import { AttributePreviewTable } from './viewers/AttributePreviewTable';
+import type { SelectableGeoJsonFeature } from './viewers/geospatialFeature';
 import { normalizeTextExtractionAnnotations, type TextExtractionAnnotation } from './viewers/textExtractionOverlay';
 
 interface ResourceViewerProps {
@@ -22,6 +24,7 @@ export const ResourceViewer: React.FC<ResourceViewerProps> = ({ resource, distri
         }
     }, [distributions, resource]);
     const extractionEndpoint = config?.protocol === "iiif_image" ? config.textExtractionEndpoint : undefined;
+    const [selectedFeature, setSelectedFeature] = useState<SelectableGeoJsonFeature | null>(null);
     const [loadedTextAnnotations, setLoadedTextAnnotations] = useState<{
         endpoint: string;
         annotations: TextExtractionAnnotation[];
@@ -82,9 +85,13 @@ export const ResourceViewer: React.FC<ResourceViewerProps> = ({ resource, distri
         };
     }, [extractionEndpoint]);
 
+    useEffect(() => {
+        setSelectedFeature(null);
+    }, [config?.endpoint, config?.attributeTableEndpoint]);
+
     if (!config) return null;
 
-    const { protocol, endpoint, geometry } = config;
+    const { protocol, endpoint, geometry, attributeTableEndpoint } = config;
 
     const getViewerType = (proto: string) => {
         if (proto === 'iiif_manifest') return 'clover';
@@ -130,17 +137,27 @@ export const ResourceViewer: React.FC<ResourceViewerProps> = ({ resource, distri
         }
 
         return (
-            <div className="mb-8 border border-gray-200 dark:border-slate-700 rounded-lg overflow-hidden relative z-0">
-                <div key={endpoint} className="viewer h-[500px] w-full">
-                    <MapLibreResourceViewer
-                        protocol={protocol}
-                        url={endpoint}
-                        layerId={resource.gbl_wxsIdentifier_s ?? ''}
-                        mapGeom={mapGeom}
-                        options={{ opacity: 0.75 }}
-                    />
+            <>
+                <div className="mb-8 border border-gray-200 dark:border-slate-700 rounded-lg overflow-hidden relative z-0">
+                    <div key={endpoint} className="viewer h-[500px] w-full">
+                        <MapLibreResourceViewer
+                            protocol={protocol}
+                            url={endpoint}
+                            layerId={resource.gbl_wxsIdentifier_s ?? ''}
+                            mapGeom={mapGeom}
+                            selectedFeature={selectedFeature}
+                            options={{ opacity: 0.75 }}
+                        />
+                    </div>
                 </div>
-            </div>
+                {attributeTableEndpoint && (
+                    <AttributePreviewTable
+                        url={attributeTableEndpoint}
+                        selectedFeatureId={selectedFeature?.id}
+                        onSelectFeature={setSelectedFeature}
+                    />
+                )}
+            </>
         );
     }
 

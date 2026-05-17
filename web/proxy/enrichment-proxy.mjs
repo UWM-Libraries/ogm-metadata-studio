@@ -1,11 +1,15 @@
 import http from "node:http";
 import { existsSync, readFileSync } from "node:fs";
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { tmpdir } from "node:os";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const execFileAsync = promisify(execFile);
 
 function parseEnvValue(value) {
   const trimmed = value.trim();
@@ -45,6 +49,8 @@ const CONFIG_PATH = process.env.ENRICHMENT_PROXY_CONFIG || path.resolve(__dirnam
 const DEFAULT_REGION = "us-east-1";
 const S3_LIST_TIMEOUT_MS = Number(process.env.ENRICHMENT_PROXY_S3_LIST_TIMEOUT_MS || 30_000);
 const S3_OBJECT_TIMEOUT_MS = Number(process.env.ENRICHMENT_PROXY_S3_OBJECT_TIMEOUT_MS || 120_000);
+const COG_PREVIEW_TIMEOUT_MS = Number(process.env.ENRICHMENT_PROXY_COG_PREVIEW_TIMEOUT_MS || 120_000);
+const COG_PREVIEW_MAX_DIMENSION = Number(process.env.ENRICHMENT_PROXY_COG_PREVIEW_MAX_DIMENSION || 1400);
 const MAX_LIST_PAGES = Number(process.env.ENRICHMENT_PROXY_MAX_LIST_PAGES || 1000);
 const EMPTY_HASH = crypto.createHash("sha256").update("").digest("hex");
 const VISION_TEST_IMAGE = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=", "base64");
@@ -123,8 +129,9 @@ function send(res, status, body) {
   res.writeHead(status, {
     "Content-Type": "application/json",
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "Content-Type",
-    "Access-Control-Allow-Methods": "GET,PUT,POST,OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Range",
+    "Access-Control-Allow-Methods": "GET,HEAD,PUT,POST,OPTIONS",
+    "Access-Control-Expose-Headers": "Accept-Ranges, Content-Length, Content-Range, Content-Type, ETag, Last-Modified",
   });
   res.end(safeJsonStringify(body));
 }
@@ -329,6 +336,12 @@ function contentTypeForKey(key) {
   if (lower.endsWith(".webp")) return "image/webp";
   if (lower.endsWith(".tif") || lower.endsWith(".tiff")) return "image/tiff";
   if (lower.endsWith(".jp2") || lower.endsWith(".j2k")) return "image/jp2";
+  if (lower.endsWith(".zip")) return "application/zip";
+  if (lower.endsWith(".geojson")) return "application/geo+json";
+  if (lower.endsWith(".json")) return "application/json";
+  if (lower.endsWith(".parquet")) return "application/vnd.apache.parquet";
+  if (lower.endsWith(".pmtiles")) return "application/vnd.pmtiles";
+  if (lower.endsWith(".xml")) return "application/xml";
   return "application/octet-stream";
 }
 
@@ -343,6 +356,264 @@ function publicUrlFor(profile, key) {
 
 function accessUrlFor(profile, key) {
   return publicUrlFor(profile, key) || objectUrl(profile, key).toString();
+}
+
+function decodeUrlPathSegment(segment) {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
+}
+
+function keyFromPublicUrl(profile, artifactUrl) {
+  if (!profile.publicBaseUrl) return "";
+  const publicBase = String(profile.publicBaseUrl).replace(/\/+$/, "");
+  if (!artifactUrl.href.startsWith(`${publicBase}/`)) return "";
+  return artifactUrl.href
+    .slice(publicBase.length + 1)
+    .split(/[?#]/, 1)[0]
+    .split("/")
+    .map(decodeUrlPathSegment)
+    .join("/");
+}
+
+function keyFromObjectUrl(profile, artifactUrl) {
+  const endpoint = new URL(String(profile.endpoint || "").replace(/\/+$/, ""));
+  const bucket = String(profile.bucket || "");
+  if (!bucket || artifactUrl.protocol !== endpoint.protocol) return "";
+
+  const forcePathStyle = profile.forcePathStyle !== false;
+  if (forcePathStyle) {
+    if (artifactUrl.host !== endpoint.host) return "";
+    const parts = artifactUrl.pathname.replace(/^\/+/, "").split("/");
+    if (decodeUrlPathSegment(parts[0] || "") !== bucket) return "";
+    return parts.slice(1).map(decodeUrlPathSegment).join("/");
+  }
+
+  if (artifactUrl.host !== `${bucket}.${endpoint.host}`) return "";
+  return artifactUrl.pathname.replace(/^\/+/, "").split("/").map(decodeUrlPathSegment).join("/");
+}
+
+function findArtifactProfileAndKey(config, rawUrl) {
+  let artifactUrl;
+  try {
+    artifactUrl = new URL(String(rawUrl || ""));
+  } catch {
+    throw new Error("Artifact proxy requires a valid url parameter.");
+  }
+  if (!["http:", "https:"].includes(artifactUrl.protocol)) throw new Error("Artifact proxy only supports HTTP(S) URLs.");
+
+  for (const profile of config.storageProfiles || []) {
+    const key = keyFromPublicUrl(profile, artifactUrl) || keyFromObjectUrl(profile, artifactUrl);
+    if (!key) continue;
+    const uploadRoot = uploadBasePrefix(profile).replace(/\/+$/, "");
+    if (!key.startsWith(`${uploadRoot}/`)) throw new Error("Artifact URL is outside the configured upload prefix.");
+    return { profile, key };
+  }
+  throw new Error("Artifact URL does not match a configured storage profile.");
+}
+
+async function proxyArtifactObject(config, req, res, rawUrl) {
+  if (!["GET", "HEAD"].includes(req.method || "")) {
+    res.writeHead(405, {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Headers": "Content-Type, Range",
+      "Access-Control-Allow-Methods": "GET,HEAD,OPTIONS",
+    });
+    res.end();
+    return;
+  }
+
+  const { profile, key } = findArtifactProfileAndKey(config, rawUrl);
+  const headers = {};
+  if (req.headers.range) headers.Range = req.headers.range;
+  const upstream = await signedFetch(profile, objectUrl(profile, key), {
+    method: req.method,
+    headers,
+    timeoutMs: S3_OBJECT_TIMEOUT_MS,
+  });
+
+  const responseHeaders = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type, Range",
+    "Access-Control-Allow-Methods": "GET,HEAD,OPTIONS",
+    "Access-Control-Expose-Headers": "Accept-Ranges, Content-Length, Content-Range, Content-Type, ETag, Last-Modified",
+  };
+  for (const name of ["accept-ranges", "cache-control", "content-length", "content-range", "content-type", "etag", "last-modified"]) {
+    const value = upstream.headers.get(name);
+    if (value) responseHeaders[name] = value;
+  }
+  if (!responseHeaders["content-type"]) responseHeaders["content-type"] = contentTypeForKey(key);
+  res.writeHead(upstream.status, responseHeaders);
+  if (req.method === "HEAD" || upstream.status === 304) {
+    res.end();
+    return;
+  }
+  const buffer = Buffer.from(await upstream.arrayBuffer());
+  res.end(buffer);
+}
+
+function parseCogPreviewDimension(value, fallback) {
+  const parsed = Math.round(Number(value));
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.max(16, Math.min(COG_PREVIEW_MAX_DIMENSION, parsed));
+}
+
+function clampNumber(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function parseCogPreviewBbox(value) {
+  const parts = String(value || "").split(",").map((part) => Number(part.trim()));
+  if (parts.length !== 4 || parts.some((part) => !Number.isFinite(part))) {
+    throw new Error("COG preview requires bbox=west,south,east,north in EPSG:4326.");
+  }
+  let [west, south, east, north] = parts;
+  west = clampNumber(west, -180, 180);
+  east = clampNumber(east, -180, 180);
+  south = clampNumber(south, -90, 90);
+  north = clampNumber(north, -90, 90);
+  if (!(east > west && north > south)) {
+    throw new Error("COG preview bbox is outside the valid EPSG:4326 range.");
+  }
+  return { west, south, east, north };
+}
+
+function cogPreviewVsicurlCandidates(rawUrl, profile, key) {
+  const candidates = [];
+  const push = (candidate) => {
+    if (!candidate) return;
+    if (!/^https?:\/\//i.test(candidate)) return;
+    if (candidates.includes(candidate)) return;
+    candidates.push(candidate);
+  };
+  push(String(rawUrl || ""));
+  push(publicUrlFor(profile, key));
+  push(objectUrl(profile, key).toString());
+  return candidates.map((candidate) => `/vsicurl/${candidate}`);
+}
+
+async function renderCogPreviewWithSource(sourcePath, outputPath, bbox, width, height) {
+  return tryExecFile("gdalwarp", [
+    "--config", "GDAL_DISABLE_READDIR_ON_OPEN", "EMPTY_DIR",
+    "--config", "CPL_VSIL_CURL_ALLOWED_EXTENSIONS", ".tif,.tiff,.TIF,.TIFF",
+    "-overwrite",
+    "-t_srs", "EPSG:4326",
+    "-te", String(bbox.west), String(bbox.south), String(bbox.east), String(bbox.north),
+    "-ts", String(width), String(height),
+    "-r", "bilinear",
+    "-dstalpha",
+    "-multi",
+    "-wo", "NUM_THREADS=ALL_CPUS",
+    "-of", "PNG",
+    sourcePath,
+    outputPath,
+  ], { timeoutMs: COG_PREVIEW_TIMEOUT_MS });
+}
+
+async function inspectCogWithSource(sourcePath) {
+  return tryExecFileOutput("gdalinfo", [
+    "--config", "GDAL_DISABLE_READDIR_ON_OPEN", "EMPTY_DIR",
+    "--config", "CPL_VSIL_CURL_ALLOWED_EXTENSIONS", ".tif,.tiff,.TIF,.TIFF",
+    "-json",
+    sourcePath,
+  ], { timeoutMs: COG_PREVIEW_TIMEOUT_MS, maxBuffer: 1024 * 1024 * 24 });
+}
+
+function responseFromCogInfo(info) {
+  const bbox = bboxFromGdalInfo(info);
+  const size = Array.isArray(info?.size) ? info.size : [];
+  if (!bbox) throw new Error("COG metadata did not include a valid WGS84 extent.");
+  return {
+    bbox: [bbox.west, bbox.south, bbox.east, bbox.north],
+    width: Number(size[0] || 0) || null,
+    height: Number(size[1] || 0) || null,
+    crs: String(info?.stac?.["proj:epsg"] || info?.coordinateSystem?.name || ""),
+    layout: String(info?.metadata?.IMAGE_STRUCTURE?.LAYOUT || ""),
+  };
+}
+
+async function inspectCogArtifact(config, res, rawUrl) {
+  const { profile, key } = findArtifactProfileAndKey(config, rawUrl);
+  if (!/\.tiff?$/i.test(key)) throw new Error("COG metadata only supports GeoTIFF artifacts.");
+  if (!await resolveCommandPath("gdalinfo")) {
+    throw new Error("COG metadata requires GDAL gdalinfo to be installed.");
+  }
+
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "ogm-cog-info-"));
+  try {
+    let lastError = "";
+    for (const sourcePath of cogPreviewVsicurlCandidates(rawUrl, profile, key)) {
+      const result = await inspectCogWithSource(sourcePath);
+      if (result.ok) {
+        return send(res, 200, responseFromCogInfo(JSON.parse(result.stdout)));
+      }
+      lastError = result.error || lastError;
+    }
+
+    const sourcePath = path.join(tempRoot, path.basename(key) || "source.cog.tif");
+    await writeFile(sourcePath, await fetchObjectBuffer(profile, key));
+    const result = await inspectCogWithSource(sourcePath);
+    if (!result.ok) {
+      throw new Error(`COG metadata inspection failed: ${result.error || lastError || "GDAL did not return metadata."}`);
+    }
+    return send(res, 200, responseFromCogInfo(JSON.parse(result.stdout)));
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+}
+
+async function previewCogArtifact(config, res, rawUrl, searchParams) {
+  const { profile, key } = findArtifactProfileAndKey(config, rawUrl);
+  if (!/\.tiff?$/i.test(key)) throw new Error("COG preview only supports GeoTIFF artifacts.");
+  if (!await resolveCommandPath("gdalwarp")) {
+    throw new Error("COG preview requires GDAL gdalwarp to be installed.");
+  }
+
+  const bbox = parseCogPreviewBbox(searchParams.get("bbox"));
+  const width = parseCogPreviewDimension(searchParams.get("width"), 800);
+  const height = parseCogPreviewDimension(searchParams.get("height"), 600);
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "ogm-cog-preview-"));
+  try {
+    let lastError = "";
+    for (const sourcePath of cogPreviewVsicurlCandidates(rawUrl, profile, key)) {
+      const outputPath = path.join(tempRoot, `preview-${crypto.randomUUID()}.png`);
+      const result = await renderCogPreviewWithSource(sourcePath, outputPath, bbox, width, height);
+      if (result.ok && existsSync(outputPath)) {
+        const png = await readFile(outputPath);
+        res.writeHead(200, {
+          "Content-Type": "image/png",
+          "Cache-Control": "public, max-age=300",
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Headers": "Content-Type, Range",
+          "Access-Control-Allow-Methods": "GET,OPTIONS",
+        });
+        res.end(png);
+        return;
+      }
+      lastError = result.error || lastError;
+    }
+
+    const sourcePath = path.join(tempRoot, path.basename(key) || "source.cog.tif");
+    const outputPath = path.join(tempRoot, "preview.png");
+    await writeFile(sourcePath, await fetchObjectBuffer(profile, key));
+    const result = await renderCogPreviewWithSource(sourcePath, outputPath, bbox, width, height);
+    if (!result.ok || !existsSync(outputPath)) {
+      throw new Error(`COG preview render failed: ${result.error || lastError || "GDAL did not create a PNG."}`);
+    }
+    const png = await readFile(outputPath);
+    res.writeHead(200, {
+      "Content-Type": "image/png",
+      "Cache-Control": "public, max-age=300",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Headers": "Content-Type, Range",
+      "Access-Control-Allow-Methods": "GET,OPTIONS",
+    });
+    res.end(png);
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
 }
 
 function sanitizeFileName(name) {
@@ -361,14 +632,33 @@ function checksumIndexKey(profile, checksum) {
 
 function uploadKeys(profile, resourceId, fileName) {
   const safeName = sanitizeFileName(fileName);
+  const baseName = safeName.replace(/\.[^.]+$/, "") || "image";
   const root = `${uploadBasePrefix(profile)}/${resourceId}`;
   return {
     root,
     original: `${root}/original_file/${safeName}`,
+    cog: `${root}/derivatives/${baseName}.cog.tif`,
     iiif: `${root}/iiif`,
     thumbnail: `${root}/thumbnail/thumbnail.jpg`,
     metadataSources: `${root}/metadata_sources`,
     extraction: `${root}/enrichment_response.json`,
+    aardvark: `${root}/aardvark.json`,
+  };
+}
+
+function geospatialUploadKeys(profile, resourceId, fileName) {
+  const safeName = sanitizeFileName(fileName || "geospatial_package.zip");
+  const baseName = safeName.replace(/\.[^.]+$/, "") || "dataset";
+  const root = `${uploadBasePrefix(profile)}/${resourceId}`;
+  return {
+    root,
+    original: `${root}/original_file/${safeName}`,
+    manifest: `${root}/dataset_manifest.json`,
+    geojson: `${root}/derivatives/${baseName}.geojson`,
+    geoParquet: `${root}/derivatives/${baseName}.parquet`,
+    pmtiles: `${root}/derivatives/${baseName}.pmtiles`,
+    cog: `${root}/derivatives/${baseName}.cog.tif`,
+    thumbnail: `${root}/thumbnail/thumbnail.jpg`,
     aardvark: `${root}/aardvark.json`,
   };
 }
@@ -1283,9 +1573,9 @@ function normalizeAardvarkResource(candidate, fallback, context) {
   next.dct_references_s = fallback.dct_references_s;
   next.dct_identifier_sm = uniqueStrings([context.resourceId, context.checksum, ...(next.dct_identifier_sm || [])]);
   next.dct_source_sm = uniqueStrings([context.artifacts.originalUrl, ...(context.metadataSourceUrls || []), ...(next.dct_source_sm || [])]);
-  next.dcat_bbox = next.dcat_bbox || fallback.dcat_bbox || "";
-  next.locn_geometry = next.locn_geometry || fallback.locn_geometry || "";
-  next.dcat_centroid = next.dcat_centroid || fallback.dcat_centroid || "";
+  next.dcat_bbox = fallback.dcat_bbox || next.dcat_bbox || "";
+  next.locn_geometry = fallback.locn_geometry || next.locn_geometry || "";
+  next.dcat_centroid = fallback.dcat_centroid || next.dcat_centroid || "";
   next.gbl_georeferenced_b = Boolean(next.dcat_bbox || next.locn_geometry);
   next.gbl_suppressed_b = Boolean(next.gbl_suppressed_b);
   delete next.extra;
@@ -1343,6 +1633,7 @@ function uploadKeysFromRoot(root, fileName = "original", originalKey = "") {
   return {
     root: cleanRoot,
     original: originalKey || `${cleanRoot}/original_file/${safeName}`,
+    cog: `${cleanRoot}/derivatives/${safeName.replace(/\.[^.]+$/, "") || "image"}.cog.tif`,
     iiif: `${cleanRoot}/iiif`,
     thumbnail: `${cleanRoot}/thumbnail/thumbnail.jpg`,
     metadataSources: `${cleanRoot}/metadata_sources`,
@@ -1354,22 +1645,39 @@ function uploadKeysFromRoot(root, fileName = "original", originalKey = "") {
 function artifactUrlsForResource(profile, keys, resource) {
   const refs = referencesFromResource(resource);
   const iiifReference = refs["http://iiif.io/api/image"] ? String(refs["http://iiif.io/api/image"]) : "";
+  const cogReference = refs["https://www.cogeo.org/"];
+  const cogUrl = typeof cogReference === "string"
+    ? cogReference
+    : cogReference && typeof cogReference === "object"
+      ? String(cogReference.url || cogReference["@id"] || cogReference.id || "")
+      : "";
   return {
     originalUrl: refs["http://schema.org/url"] || accessUrlFor(profile, keys.original),
     thumbnailUrl: refs["http://schema.org/thumbnailUrl"] || accessUrlFor(profile, keys.thumbnail),
     iiifInfoUrl: iiifReference ? (iiifReference.endsWith("/info.json") ? iiifReference : `${iiifReference.replace(/\/+$/, "")}/info.json`) : `${accessUrlFor(profile, keys.iiif)}/info.json`,
     extractionUrl: refs["https://opengeometadata.org/reference/enrichment-response"] || accessUrlFor(profile, keys.extraction),
     aardvarkUrl: refs["https://opengeometadata.org/reference/aardvark-json"] || accessUrlFor(profile, keys.aardvark),
+    cogUrl,
   };
 }
 
 function ensureReferenceJson(resource, artifacts) {
   const refs = referencesFromResource(resource);
+  const downloadRefs = Array.isArray(refs["http://schema.org/downloadUrl"])
+    ? refs["http://schema.org/downloadUrl"]
+    : refs["http://schema.org/downloadUrl"] ? [refs["http://schema.org/downloadUrl"]] : [];
   const nextRefs = {
     ...refs,
     "http://schema.org/url": artifacts.originalUrl,
     "http://schema.org/thumbnailUrl": artifacts.thumbnailUrl,
     "http://iiif.io/api/image": String(artifacts.iiifInfoUrl || "").replace(/\/info\.json$/i, ""),
+    ...(artifacts.cogUrl ? {
+      "http://schema.org/downloadUrl": [
+        ...downloadRefs,
+        { url: artifacts.cogUrl, label: "Cloud Optimized GeoTIFF derivative" },
+      ],
+      "https://www.cogeo.org/": { url: artifacts.cogUrl, label: "Cloud Optimized GeoTIFF" },
+    } : {}),
     "https://opengeometadata.org/reference/enrichment-response": artifacts.extractionUrl,
     "https://opengeometadata.org/reference/aardvark-json": artifacts.aardvarkUrl,
   };
@@ -1475,6 +1783,878 @@ async function readMetadataDocumentsFromS3(profile, keys, log = () => undefined)
   return documents;
 }
 
+async function loadJsZip() {
+  const mod = await import("jszip");
+  return mod.default || mod;
+}
+
+function normalizeZipPath(name) {
+  return String(name || "").replace(/\\/g, "/").replace(/^\/+/, "");
+}
+
+function isIgnoredZipEntry(name) {
+  const normalized = normalizeZipPath(name);
+  const parts = normalized.split("/");
+  const basename = parts[parts.length - 1] || "";
+  return parts.includes("__MACOSX") || basename.startsWith("._") || basename === ".DS_Store";
+}
+
+function stripKnownGeoExtension(name) {
+  const normalized = normalizeZipPath(name);
+  if (/\.shp\.xml$/i.test(normalized)) return normalized.replace(/\.shp\.xml$/i, "");
+  return normalized.replace(/\.(shp|shx|dbf|prj|cpg|sbn|sbx|qix)$/i, "");
+}
+
+function stripKnownRasterExtension(name) {
+  const normalized = normalizeZipPath(name);
+  return normalized
+    .replace(/\.(tif|tiff|sid|img|jp2|j2k)\.aux\.xml$/i, "")
+    .replace(/\.(tif|tiff|sid|img|jp2|j2k|aux)\.xml$/i, "")
+    .replace(/\.(tfw|tifw|jgw|j2w|sdw|wld|prj|aux|ovr|rrd|met)$/i, "")
+    .replace(/\.(tiff?|sid|img|jp2|j2k)$/i, "");
+}
+
+function isRasterSourceEntry(name) {
+  return /\.(tiff?|sid|img|jp2|j2k)$/i.test(name);
+}
+
+async function zipEntriesFromBuffer(buffer) {
+  const JSZip = await loadJsZip();
+  const zip = await JSZip.loadAsync(buffer);
+  const entries = [];
+  for (const [rawName, entry] of Object.entries(zip.files)) {
+    if (entry.dir) continue;
+    const name = normalizeZipPath(rawName);
+    if (isIgnoredZipEntry(name)) continue;
+    const entryBuffer = await entry.async("nodebuffer");
+    entries.push({
+      name,
+      lowerName: name.toLowerCase(),
+      size: entryBuffer.length,
+      buffer: entryBuffer,
+    });
+  }
+  entries.sort((a, b) => a.name.localeCompare(b.name));
+  return entries;
+}
+
+function findEntry(entries, predicate) {
+  return entries.find((entry) => predicate(entry.lowerName));
+}
+
+function findShapefileSet(entries) {
+  const shp = findEntry(entries, (name) => name.endsWith(".shp") && !name.endsWith(".shp.xml"));
+  if (!shp) return null;
+  const base = stripKnownGeoExtension(shp.name);
+  const lowerBase = base.toLowerCase();
+  const byLowerName = new Map(entries.map((entry) => [entry.lowerName, entry]));
+  return {
+    base,
+    shp,
+    shx: byLowerName.get(`${lowerBase}.shx`) || null,
+    dbf: byLowerName.get(`${lowerBase}.dbf`) || null,
+    prj: byLowerName.get(`${lowerBase}.prj`) || null,
+    shpXml: byLowerName.get(`${lowerBase}.shp.xml`) || null,
+  };
+}
+
+function findRasterSet(entries) {
+  const source = findEntry(entries, isRasterSourceEntry);
+  if (!source) return null;
+  const base = stripKnownRasterExtension(source.name);
+  const lowerBase = base.toLowerCase();
+  return {
+    base,
+    source,
+    sidecars: entries.filter((entry) => entry !== source && stripKnownRasterExtension(entry.name).toLowerCase() === lowerBase),
+  };
+}
+
+function parseDbf(buffer) {
+  if (!buffer || buffer.length < 32) return null;
+  const recordCount = buffer.readUInt32LE(4);
+  const headerLength = buffer.readUInt16LE(8);
+  const recordLength = buffer.readUInt16LE(10);
+  const fields = [];
+  let offset = 32;
+  let recordOffset = 1;
+  while (offset + 32 <= buffer.length && buffer[offset] !== 0x0d) {
+    const descriptor = buffer.subarray(offset, offset + 32);
+    const name = descriptor.subarray(0, 11).toString("ascii").replace(/\0.*$/g, "").trim();
+    const type = String.fromCharCode(descriptor[11] || 0);
+    const length = descriptor[16] || 0;
+    const decimals = descriptor[17] || 0;
+    if (name && length > 0) {
+      fields.push({ name, type, length, decimals, offset: recordOffset });
+      recordOffset += length;
+    }
+    offset += 32;
+  }
+
+  const rows = [];
+  for (let index = 0; index < recordCount; index += 1) {
+    const start = headerLength + index * recordLength;
+    const record = buffer.subarray(start, start + recordLength);
+    if (record.length < recordLength || record[0] === 0x2a) continue;
+    const row = {};
+    for (const field of fields) {
+      const raw = record.subarray(field.offset, field.offset + field.length).toString("latin1").trim();
+      row[field.name] = raw;
+    }
+    rows.push(row);
+  }
+
+  return {
+    recordCount,
+    headerLength,
+    recordLength,
+    fields: fields.map(({ offset: _offset, ...field }) => field),
+    rows,
+  };
+}
+
+const SHAPE_TYPE_LABELS = {
+  0: "Null",
+  1: "Point",
+  3: "Polyline",
+  5: "Polygon",
+  8: "MultiPoint",
+  11: "PointZ",
+  13: "PolylineZ",
+  15: "PolygonZ",
+  18: "MultiPointZ",
+  21: "PointM",
+  23: "PolylineM",
+  25: "PolygonM",
+  28: "MultiPointM",
+  31: "MultiPatch",
+};
+
+function parseShpSummary(buffer) {
+  if (!buffer || buffer.length < 100) throw new Error("The .shp file is too small to contain a valid shapefile header.");
+  const fileCode = buffer.readInt32BE(0);
+  const fileLengthWords = buffer.readInt32BE(24);
+  const version = buffer.readInt32LE(28);
+  const shapeType = buffer.readInt32LE(32);
+  const minX = buffer.readDoubleLE(36);
+  const minY = buffer.readDoubleLE(44);
+  const maxX = buffer.readDoubleLE(52);
+  const maxY = buffer.readDoubleLE(60);
+  const shapeTypeCounts = {};
+  let recordCount = 0;
+  let totalParts = 0;
+  let totalPoints = 0;
+  let offset = 100;
+  while (offset + 8 <= buffer.length) {
+    const contentLengthWords = buffer.readInt32BE(offset + 4);
+    const contentOffset = offset + 8;
+    const byteLength = contentLengthWords * 2;
+    if (contentOffset + byteLength > buffer.length || byteLength < 4) break;
+    const recordShapeType = buffer.readInt32LE(contentOffset);
+    shapeTypeCounts[recordShapeType] = (shapeTypeCounts[recordShapeType] || 0) + 1;
+    if ([3, 5, 13, 15, 23, 25, 31].includes(recordShapeType) && byteLength >= 44) {
+      totalParts += buffer.readInt32LE(contentOffset + 36);
+      totalPoints += buffer.readInt32LE(contentOffset + 40);
+    }
+    recordCount += 1;
+    offset += 8 + byteLength;
+  }
+  return {
+    fileCode,
+    version,
+    fileLengthBytes: fileLengthWords * 2,
+    shapeType,
+    geometryType: SHAPE_TYPE_LABELS[shapeType] || `Shape type ${shapeType}`,
+    recordCount,
+    totalParts,
+    totalPoints,
+    bbox: { west: minX, south: minY, east: maxX, north: maxY },
+    shapeTypeCounts,
+  };
+}
+
+function ensureClosedRing(points) {
+  if (points.length === 0) return points;
+  const first = points[0];
+  const last = points[points.length - 1];
+  if (first[0] === last[0] && first[1] === last[1]) return points;
+  return [...points, first];
+}
+
+function parseShpPolygonFeatures(buffer, rows) {
+  const features = [];
+  let recordIndex = 0;
+  let offset = 100;
+  while (offset + 8 <= buffer.length) {
+    const contentLengthWords = buffer.readInt32BE(offset + 4);
+    const contentOffset = offset + 8;
+    const byteLength = contentLengthWords * 2;
+    if (contentOffset + byteLength > buffer.length || byteLength < 4) break;
+    const shapeType = buffer.readInt32LE(contentOffset);
+    if (shapeType === 5 && byteLength >= 44) {
+      const numParts = buffer.readInt32LE(contentOffset + 36);
+      const numPoints = buffer.readInt32LE(contentOffset + 40);
+      const partsOffset = contentOffset + 44;
+      const pointsOffset = partsOffset + numParts * 4;
+      const partStarts = [];
+      for (let part = 0; part < numParts; part += 1) {
+        partStarts.push(buffer.readInt32LE(partsOffset + part * 4));
+      }
+      const rings = [];
+      for (let part = 0; part < numParts; part += 1) {
+        const startPoint = partStarts[part];
+        const endPoint = part + 1 < numParts ? partStarts[part + 1] : numPoints;
+        const ring = [];
+        for (let point = startPoint; point < endPoint; point += 1) {
+          const pointOffset = pointsOffset + point * 16;
+          ring.push([buffer.readDoubleLE(pointOffset), buffer.readDoubleLE(pointOffset + 8)]);
+        }
+        if (ring.length >= 4) rings.push(ensureClosedRing(ring));
+      }
+      if (rings.length > 0) {
+        features.push({
+          type: "Feature",
+          properties: rows?.[recordIndex] || {},
+          geometry: { type: "Polygon", coordinates: rings },
+        });
+      }
+    }
+    recordIndex += 1;
+    offset += 8 + byteLength;
+  }
+  return features;
+}
+
+function compactCounts(counter, limit = 20) {
+  return Array.from(counter.entries())
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, limit)
+    .map(([value, count]) => ({ value, count }));
+}
+
+function summarizeAttributes(dbf) {
+  if (!dbf) return null;
+  const interestingNames = ["ST", "STATE", "Band", "BAND", "UTM", "ZONE", "Res", "RES", "SrcImgDate", "VerDate", "FileName", "QQNAME"];
+  const stats = {};
+  for (const name of interestingNames) {
+    if (!dbf.fields.some((field) => field.name === name)) continue;
+    const counter = new Map();
+    for (const row of dbf.rows) {
+      const value = String(row[name] || "").trim();
+      if (!value) continue;
+      counter.set(value, (counter.get(value) || 0) + 1);
+    }
+    stats[name] = {
+      uniqueCount: counter.size,
+      topValues: compactCounts(counter),
+    };
+  }
+  return {
+    recordCount: dbf.recordCount,
+    fieldCount: dbf.fields.length,
+    fields: dbf.fields,
+    stats,
+    sampleRows: dbf.rows.slice(0, 8),
+  };
+}
+
+function yyyymmddToIso(value) {
+  const text = String(value || "").trim();
+  if (!/^\d{8}$/.test(text)) return "";
+  return `${text.slice(0, 4)}-${text.slice(4, 6)}-${text.slice(6, 8)}`;
+}
+
+function dateRangeFromRows(rows, field) {
+  const values = rows.map((row) => String(row[field] || "").trim()).filter((value) => /^\d{8}$/.test(value)).sort();
+  if (values.length === 0) return null;
+  return {
+    field,
+    min: values[0],
+    max: values[values.length - 1],
+    minIso: yyyymmddToIso(values[0]),
+    maxIso: yyyymmddToIso(values[values.length - 1]),
+    years: Array.from(new Set(values.map((value) => value.slice(0, 4)))).sort(),
+  };
+}
+
+function inferTemporal(dbf) {
+  if (!dbf) return null;
+  return dateRangeFromRows(dbf.rows, "SrcImgDate") || dateRangeFromRows(dbf.rows, "VerDate");
+}
+
+const US_STATE_NAMES = {
+  AL: "Alabama", AK: "Alaska", AZ: "Arizona", AR: "Arkansas", CA: "California", CO: "Colorado",
+  CT: "Connecticut", DE: "Delaware", FL: "Florida", GA: "Georgia", HI: "Hawaii", ID: "Idaho",
+  IL: "Illinois", IN: "Indiana", IA: "Iowa", KS: "Kansas", KY: "Kentucky", LA: "Louisiana",
+  ME: "Maine", MD: "Maryland", MA: "Massachusetts", MI: "Michigan", MN: "Minnesota", MS: "Mississippi",
+  MO: "Missouri", MT: "Montana", NE: "Nebraska", NV: "Nevada", NH: "New Hampshire", NJ: "New Jersey",
+  NM: "New Mexico", NY: "New York", NC: "North Carolina", ND: "North Dakota", OH: "Ohio", OK: "Oklahoma",
+  OR: "Oregon", PA: "Pennsylvania", RI: "Rhode Island", SC: "South Carolina", SD: "South Dakota",
+  TN: "Tennessee", TX: "Texas", UT: "Utah", VT: "Vermont", VA: "Virginia", WA: "Washington",
+  WV: "West Virginia", WI: "Wisconsin", WY: "Wyoming",
+};
+
+function spatialNamesFromAttributes(dbf) {
+  if (!dbf) return [];
+  const counter = new Map();
+  for (const row of dbf.rows) {
+    const code = String(row.ST || row.STATE || "").trim().toUpperCase();
+    if (!code) continue;
+    const name = US_STATE_NAMES[code] || code;
+    counter.set(name, (counter.get(name) || 0) + 1);
+  }
+  return compactCounts(counter, 12).map((item) => item.value);
+}
+
+function humanTitleFromPackage(baseName, manifest) {
+  const lower = String(baseName || "").toLowerCase();
+  if (/^naip[_-]nv[_-]2010[_-]1m[_-]m4b/.test(lower)) {
+    return "NAIP Nevada 2010 1-meter 4-band image tile footprints";
+  }
+  const cleaned = String(baseName || "Geospatial dataset")
+    .replace(/[_-]+/g, " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase())
+    .trim();
+  const geometry = String(manifest?.dataset?.geometryType || "").toLowerCase();
+  return geometry.includes("polygon") ? `${cleaned} polygons` : cleaned;
+}
+
+function canUseRawLonLatGeoJson(manifest) {
+  const bbox = manifest?.dataset?.bbox || {};
+  const finite = [bbox.west, bbox.east, bbox.south, bbox.north].every((value) => Number.isFinite(Number(value)));
+  if (!finite) return false;
+  const inRange = bbox.west >= -180 && bbox.east <= 180 && bbox.south >= -90 && bbox.north <= 90;
+  const prj = String(manifest?.crs?.wkt || "").toLowerCase();
+  return inRange && (prj.includes("geogcs") || prj.includes("degree") || !prj.trim());
+}
+
+function geojsonFromShapefile(shpBuffer, dbf, manifest) {
+  if (!canUseRawLonLatGeoJson(manifest)) return null;
+  if (manifest?.dataset?.shapeType !== 5) return null;
+  const features = parseShpPolygonFeatures(shpBuffer, dbf?.rows || []);
+  return {
+    type: "FeatureCollection",
+    name: manifest.dataset.baseName,
+    features,
+  };
+}
+
+function bboxToAardvarkEnvelope(bbox) {
+  if (!bbox) return "";
+  return `ENVELOPE(${bbox.west},${bbox.east},${bbox.north},${bbox.south})`;
+}
+
+function bboxToPolygonJson(bbox) {
+  if (!bbox) return "";
+  return safeJsonStringify({
+    type: "Polygon",
+    coordinates: [[
+      [bbox.west, bbox.north],
+      [bbox.east, bbox.north],
+      [bbox.east, bbox.south],
+      [bbox.west, bbox.south],
+      [bbox.west, bbox.north],
+    ]],
+  });
+}
+
+function bboxToCentroidJson(bbox) {
+  if (!bbox) return "";
+  return safeJsonStringify({
+    type: "Point",
+    coordinates: [(bbox.west + bbox.east) / 2, (bbox.north + bbox.south) / 2],
+  });
+}
+
+function metadataXmlSummary(xml) {
+  if (!xml) return null;
+  const metaId = (xml.match(/<MetaID>([\s\S]*?)<\/MetaID>/i)?.[1] || "").trim();
+  const createDate = (xml.match(/<CreaDate>([\s\S]*?)<\/CreaDate>/i)?.[1] || "").trim();
+  const processText = (xml.match(/<Process\b[^>]*>([\s\S]*?)<\/Process>/i)?.[1] || "").trim();
+  return {
+    metaId,
+    createDate,
+    processText,
+    bytes: Buffer.byteLength(xml, "utf8"),
+  };
+}
+
+function rasterSourceFormat(name) {
+  if (/\.tiff?$/i.test(name)) return "GeoTIFF";
+  if (/\.sid$/i.test(name)) return "MrSID";
+  if (/\.img$/i.test(name)) return "Erdas Imagine";
+  if (/\.jp2|\.j2k$/i.test(name)) return "JPEG2000";
+  return "Raster";
+}
+
+function analyzeShapefilePackage(entries, shapefile, fileName) {
+  const shpSummary = parseShpSummary(shapefile.shp.buffer);
+  const dbf = shapefile.dbf ? parseDbf(shapefile.dbf.buffer) : null;
+  const prjText = shapefile.prj ? shapefile.prj.buffer.toString("utf8").trim() : "";
+  const xmlText = shapefile.shpXml ? shapefile.shpXml.buffer.toString("utf8").trim() : "";
+  const baseName = path.basename(shapefile.base);
+  const temporal = inferTemporal(dbf);
+  const manifest = {
+    package: {
+      fileName,
+      format: "ZIP",
+      fileCount: entries.length,
+      files: entries.map((entry) => ({ path: entry.name, bytes: entry.buffer.length })),
+    },
+    dataset: {
+      kind: "vector",
+      baseName,
+      sourceFormat: "ESRI Shapefile",
+      shapeType: shpSummary.shapeType,
+      geometryType: shpSummary.geometryType,
+      featureCount: shpSummary.recordCount,
+      totalParts: shpSummary.totalParts,
+      totalPoints: shpSummary.totalPoints,
+      bbox: shpSummary.bbox,
+      centroid: {
+        lon: (shpSummary.bbox.west + shpSummary.bbox.east) / 2,
+        lat: (shpSummary.bbox.south + shpSummary.bbox.north) / 2,
+      },
+    },
+    crs: {
+      wkt: prjText,
+      normalized: prjText.includes("North_American_1983") ? "NAD83 geographic coordinates" : "",
+    },
+    attributes: summarizeAttributes(dbf),
+    temporal,
+    spatial: {
+      names: spatialNamesFromAttributes(dbf),
+    },
+    sidecarMetadata: metadataXmlSummary(xmlText),
+    derivatives: [],
+  };
+  return { entries, shapefile, dbf, manifest };
+}
+
+function analyzeRasterPackage(entries, raster, fileName) {
+  const baseName = path.basename(stripKnownRasterExtension(raster.base));
+  const xmlEntry = raster.sidecars.find((entry) => /\.xml$/i.test(entry.name));
+  const xmlText = xmlEntry ? xmlEntry.buffer.toString("utf8").trim() : "";
+  const manifest = {
+    package: {
+      fileName,
+      format: "ZIP",
+      fileCount: entries.length,
+      files: entries.map((entry) => ({ path: entry.name, bytes: entry.buffer.length })),
+    },
+    dataset: {
+      kind: "raster",
+      baseName,
+      sourceFormat: rasterSourceFormat(raster.source.name),
+      geometryType: "Raster",
+      featureCount: 1,
+      sourcePath: raster.source.name,
+      sidecarCount: raster.sidecars.length,
+      bbox: null,
+      centroid: null,
+    },
+    crs: {
+      wkt: "",
+      normalized: "",
+    },
+    attributes: { fieldCount: 0, fields: [], stats: {} },
+    temporal: { years: [], minIso: "", maxIso: "" },
+    spatial: { names: [] },
+    sidecarMetadata: metadataXmlSummary(xmlText),
+    derivatives: [],
+  };
+  return { entries, raster, manifest };
+}
+
+async function analyzeGeospatialPackage(buffer, fileName) {
+  const entries = await zipEntriesFromBuffer(buffer);
+  const shapefile = findShapefileSet(entries);
+  if (shapefile) return analyzeShapefilePackage(entries, shapefile, fileName);
+  const raster = findRasterSet(entries);
+  if (raster) return analyzeRasterPackage(entries, raster, fileName);
+  throw new Error("Geospatial package must contain a shapefile or geospatial raster source. Submit a zipped shapefile package, loose shapefile sidecars, or a raster with georeferencing sidecars.");
+}
+
+async function writeEntriesToDirectory(entries, directory) {
+  for (const entry of entries) {
+    const target = path.join(directory, entry.name);
+    const targetDir = path.dirname(target);
+    await mkdir(targetDir, { recursive: true });
+    await writeFile(target, entry.buffer);
+  }
+}
+
+const EXTRA_COMMAND_DIRS = [
+  "/opt/homebrew/bin",
+  "/usr/local/bin",
+  "/usr/bin",
+  "/bin",
+];
+
+async function resolveCommandPath(command) {
+  if (command.includes("/") && existsSync(command)) return command;
+  try {
+    const { stdout } = await execFileAsync("which", [command], { timeout: 10_000 });
+    const found = String(stdout || "").trim().split(/\r?\n/)[0];
+    if (found) return found;
+  } catch {
+    // Fall back to common macOS package-manager locations below.
+  }
+  for (const directory of EXTRA_COMMAND_DIRS) {
+    const candidate = path.join(directory, command);
+    if (existsSync(candidate)) return candidate;
+  }
+  return "";
+}
+
+async function tryExecFile(command, args, options = {}) {
+  try {
+    const resolved = await resolveCommandPath(command);
+    if (!resolved) return { ok: false, error: `Command not found: ${command}` };
+    await execFileAsync(resolved, args, {
+      timeout: options.timeoutMs || 180_000,
+      maxBuffer: 1024 * 1024 * 8,
+    });
+    return { ok: true };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error?.stderr || error?.stdout || error?.message || String(error),
+    };
+  }
+}
+
+async function tryExecFileOutput(command, args, options = {}) {
+  try {
+    const resolved = await resolveCommandPath(command);
+    if (!resolved) return { ok: false, error: `Command not found: ${command}`, stdout: "", stderr: "" };
+    const { stdout, stderr } = await execFileAsync(resolved, args, {
+      timeout: options.timeoutMs || 180_000,
+      maxBuffer: options.maxBuffer || 1024 * 1024 * 16,
+    });
+    return { ok: true, stdout: String(stdout || ""), stderr: String(stderr || "") };
+  } catch (error) {
+    return {
+      ok: false,
+      stdout: String(error?.stdout || ""),
+      stderr: String(error?.stderr || ""),
+      error: error?.stderr || error?.stdout || error?.message || String(error),
+    };
+  }
+}
+
+function bboxFromCoordinateGroups(groups) {
+  const points = [];
+  const collect = (value) => {
+    if (!Array.isArray(value)) return;
+    if (typeof value[0] === "number" && typeof value[1] === "number") {
+      points.push([Number(value[0]), Number(value[1])]);
+      return;
+    }
+    for (const child of value) collect(child);
+  };
+  collect(groups);
+  const valid = points.filter(([lon, lat]) => Number.isFinite(lon) && Number.isFinite(lat));
+  if (valid.length === 0) return null;
+  return {
+    west: Math.min(...valid.map(([lon]) => lon)),
+    south: Math.min(...valid.map(([, lat]) => lat)),
+    east: Math.max(...valid.map(([lon]) => lon)),
+    north: Math.max(...valid.map(([, lat]) => lat)),
+  };
+}
+
+function rawCornerBboxFromGdalInfo(info) {
+  const corners = info?.cornerCoordinates;
+  if (!corners) return null;
+  const points = [corners.lowerLeft, corners.lowerRight, corners.upperRight, corners.upperLeft]
+    .filter((point) => Array.isArray(point) && point.length >= 2)
+    .map((point) => [Number(point[0]), Number(point[1])])
+    .filter(([x, y]) => Number.isFinite(x) && Number.isFinite(y));
+  if (points.length === 0) return null;
+  const bbox = bboxFromCoordinateGroups(points);
+  const looksLonLat = bbox && bbox.west >= -180 && bbox.east <= 180 && bbox.south >= -90 && bbox.north <= 90;
+  return looksLonLat ? bbox : null;
+}
+
+function bboxFromGdalInfo(info) {
+  return bboxFromCoordinateGroups(info?.wgs84Extent?.coordinates) || rawCornerBboxFromGdalInfo(info);
+}
+
+function summarizeGdalInfo(info) {
+  return {
+    driver: info?.driverShortName || "",
+    size: Array.isArray(info?.size) ? info.size : [],
+    compression: info?.metadata?.IMAGE_STRUCTURE?.COMPRESSION || "",
+    layout: info?.metadata?.IMAGE_STRUCTURE?.LAYOUT || "",
+  };
+}
+
+function applyGdalInfoToRasterManifest(manifest, info) {
+  const bbox = bboxFromGdalInfo(info);
+  const size = Array.isArray(info?.size) ? info.size : [];
+  manifest.dataset.width = Number(size[0] || 0) || undefined;
+  manifest.dataset.height = Number(size[1] || 0) || undefined;
+  manifest.dataset.bands = Array.isArray(info?.bands) ? info.bands.length : undefined;
+  manifest.dataset.bbox = bbox;
+  manifest.dataset.centroid = bbox ? {
+    lon: (bbox.west + bbox.east) / 2,
+    lat: (bbox.south + bbox.north) / 2,
+  } : null;
+  manifest.crs.wkt = String(info?.coordinateSystem?.wkt || "");
+  manifest.crs.normalized = info?.coordinateSystem?.dataAxisToSRSAxisMapping ? "GDAL-detected coordinate reference system" : "";
+  manifest.gdal = summarizeGdalInfo(info);
+}
+
+async function inspectRasterWithGdal(rasterPath, manifest, statuses, log) {
+  const result = await tryExecFileOutput("gdalinfo", ["-json", rasterPath], { timeoutMs: 120_000 });
+  if (!result.ok) {
+    statuses.push({ kind: "gdalinfo", status: "missing_dependency", command: "gdalinfo", reason: result.error || "Install GDAL to inspect raster georeferencing." });
+    return null;
+  }
+  try {
+    const info = JSON.parse(result.stdout);
+    applyGdalInfoToRasterManifest(manifest, info);
+    statuses.push({ kind: "gdalinfo", status: "created", bbox: manifest.dataset.bbox, width: manifest.dataset.width, height: manifest.dataset.height });
+    log("Raster metadata inspected with GDAL", { bbox: manifest.dataset.bbox, width: manifest.dataset.width, height: manifest.dataset.height });
+    return info;
+  } catch (error) {
+    statuses.push({ kind: "gdalinfo", status: "failed", reason: error.message || String(error) });
+    return null;
+  }
+}
+
+function hasRasterGeoreference(manifest, info) {
+  return Boolean(manifest.dataset.bbox || info?.geoTransform || info?.gcps?.gcpList?.length || info?.coordinateSystem?.wkt);
+}
+
+async function createCogDerivative({ profile, keys, sourcePath, manifest, statuses, uploaded, log }) {
+  if (!await resolveCommandPath("gdal_translate")) {
+    statuses.push({ kind: "cog", status: "missing_dependency", command: "gdal_translate", reason: "Install GDAL to create Cloud Optimized GeoTIFF derivatives." });
+    return;
+  }
+  const cogPath = path.join(path.dirname(sourcePath), `${manifest.dataset.baseName}.cog.tif`);
+  const result = await tryExecFile("gdal_translate", [
+    "-of", "COG",
+    "-co", "COMPRESS=DEFLATE",
+    "-co", "PREDICTOR=YES",
+    "-co", "BLOCKSIZE=512",
+    "-co", "BIGTIFF=IF_SAFER",
+    "-co", "NUM_THREADS=ALL_CPUS",
+    sourcePath,
+    cogPath,
+  ], { timeoutMs: 300_000 });
+  if (result.ok && existsSync(cogPath)) {
+    const cogBuffer = await readFile(cogPath);
+    await putObjectBuffer(profile, keys.cog, cogBuffer, "image/tiff");
+    uploaded.cogUrl = accessUrlFor(profile, keys.cog);
+    statuses.push({ kind: "cog", status: "created", key: keys.cog, bytes: cogBuffer.length });
+    log("COG derivative uploaded", { key: keys.cog, bytes: cogBuffer.length });
+  } else {
+    statuses.push({ kind: "cog", status: "failed", reason: result.error || "gdal_translate did not create a COG file." });
+  }
+}
+
+async function createRasterGeospatialDerivatives({ profile, keys, entries, raster, manifest, log }) {
+  const uploaded = {};
+  const statuses = [];
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "ogm-georaster-"));
+  try {
+    await writeEntriesToDirectory(entries, tempRoot);
+    const rasterPath = path.join(tempRoot, raster.source.name);
+    const info = await inspectRasterWithGdal(rasterPath, manifest, statuses, log);
+    if (hasRasterGeoreference(manifest, info)) {
+      await createCogDerivative({ profile, keys, sourcePath: rasterPath, manifest, statuses, uploaded, log });
+    } else {
+      statuses.push({ kind: "cog", status: "skipped", reason: "GDAL did not find raster georeferencing; keeping this out of the COG path." });
+    }
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+  return { uploaded, statuses };
+}
+
+async function createVectorGeospatialDerivatives({ profile, keys, entries, shapefile, dbf, manifest, log }) {
+  const uploaded = {};
+  const statuses = [];
+  const geojson = geojsonFromShapefile(shapefile.shp.buffer, dbf, manifest);
+  let geojsonBuffer = null;
+
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "ogm-geodata-"));
+  try {
+    await writeEntriesToDirectory(entries, tempRoot);
+    const shpPath = path.join(tempRoot, shapefile.shp.name);
+    const geojsonPath = path.join(tempRoot, `${manifest.dataset.baseName}.geojson`);
+    const ogr2ogrPath = await resolveCommandPath("ogr2ogr");
+    if (geojson) {
+      geojsonBuffer = Buffer.from(safeJsonStringify(geojson), "utf8");
+      await writeFile(geojsonPath, geojsonBuffer);
+      await putObjectBuffer(profile, keys.geojson, geojsonBuffer, "application/geo+json");
+      uploaded.geojsonUrl = accessUrlFor(profile, keys.geojson);
+      statuses.push({ kind: "geojson", status: "created", method: "native-parser", key: keys.geojson, bytes: geojsonBuffer.length });
+      log("GeoJSON viewer derivative uploaded", { key: keys.geojson, bytes: geojsonBuffer.length });
+    } else if (ogr2ogrPath) {
+      const result = await tryExecFile("ogr2ogr", [
+        "-t_srs", "EPSG:4326",
+        "-f", "GeoJSON",
+        geojsonPath,
+        shpPath,
+      ]);
+      if (result.ok && existsSync(geojsonPath)) {
+        geojsonBuffer = await readFile(geojsonPath);
+        await putObjectBuffer(profile, keys.geojson, geojsonBuffer, "application/geo+json");
+        uploaded.geojsonUrl = accessUrlFor(profile, keys.geojson);
+        statuses.push({ kind: "geojson", status: "created", method: "ogr2ogr", key: keys.geojson, bytes: geojsonBuffer.length });
+        log("GeoJSON viewer derivative uploaded", { key: keys.geojson, bytes: geojsonBuffer.length, method: "ogr2ogr" });
+      } else {
+        statuses.push({ kind: "geojson", status: "failed", reason: result.error || "ogr2ogr did not create a GeoJSON file." });
+      }
+    } else {
+      statuses.push({ kind: "geojson", status: "missing_dependency", command: "ogr2ogr", reason: "Install GDAL to create GeoJSON derivatives for projected or non-polygon shapefiles." });
+    }
+
+    if (ogr2ogrPath) {
+      const parquetPath = path.join(tempRoot, `${manifest.dataset.baseName}.parquet`);
+      const result = await tryExecFile("ogr2ogr", [
+        "-t_srs", "EPSG:4326",
+        "-f", "Parquet",
+        parquetPath,
+        shpPath,
+      ]);
+      if (result.ok && existsSync(parquetPath)) {
+        const parquetBuffer = await readFile(parquetPath);
+        await putObjectBuffer(profile, keys.geoParquet, parquetBuffer, "application/vnd.apache.parquet");
+        uploaded.geoParquetUrl = accessUrlFor(profile, keys.geoParquet);
+        statuses.push({ kind: "geoparquet", status: "created", key: keys.geoParquet, bytes: parquetBuffer.length });
+        log("GeoParquet derivative uploaded", { key: keys.geoParquet, bytes: parquetBuffer.length });
+      } else {
+        statuses.push({ kind: "geoparquet", status: "failed", reason: result.error || "ogr2ogr did not create a parquet file." });
+      }
+    } else {
+      statuses.push({ kind: "geoparquet", status: "missing_dependency", command: "ogr2ogr", reason: "Install GDAL to create GeoParquet derivatives." });
+    }
+
+    if (geojsonBuffer && await resolveCommandPath("tippecanoe")) {
+      const pmtilesPath = path.join(tempRoot, `${manifest.dataset.baseName}.pmtiles`);
+      const direct = await tryExecFile("tippecanoe", [
+        "-o", pmtilesPath,
+        "-f",
+        "-zg",
+        "--drop-densest-as-needed",
+        "--extend-zooms-if-still-dropping",
+        geojsonPath,
+      ]);
+      if (direct.ok && existsSync(pmtilesPath)) {
+        const pmtilesBuffer = await readFile(pmtilesPath);
+        await putObjectBuffer(profile, keys.pmtiles, pmtilesBuffer, "application/vnd.pmtiles");
+        uploaded.pmtilesUrl = accessUrlFor(profile, keys.pmtiles);
+        statuses.push({ kind: "pmtiles", status: "created", key: keys.pmtiles, bytes: pmtilesBuffer.length });
+        log("PMTiles derivative uploaded", { key: keys.pmtiles, bytes: pmtilesBuffer.length });
+      } else {
+        statuses.push({ kind: "pmtiles", status: "failed", reason: direct.error || "tippecanoe did not create a PMTiles file." });
+      }
+    } else if (!geojsonBuffer) {
+      statuses.push({ kind: "pmtiles", status: "skipped", reason: "A GeoJSON intermediate is required before creating PMTiles." });
+    } else {
+      statuses.push({ kind: "pmtiles", status: "missing_dependency", command: "tippecanoe", reason: "Install tippecanoe to create PMTiles derivatives." });
+    }
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+
+  return { uploaded, statuses };
+}
+
+async function createGeospatialDerivatives(args) {
+  if (args.manifest?.dataset?.kind === "raster") return createRasterGeospatialDerivatives(args);
+  return createVectorGeospatialDerivatives(args);
+}
+
+function buildAardvarkForGeospatialPackage({ resourceId, checksum, fileName, fileSize, manifest, batchDefaults = {}, artifacts }) {
+  const isRaster = manifest.dataset.kind === "raster";
+  const bbox = manifest.dataset.bbox;
+  const temporalYears = manifest.temporal?.years || [];
+  const firstYear = temporalYears[0] ? Number.parseInt(temporalYears[0], 10) : null;
+  const spatialNames = manifest.spatial?.names || [];
+  const featureCount = Number(manifest.dataset.featureCount || 0).toLocaleString();
+  const datePhrase = manifest.temporal?.minIso && manifest.temporal?.maxIso
+    ? ` Source imagery dates range from ${manifest.temporal.minIso} to ${manifest.temporal.maxIso}.`
+    : "";
+  const rasterDimensions = manifest.dataset.width && manifest.dataset.height
+    ? ` with ${Number(manifest.dataset.width).toLocaleString()} x ${Number(manifest.dataset.height).toLocaleString()} pixels`
+    : "";
+  const description = isRaster
+    ? `${manifest.dataset.sourceFormat} raster dataset${rasterDimensions}.${datePhrase}`.trim()
+    : `${manifest.dataset.sourceFormat} dataset containing ${featureCount} ${String(manifest.dataset.geometryType || "feature").toLowerCase()} feature(s).${datePhrase}`.trim();
+  const title = String(batchDefaults.titlePrefix ? `${batchDefaults.titlePrefix}: ${humanTitleFromPackage(manifest.dataset.baseName, manifest)}` : humanTitleFromPackage(manifest.dataset.baseName, manifest));
+  const refs = {
+    "http://schema.org/downloadUrl": [
+      { url: artifacts.originalUrl, label: isRaster ? "Original geospatial raster package" : "Original zipped shapefile package" },
+      ...(artifacts.geoParquetUrl ? [{ url: artifacts.geoParquetUrl, label: "GeoParquet derivative" }] : []),
+      ...(artifacts.pmtilesUrl ? [{ url: artifacts.pmtilesUrl, label: "PMTiles vector tile derivative" }] : []),
+      ...(artifacts.geojsonUrl ? [{ url: artifacts.geojsonUrl, label: "GeoJSON viewer derivative" }] : []),
+      ...(artifacts.cogUrl ? [{ url: artifacts.cogUrl, label: "Cloud Optimized GeoTIFF derivative" }] : []),
+    ],
+    ...(artifacts.geojsonUrl ? { geojson: { url: artifacts.geojsonUrl, label: "GeoJSON viewer derivative" } } : {}),
+    ...(artifacts.pmtilesUrl ? { pmtiles: { url: artifacts.pmtilesUrl, label: "PMTiles vector tiles" } } : {}),
+    ...(artifacts.cogUrl ? { "https://www.cogeo.org/": { url: artifacts.cogUrl, label: "Cloud Optimized GeoTIFF" } } : {}),
+    "https://opengeometadata.org/reference/dataset-manifest": { url: artifacts.manifestUrl, label: "Dataset manifest" },
+    "https://opengeometadata.org/reference/aardvark-json": { url: artifacts.aardvarkUrl, label: "Aardvark JSON" },
+  };
+  return {
+    id: resourceId,
+    dct_title_s: title,
+    dct_accessRights_s: String(batchDefaults.accessRights || "Public"),
+    dct_format_s: isRaster ? manifest.dataset.sourceFormat : "Shapefile",
+    gbl_mdVersion_s: "Aardvark",
+    schema_provider_s: String(batchDefaults.provider || ""),
+    dct_issued_s: manifest.sidecarMetadata?.createDate ? manifest.sidecarMetadata.createDate.slice(0, 4) : "",
+    dct_alternative_sm: [],
+    dct_description_sm: [description].filter(Boolean),
+    dct_language_sm: batchDefaults.language ? [String(batchDefaults.language)] : [],
+    gbl_displayNote_sm: manifest.derivatives?.some((item) => item.status === "missing_dependency")
+      ? ["Some cloud-optimized derivatives were not generated because local geospatial command-line tools are missing."]
+      : [],
+    dct_creator_sm: batchDefaults.creator ? [String(batchDefaults.creator)] : [],
+    dct_publisher_sm: batchDefaults.publisher ? [String(batchDefaults.publisher)] : [],
+    gbl_resourceClass_sm: ["Datasets"],
+    gbl_resourceType_sm: [isRaster ? "Raster data" : `${manifest.dataset.geometryType} data`.replace("Polygon data", "Polygon data")],
+    dct_subject_sm: Array.isArray(batchDefaults.subjects) ? batchDefaults.subjects.map(String) : [],
+    dcat_theme_sm: Array.from(new Set([...(Array.isArray(batchDefaults.themes) ? batchDefaults.themes.map(String) : []), "Imagery", "Location"])),
+    dcat_keyword_sm: [
+      "automated metadata",
+      isRaster ? "geospatial raster" : "geospatial package",
+      manifest.dataset.sourceFormat,
+      manifest.dataset.geometryType,
+      ...Object.keys(manifest.attributes?.stats || {}).slice(0, 8),
+    ],
+    dct_temporal_sm: temporalYears,
+    gbl_dateRange_drsim: firstYear ? [`[${Math.min(...temporalYears.map(Number))} TO ${Math.max(...temporalYears.map(Number))}]`] : [],
+    gbl_indexYear_im: firstYear,
+    dct_spatial_sm: spatialNames,
+    locn_geometry: bboxToPolygonJson(bbox),
+    dcat_bbox: bboxToAardvarkEnvelope(bbox),
+    dcat_centroid: bboxToCentroidJson(bbox),
+    gbl_georeferenced_b: Boolean(bbox),
+    dct_identifier_sm: [resourceId, checksum, fileName],
+    gbl_wxsIdentifier_s: "",
+    dct_rights_sm: batchDefaults.rights ? [String(batchDefaults.rights)] : [],
+    dct_rightsHolder_sm: batchDefaults.rightsHolder ? [String(batchDefaults.rightsHolder)] : [],
+    dct_license_sm: batchDefaults.license ? [String(batchDefaults.license)] : [],
+    pcdm_memberOf_sm: batchDefaults.memberOf ? [String(batchDefaults.memberOf)] : [],
+    dct_isPartOf_sm: batchDefaults.isPartOf ? [String(batchDefaults.isPartOf)] : [],
+    dct_source_sm: [artifacts.originalUrl],
+    dct_isVersionOf_sm: [],
+    dct_replaces_sm: [],
+    dct_isReplacedBy_sm: [],
+    dct_relation_sm: [],
+    gbl_fileSize_s: String(fileSize || ""),
+    dct_references_s: safeJsonStringify(refs),
+    gbl_suppressed_b: false,
+    gbl_mdModified_dt: new Date().toISOString(),
+  };
+}
+
 const OGM_AARDVARK_CONTROLLED_VALUE_GUIDANCE = [
   "OGM Aardvark controlled value guidance:",
   "- dct_format_s: use an OGM format label, not a MIME type. Common scanned image mappings: image/jpeg or .jpg -> JPEG; image/tiff or .tif -> TIFF; image/jp2 or .j2k -> JPEG2000; image/png -> PNG; application/pdf -> PDF. Use GeoTIFF only when the file is a georeferenced TIFF.",
@@ -1560,6 +2740,183 @@ async function callAardvarkMetadataWriter(modelProfile, request, context) {
   return { ...parsed, rawResponse, usage: rawResponse.usage };
 }
 
+function geospatialAardvarkWriterMessages({ manifest, baseResource, batchDefaults, artifacts, fileName, checksum, resourceId }) {
+  return {
+    systemPrompt: [
+      "You are an expert OpenGeoMetadata Aardvark cataloger for geospatial datasets.",
+      "Use the deterministic package manifest to improve descriptive metadata for a GIS dataset.",
+      "Do not invent values. Preserve machine-derived spatial fields, identifiers, references, and format facts unless the manifest clearly contradicts them.",
+      "Return JSON matching the provided schema only.",
+    ].join(" "),
+    userPrompt: [
+      "Create the best Aardvark metadata record for this uploaded geospatial data package.",
+      "",
+      "Important Aardvark guidance:",
+      "- This is data, not a scanned map image. Prefer gbl_resourceClass_sm [\"Datasets\"].",
+      "- Use OpenGeoMetadata data-type terms such as Polygon data, Line data, Point data, Raster data, or Table data for gbl_resourceType_sm.",
+      "- dct_format_s should be the source package format label, such as Shapefile, GeoPackage, GeoJSON, GeoTIFF, or CSV.",
+      "- dct_temporal_sm is temporal coverage. Use dataset dates from attributes or sidecar metadata only when they are evident.",
+      "- gbl_indexYear_im should be the integer year used for search/faceting when a temporal year is known.",
+      "- Keep id, dct_references_s, dct_source_sm, dcat_bbox, locn_geometry, dcat_centroid, gbl_georeferenced_b, gbl_resourceClass_sm, gbl_resourceType_sm, dct_format_s, and gbl_mdVersion_s consistent with the supplied base record.",
+      "",
+      OGM_AARDVARK_CONTROLLED_VALUE_GUIDANCE,
+      "",
+      `Resource id: ${resourceId}`,
+      `Package filename: ${fileName}`,
+      `Package SHA-256: ${checksum}`,
+      `Artifact URLs: ${safeJsonStringify(artifacts, 2)}`,
+      `Batch defaults: ${safeJsonStringify(batchDefaults, 2)}`,
+      "",
+      "Base Aardvark record to improve:",
+      safeJsonStringify(baseResource, 2),
+      "",
+      "Deterministic geospatial package manifest:",
+      safeJsonStringify(manifest, 2),
+    ].join("\n"),
+  };
+}
+
+async function callGeospatialAardvarkMetadataWriter(modelProfile, request, context) {
+  if (process.env.ENRICHMENT_PROXY_MOCK_OPENAI === "1") {
+    return { resource: context.baseResource, evidence: [] };
+  }
+  const apiKey = resolveEnv(modelProfile.apiKeyEnv, "OpenAI API key");
+  const model = request.model || modelProfile.defaultModel;
+  const { systemPrompt, userPrompt } = geospatialAardvarkWriterMessages(context);
+  const body = {
+    model,
+    input: [
+      { role: "system", content: [{ type: "input_text", text: systemPrompt }] },
+      { role: "user", content: [{ type: "input_text", text: userPrompt }] },
+    ],
+    text: {
+      format: {
+        type: "json_schema",
+        name: "aardvark_geospatial_metadata_writer",
+        schema: AARDVARK_METADATA_RESPONSE_SCHEMA,
+        strict: true,
+      },
+    },
+    ...normalizeOpenAIModelParams(model, request.modelParams || modelProfile.modelParams || {}),
+  };
+  const rawResponse = await postOpenAIResponse(apiKey, body);
+  const text = extractResponseText(rawResponse);
+  const parsed = text ? JSON.parse(text) : rawResponse;
+  return { ...parsed, rawResponse, usage: rawResponse.usage };
+}
+
+async function processGeospatialPackage(config, body) {
+  const jobId = body.jobId || crypto.randomUUID();
+  const fileName = sanitizeFileName(body.file?.name || "geospatial_package.zip");
+  const { log, milestones } = createUploadLogger(jobId, fileName);
+  const storageProfile = findProfile(config, "storage", body.storageProfileId);
+  const modelProfile = findProfile(config, "model", body.modelProfileId);
+  const checksum = String(body.checksum || body.file?.checksum || "");
+  if (!checksum) throw new Error("Geospatial package request is missing a checksum.");
+  const buffer = Buffer.from(String(body.file?.base64 || ""), "base64");
+  if (buffer.length === 0) throw new Error("Geospatial package request did not include file bytes.");
+  if (!/\.zip$/i.test(fileName)) throw new Error("Geospatial packages must be submitted as .zip files. Drop loose shapefile or raster sidecars in the browser so they can be grouped into a ZIP before processing.");
+
+  const resourceId = `geodata-${checksum.slice(0, 16)}`;
+  const keys = geospatialUploadKeys(storageProfile, resourceId, fileName);
+  const artifacts = {
+    originalUrl: accessUrlFor(storageProfile, keys.original),
+    manifestUrl: accessUrlFor(storageProfile, keys.manifest),
+    aardvarkUrl: accessUrlFor(storageProfile, keys.aardvark),
+  };
+
+  log("Geospatial package analysis started", { bytes: buffer.length });
+  const analysis = await analyzeGeospatialPackage(buffer, fileName);
+  log("Geospatial package manifest created", {
+    kind: analysis.manifest.dataset.kind,
+    features: analysis.manifest.dataset.featureCount,
+    geometryType: analysis.manifest.dataset.geometryType,
+    fields: analysis.manifest.attributes?.fieldCount || 0,
+  });
+
+  log("Original geospatial package upload started", { key: keys.original });
+  await putObjectBuffer(storageProfile, keys.original, buffer, "application/zip");
+  log("Original geospatial package upload complete", { key: keys.original });
+
+  const derivativeResult = await createGeospatialDerivatives({
+    profile: storageProfile,
+    keys,
+    entries: analysis.entries,
+    shapefile: analysis.shapefile,
+    raster: analysis.raster,
+    dbf: analysis.dbf,
+    manifest: analysis.manifest,
+    log,
+  });
+  const finalArtifacts = { ...artifacts, ...derivativeResult.uploaded };
+  analysis.manifest.derivatives = derivativeResult.statuses;
+
+  log("Uploading geospatial package manifest", { key: keys.manifest });
+  await putObjectBuffer(storageProfile, keys.manifest, Buffer.from(safeJsonStringify(analysis.manifest, 2), "utf8"), "application/json");
+
+  const baseResource = buildAardvarkForGeospatialPackage({
+    resourceId,
+    checksum,
+    fileName,
+    fileSize: buffer.length,
+    manifest: analysis.manifest,
+    batchDefaults: body.batchDefaults || {},
+    artifacts: finalArtifacts,
+  });
+
+  let writer = null;
+  let resource = baseResource;
+  try {
+    log("Geospatial Aardvark metadata writer started", { model: body.model || modelProfile.defaultModel });
+    writer = await callGeospatialAardvarkMetadataWriter(modelProfile, body, {
+      manifest: analysis.manifest,
+      baseResource,
+      batchDefaults: body.batchDefaults || {},
+      artifacts: finalArtifacts,
+      fileName,
+      checksum,
+      resourceId,
+    });
+    resource = normalizeAardvarkResource(writer.resource, baseResource, {
+      resourceId,
+      checksum,
+      artifacts: finalArtifacts,
+      fileName,
+      fallbackTitle: baseResource.dct_title_s,
+    });
+    log("Geospatial Aardvark metadata writer complete", { title: resource.dct_title_s });
+  } catch (error) {
+    log("Geospatial Aardvark metadata writer failed; using deterministic fallback", { error: error.message || String(error) });
+    resource = normalizeAardvarkResource({}, baseResource, {
+      resourceId,
+      checksum,
+      artifacts: finalArtifacts,
+      fileName,
+      fallbackTitle: baseResource.dct_title_s,
+    });
+  }
+
+  log("Uploading geospatial Aardvark JSON", { key: keys.aardvark });
+  await putObjectBuffer(storageProfile, keys.aardvark, Buffer.from(safeJsonStringify(resource, 2), "utf8"), "application/json");
+  const distributions = distributionsFromResource(resource);
+  log("Geospatial package processing complete", { resourceId });
+
+  return {
+    cached: false,
+    checksum,
+    resourceId,
+    fileName,
+    artifacts: finalArtifacts,
+    manifest: analysis.manifest,
+    rawResponse: writer?.rawResponse,
+    usage: writer?.usage,
+    aardvarkJson: resource,
+    distributions,
+    aardvarkEvidence: writer?.evidence || [],
+    proxyMilestones: milestones,
+  };
+}
+
 function buildAardvarkForUpload({ resourceId, checksum, fileName, fileSize, contentType, extraction, batchDefaults = {}, artifacts }) {
   const titleText = Array.isArray(extraction?.text)
     ? extraction.text.find((entry) => entry?.role === "title" && entry?.content)?.content
@@ -1576,6 +2933,10 @@ function buildAardvarkForUpload({ resourceId, checksum, fileName, fileSize, cont
     "http://schema.org/url": artifacts.originalUrl,
     "http://schema.org/thumbnailUrl": artifacts.thumbnailUrl,
     "http://iiif.io/api/image": artifacts.iiifInfoUrl,
+    ...(artifacts.cogUrl ? {
+      "http://schema.org/downloadUrl": [{ url: artifacts.cogUrl, label: "Cloud Optimized GeoTIFF derivative" }],
+      "https://www.cogeo.org/": { url: artifacts.cogUrl, label: "Cloud Optimized GeoTIFF" },
+    } : {}),
     "https://opengeometadata.org/reference/enrichment-response": artifacts.extractionUrl,
     "https://opengeometadata.org/reference/aardvark-json": artifacts.aardvarkUrl,
   };
@@ -1625,13 +2986,40 @@ function buildAardvarkForUpload({ resourceId, checksum, fileName, fileSize, cont
       ogm_upload_checksum_s: checksum,
     },
   };
-  const distributions = Object.entries(refs).map(([relation_key, url]) => ({
-    resource_id: resourceId,
-    relation_key,
-    url,
-    label: relation_key.includes("thumbnail") ? "Thumbnail" : relation_key.includes("iiif") ? "IIIF Image API Level 0" : relation_key.includes("enrichment") ? "Extracted placename response" : relation_key.includes("aardvark") ? "Aardvark JSON" : "Original image",
-  }));
+  const distributions = distributionsFromResource(resource);
   return { resource, distributions };
+}
+
+async function maybeCreateImageCogDerivative({ profile, keys, buffer, fileName, contentType, log }) {
+  const isPotentialGeospatialRaster = /image\/(?:tiff|jp2|j2k)/i.test(contentType || "") || /\.(tiff?|jp2|j2k)$/i.test(fileName);
+  if (!isPotentialGeospatialRaster) return { uploaded: {}, statuses: [] };
+  const statuses = [];
+  const uploaded = {};
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "ogm-image-cog-"));
+  try {
+    const sourcePath = path.join(tempRoot, sanitizeFileName(fileName || "image.tif"));
+    await writeFile(sourcePath, buffer);
+    const manifest = {
+      dataset: {
+        kind: "raster",
+        baseName: sanitizeFileName(fileName || "image").replace(/\.[^.]+$/, "") || "image",
+        bbox: null,
+      },
+      crs: {
+        wkt: "",
+        normalized: "",
+      },
+    };
+    const info = await inspectRasterWithGdal(sourcePath, manifest, statuses, log);
+    if (!hasRasterGeoreference(manifest, info)) {
+      statuses.push({ kind: "cog", status: "skipped", reason: "GDAL did not find georeferencing for this image upload." });
+      return { uploaded, statuses };
+    }
+    await createCogDerivative({ profile, keys, sourcePath, manifest, statuses, uploaded, log });
+    return { uploaded, statuses };
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
 }
 
 async function processUploadedImage(config, body) {
@@ -1756,6 +3144,7 @@ async function processUploadedImage(config, body) {
   log("Original upload started", { key: keys.original });
   const originalUpload = putObjectBuffer(storageProfile, keys.original, buffer, contentType)
     .then(() => log("Original upload complete", { key: keys.original }));
+  const cogPromise = maybeCreateImageCogDerivative({ profile: storageProfile, keys, buffer, fileName, contentType, log });
   log("IIIF package generation started", { root: keys.iiif });
   const iiifPromise = createIiifLevel0Package(storageProfile, keys, buffer, log);
   let extractionPromise;
@@ -1781,13 +3170,14 @@ async function processUploadedImage(config, body) {
         return result;
       });
   }
-  const [iiif, extractionResult] = await Promise.all([iiifPromise, extractionPromise, originalUpload.then(() => true).then(() => null)]);
-  log("Parallel proxy work complete", { tileCount: iiif.tileCount, scaleFactors: iiif.scaleFactors });
+  const [iiif, extractionResult, cogResult] = await Promise.all([iiifPromise, extractionPromise, cogPromise, originalUpload.then(() => true).then(() => null)]);
+  log("Parallel proxy work complete", { tileCount: iiif.tileCount, scaleFactors: iiif.scaleFactors, cogStatus: cogResult.statuses?.find((status) => status.kind === "cog")?.status || "not_applicable" });
 
   const finalArtifacts = {
     ...artifacts,
     thumbnailUrl: iiif.thumbnailUrl,
     iiifInfoUrl: iiif.infoUrl,
+    ...cogResult.uploaded,
   };
   const metadataSourceUrls = await uploadMetadataDocuments(storageProfile, keys, metadataDocuments, log);
   log("Uploading enrichment response JSON", { key: keys.extraction });
@@ -2116,6 +3506,15 @@ async function route(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const config = await loadConfig();
 
+  if ((req.method === "GET" || req.method === "HEAD") && url.pathname === "/api/artifacts/proxy") {
+    return proxyArtifactObject(config, req, res, url.searchParams.get("url"));
+  }
+  if (req.method === "GET" && url.pathname === "/api/artifacts/cog-info") {
+    return inspectCogArtifact(config, res, url.searchParams.get("url"));
+  }
+  if (req.method === "GET" && url.pathname === "/api/artifacts/cog-preview") {
+    return previewCogArtifact(config, res, url.searchParams.get("url"), url.searchParams);
+  }
   if (req.method === "GET" && url.pathname === "/api/config") {
     return send(res, 200, config);
   }
@@ -2201,6 +3600,11 @@ async function route(req, res) {
   if (req.method === "POST" && url.pathname === "/api/uploads/process-image") {
     const body = await readJson(req);
     const result = await processUploadedImage(config, body);
+    return send(res, 200, result);
+  }
+  if (req.method === "POST" && url.pathname === "/api/uploads/process-geospatial-package") {
+    const body = await readJson(req);
+    const result = await processGeospatialPackage(config, body);
     return send(res, 200, result);
   }
 

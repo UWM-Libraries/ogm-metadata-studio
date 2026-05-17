@@ -17,9 +17,13 @@ const RELATION_LABELS: Record<string, string> = {
     "http://iiif.io/api/presentation#manifest": "IIIF Manifest",
     "https://iiif.io/api/presentation#manifest": "IIIF Manifest",
     "https://opengeometadata.org/reference/enrichment-response": "Enrichment response",
+    "https://opengeometadata.org/reference/dataset-manifest": "Dataset manifest",
     "https://opengeometadata.org/reference/aardvark-json": "Aardvark JSON",
+    "https://www.cogeo.org/": "Cloud Optimized GeoTIFF",
     "http://www.isotc211.org/schemas/2005/gmd/": "ISO metadata",
     "http://www.opengis.net/cat/csw/csdgm": "FGDC metadata",
+    "geojson": "GeoJSON",
+    "pmtiles": "PMTiles",
 };
 
 function relationLabel(distribution: Distribution): string {
@@ -29,6 +33,10 @@ function relationLabel(distribution: Distribution): string {
     const lower = key.toLowerCase();
     if (lower.includes("thumbnail")) return "Thumbnail";
     if (lower.includes("iiif")) return "IIIF";
+    if (lower.includes("geojson")) return "GeoJSON";
+    if (lower.includes("pmtiles")) return "PMTiles";
+    if (lower.includes("cogeo")) return "Cloud Optimized GeoTIFF";
+    if (lower.includes("dataset-manifest")) return "Dataset manifest";
     if (lower.includes("enrichment")) return "Enrichment response";
     if (lower.includes("aardvark")) return "Aardvark JSON";
     if (lower.includes("download")) return "Download";
@@ -59,6 +67,7 @@ function distributionSortScore(distribution: Distribution): number {
     if (label.includes("original") || key.endsWith("/url")) return 10;
     if (label.includes("thumbnail") || key.includes("thumbnail")) return 20;
     if (label.includes("iiif") || key.includes("iiif")) return 30;
+    if (label.includes("cloud optimized geotiff") || key.includes("cogeo")) return 35;
     if (label.includes("enrichment") || key.includes("enrichment")) return 40;
     if (label.includes("aardvark") || key.includes("aardvark")) return 50;
     if (label.includes("metadata") || key.includes("gmd") || key.includes("csdgm")) return 60;
