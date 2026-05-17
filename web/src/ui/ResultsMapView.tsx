@@ -1,7 +1,8 @@
-import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useMemo, useRef } from 'react';
 import maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import { Resource } from '../aardvark/model';
+import { textToLngLatBounds } from './viewers/maplibreBounds';
 
 const MAP_STYLE = "https://demotiles.maplibre.org/style.json";
 
@@ -15,19 +16,8 @@ interface ResultsMapViewProps {
 type BoundsLike = [[number, number], [number, number]];
 
 function parseBounds(bboxStr: string): BoundsLike | null {
-    const envelopeMatch = bboxStr.match(/ENVELOPE\s*\(\s*(-?\d+\.?\d*)\s*,\s*(-?\d+\.?\d*)\s*,\s*(-?\d+\.?\d*)\s*,\s*(-?\d+\.?\d*)\s*\)/i);
-    if (envelopeMatch) {
-        const minX = parseFloat(envelopeMatch[1]);
-        const maxX = parseFloat(envelopeMatch[2]);
-        const maxY = parseFloat(envelopeMatch[3]);
-        const minY = parseFloat(envelopeMatch[4]);
-        return [[minY, minX], [maxY, maxX]];
-    }
-    const parts = bboxStr.split(',').map(s => parseFloat(s.trim()));
-    if (parts.length === 4 && parts.every(n => !isNaN(n))) {
-        return [[parts[1], parts[0]], [parts[3], parts[2]]];
-    }
-    return null;
+    const bounds = textToLngLatBounds(bboxStr);
+    return bounds ? [[bounds[0][1], bounds[0][0]], [bounds[1][1], bounds[1][0]]] : null;
 }
 
 export const ResultsMapView: React.FC<ResultsMapViewProps> = ({
@@ -67,7 +57,9 @@ export const ResultsMapView: React.FC<ResultsMapViewProps> = ({
         })),
     }), [features]);
 
-    featuresRef.current = features;
+    useEffect(() => {
+        featuresRef.current = features;
+    }, [features]);
 
     useLayoutEffect(() => {
         if (mapRef.current) {

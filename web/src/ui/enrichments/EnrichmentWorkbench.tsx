@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import JSZip from "jszip";
 import {
     ensureDefaultEnrichmentData,
     getHistoricalMapDefinition,
@@ -15,11 +16,21 @@ import { Distribution, resourceFromJson } from "../../aardvark/model";
 import { useToast } from "../shared/ToastContext";
 import { IiifImageViewer } from "../viewers/IiifImageViewer";
 import { normalizeTextExtractionAnnotations } from "../viewers/textExtractionOverlay";
+import {
+    basenameFromPath,
+    fileDisplayName,
+    fileWithRelativePath,
+    filesFromDataTransfer,
+    filesFromDirectoryHandle,
+    relativePathForFile,
+    type FileSystemDirectoryHandleLike,
+} from "./uploadDirectory";
 
 type Panel = "upload" | "config" | "inventory";
 type BusyOperation = "" | "upload" | "regenerate" | "refresh";
 type EnrichmentPhase = "starting" | "requesting" | "storing" | "completed" | "failed";
 type UploadStatus = "queued" | "hashing" | "processing" | "publishing" | "completed" | "cached" | "failed";
+type UploadKind = "image" | "geospatial";
 
 interface EnrichmentMilestone {
     id: string;
@@ -47,9 +58,13 @@ interface EnrichmentProgress {
 
 interface UploadItem {
     id: string;
+    kind: UploadKind;
     file: File;
+    files?: File[];
     name: string;
+    sourcePath?: string;
     size: number;
+    sourceFileCount?: number;
     status: UploadStatus;
     message: string;
     checksum?: string;
@@ -58,10 +73,15 @@ interface UploadItem {
     extraction?: unknown;
     artifacts?: {
         originalUrl: string;
-        thumbnailUrl: string;
-        iiifInfoUrl: string;
-        extractionUrl: string;
+        thumbnailUrl?: string;
+        iiifInfoUrl?: string;
+        extractionUrl?: string;
+        manifestUrl?: string;
         aardvarkUrl: string;
+        geojsonUrl?: string;
+        geoParquetUrl?: string;
+        pmtilesUrl?: string;
+        cogUrl?: string;
     };
     error?: string;
     milestones?: EnrichmentMilestone[];
@@ -71,6 +91,7 @@ interface MetadataUploadItem {
     id: string;
     file: File;
     name: string;
+    sourcePath?: string;
     size: number;
 }
 
@@ -183,12 +204,191 @@ function isImageUpload(file: File): boolean {
     return file.type.startsWith("image/") || /\.(jpe?g|png|webp|tiff?|jp2|j2k)$/i.test(file.name);
 }
 
+function isZipUpload(file: File): boolean {
+    return /\.zip$/i.test(file.name) || file.type === "application/zip" || file.type === "application/x-zip-compressed";
+}
+
+function isIgnoredArchiveEntryName(name: string): boolean {
+    const normalized = name.replace(/\\/g, "/");
+    const parts = normalized.split("/");
+    const basename = parts[parts.length - 1] || "";
+    return parts.includes("__MACOSX") || basename === ".DS_Store" || basename === "Thumbs.db" || basename.startsWith("._");
+}
+
+function isShapefileSidecar(file: File): boolean {
+    return /\.(shp|shx|dbf|prj|cpg|sbn|sbx|qix)$/i.test(file.name) || /\.shp\.xml$/i.test(file.name);
+}
+
+function isGeospatialRasterSource(file: File): boolean {
+    return /\.(tiff?|sid|img|jp2|j2k)$/i.test(file.name);
+}
+
+function isGeospatialRasterSidecar(file: File): boolean {
+    return /\.(tfw|tifw|jgw|j2w|sdw|wld|prj|aux|ovr|rrd|met)$/i.test(file.name)
+        || /\.(tif|tiff|sid|img|jp2|j2k|aux)\.xml$/i.test(file.name)
+        || /\.(tif|tiff|sid|img|jp2|j2k)\.aux\.xml$/i.test(file.name);
+}
+
 function isMetadataUpload(file: File): boolean {
-    return file.type.includes("xml") || file.type.startsWith("text/") || /\.(txt|xml|fgdc|iso)$/i.test(file.name);
+    return file.type.includes("xml") || file.type.startsWith("text/") || /\.(txt|xml|fgdc|iso|met)$/i.test(file.name);
+}
+
+function isMetadataEntryName(name: string): boolean {
+    return /\.(txt|xml|fgdc|iso|met)$/i.test(name);
+}
+
+function metadataContentTypeForName(name: string): string {
+    return /\.(xml|fgdc|iso)$/i.test(name) ? "application/xml" : "text/plain";
+}
+
+function stripKnownRasterExtension(name: string): string {
+    return name
+        .replace(/\.(tif|tiff|sid|img|jp2|j2k)\.aux\.xml$/i, "")
+        .replace(/\.(tif|tiff|sid|img|jp2|j2k|aux)\.xml$/i, "")
+        .replace(/\.(tfw|tifw|jgw|j2w|sdw|wld|prj|aux|ovr|rrd|met)$/i, "")
+        .replace(/\.(tiff?|sid|img|jp2|j2k)$/i, "");
+}
+
+function shapefileGroupKey(file: File): string {
+    const pathName = relativePathForFile(file);
+    const directory = pathName.includes("/") ? pathName.slice(0, pathName.lastIndexOf("/") + 1) : "";
+    const base = basenameFromPath(pathName).replace(/\.shp\.xml$/i, "").replace(/\.(shp|shx|dbf|prj|cpg|sbn|sbx|qix)$/i, "");
+    return `${directory}${base}`.toLowerCase();
+}
+
+function geospatialPackageNameFromGroup(files: File[]): string {
+    const shp = files.find((file) => /\.shp$/i.test(file.name));
+    const base = basenameFromPath(relativePathForFile((shp || files[0])))
+        .replace(/\.shp$/i, "")
+        .replace(/\.[^.]+$/i, "") || "geospatial_package";
+    return `${base}.zip`;
+}
+
+function groupShapefileSidecars(files: File[]): File[][] {
+    const grouped = new Map<string, File[]>();
+    for (const file of files) {
+        const key = shapefileGroupKey(file);
+        grouped.set(key, [...(grouped.get(key) || []), file]);
+    }
+    return Array.from(grouped.values()).filter((group) => group.some((file) => /\.shp$/i.test(file.name)));
+}
+
+function rasterGroupKey(file: File): string {
+    const pathName = relativePathForFile(file);
+    const directory = pathName.includes("/") ? pathName.slice(0, pathName.lastIndexOf("/") + 1) : "";
+    return `${directory}${stripKnownRasterExtension(basenameFromPath(pathName))}`.toLowerCase();
+}
+
+function geospatialRasterPackageNameFromGroup(files: File[]): string {
+    const source = files.find(isGeospatialRasterSource) || files[0];
+    const base = stripKnownRasterExtension(basenameFromPath(relativePathForFile(source))) || "geospatial_raster";
+    return `${base}.zip`;
+}
+
+function groupGeospatialRasterFiles(files: File[]): File[][] {
+    const grouped = new Map<string, File[]>();
+    for (const file of files) {
+        const key = rasterGroupKey(file);
+        grouped.set(key, [...(grouped.get(key) || []), file]);
+    }
+    return Array.from(grouped.values()).filter((group) => {
+        const sources = group.filter(isGeospatialRasterSource);
+        if (sources.length === 0) return false;
+        const hasSidecar = group.some((file) => !sources.includes(file));
+        return hasSidecar || sources.some((file) => /\.(sid|img)$/i.test(file.name));
+    });
+}
+
+function archiveHasGeospatialDataset(entryNames: string[]): boolean {
+    if (entryNames.some((name) => /\.shp$/i.test(name) && !/\.shp\.xml$/i.test(name))) return true;
+
+    const grouped = new Map<string, string[]>();
+    for (const name of entryNames) {
+        const normalized = name.replace(/\\/g, "/");
+        const directory = normalized.includes("/") ? normalized.slice(0, normalized.lastIndexOf("/") + 1) : "";
+        const key = `${directory}${stripKnownRasterExtension(basenameFromPath(normalized))}`.toLowerCase();
+        grouped.set(key, [...(grouped.get(key) || []), normalized]);
+    }
+
+    return Array.from(grouped.values()).some((group) => {
+        const sources = group.filter((name) => /\.(tiff?|sid|img|jp2|j2k)$/i.test(name));
+        if (sources.length === 0) return false;
+        const hasSidecar = group.some((name) => !sources.includes(name));
+        return hasSidecar || sources.some((name) => /\.(sid|img)$/i.test(name));
+    });
+}
+
+async function metadataFilesFromZip(file: File, zip: JSZip): Promise<File[]> {
+    const files: File[] = [];
+    const zipPath = relativePathForFile(file);
+    const entries = Object.values(zip.files)
+        .filter((entry) => !entry.dir)
+        .filter((entry) => !isIgnoredArchiveEntryName(entry.name))
+        .filter((entry) => isMetadataEntryName(entry.name));
+    for (const entry of entries) {
+        const buffer = await entry.async("arraybuffer");
+        const name = basenameFromPath(entry.name);
+        const metadataFile = new File([buffer], name, { type: metadataContentTypeForName(name) });
+        files.push(fileWithRelativePath(metadataFile, `${zipPath}/${entry.name}`));
+    }
+    return files;
+}
+
+async function classifyZipUploads(zipFiles: File[]): Promise<{
+    geospatialZipPackages: File[];
+    metadataFiles: File[];
+    unsupportedZipCount: number;
+}> {
+    const geospatialZipPackages: File[] = [];
+    const metadataFiles: File[] = [];
+    let unsupportedZipCount = 0;
+
+    for (const file of zipFiles) {
+        try {
+            const zip = await JSZip.loadAsync(await file.arrayBuffer());
+            const entryNames = Object.values(zip.files)
+                .filter((entry) => !entry.dir)
+                .map((entry) => entry.name)
+                .filter((name) => !isIgnoredArchiveEntryName(name));
+            if (archiveHasGeospatialDataset(entryNames)) {
+                geospatialZipPackages.push(file);
+                continue;
+            }
+            const extractedMetadata = await metadataFilesFromZip(file, zip);
+            if (extractedMetadata.length > 0) {
+                metadataFiles.push(...extractedMetadata);
+                continue;
+            }
+            unsupportedZipCount += 1;
+        } catch {
+            unsupportedZipCount += 1;
+        }
+    }
+
+    return { geospatialZipPackages, metadataFiles, unsupportedZipCount };
+}
+
+function fileStemForMetadataMatch(name: string): string {
+    return basenameFromPath(name)
+        .replace(/\.(jpe?g|png|webp|tiff?|jp2|j2k)\.(txt|xml|fgdc|iso|met)$/i, "")
+        .replace(/\.(txt|xml|fgdc|iso|met)$/i, "")
+        .replace(/\.(jpe?g|png|webp|tiff?|jp2|j2k)$/i, "")
+        .replace(/\.[^.]+$/, "");
 }
 
 function normalizedBaseName(name: string): string {
-    return name.replace(/\.[^.]+$/, "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+    return fileStemForMetadataMatch(name).toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function normalizedPathStem(name: string): string {
+    const normalized = String(name || "").replace(/\\/g, "/");
+    const directory = normalized.includes("/") ? normalized.slice(0, normalized.lastIndexOf("/") + 1) : "";
+    return `${directory}${fileStemForMetadataMatch(name)}`.toLowerCase().replace(/[^a-z0-9/]+/g, "");
+}
+
+function isIgnoredFilesystemFile(file: File): boolean {
+    const name = basenameFromPath(relativePathForFile(file));
+    return name === ".DS_Store" || name === "Thumbs.db" || name.startsWith("._");
 }
 
 async function readMetadataPayload(file: File) {
@@ -197,6 +397,27 @@ async function readMetadataPayload(file: File) {
         type: file.type || (file.name.toLowerCase().endsWith(".xml") ? "application/xml" : "text/plain"),
         size: file.size,
         text: await file.text(),
+    };
+}
+
+async function buildGeospatialPackageBuffer(item: UploadItem): Promise<{ buffer: ArrayBuffer; fileName: string; sourceFileCount: number }> {
+    const files = item.files && item.files.length > 0 ? item.files : [item.file];
+    if (files.length === 1 && isZipUpload(files[0])) {
+        return {
+            buffer: await files[0].arrayBuffer(),
+            fileName: files[0].name,
+            sourceFileCount: 1,
+        };
+    }
+    const zip = new JSZip();
+    for (const file of files) {
+        zip.file(relativePathForFile(file), file);
+    }
+    const buffer = await zip.generateAsync({ type: "arraybuffer", compression: "DEFLATE" });
+    return {
+        buffer,
+        fileName: item.name,
+        sourceFileCount: files.length,
     };
 }
 
@@ -237,6 +458,7 @@ export const EnrichmentWorkbench: React.FC = () => {
     const inventoryAbortRef = useRef<AbortController | null>(null);
     const runAbortRef = useRef<AbortController | null>(null);
     const uploadAbortRef = useRef<AbortController | null>(null);
+    const directoryInputRef = useRef<HTMLInputElement | null>(null);
     const [activePanel, setActivePanel] = useState<Panel>("upload");
     const [config, setConfig] = useState<ProxyConfig>({ storageProfiles: [], modelProfiles: [], visionProfiles: [] });
     const [selectedStorageId, setSelectedStorageId] = useState("");
@@ -535,20 +757,51 @@ export const EnrichmentWorkbench: React.FC = () => {
         )));
     };
 
-    const metadataForImage = (imageName: string): MetadataUploadItem[] => {
-        const imageBase = normalizedBaseName(imageName);
+    const metadataForImage = (item: UploadItem): MetadataUploadItem[] => {
+        const imagePathStem = normalizedPathStem(item.sourcePath || item.name);
+        const pathMatched = metadataItems.filter((metadata) => normalizedPathStem(metadata.sourcePath || metadata.name) === imagePathStem);
+        if (pathMatched.length > 0) return pathMatched;
+        const imageBase = normalizedBaseName(item.name);
         const matched = metadataItems.filter((item) => normalizedBaseName(item.name) === imageBase);
         if (matched.length > 0) return matched;
         return metadataItems.length === 1 ? metadataItems : [];
     };
 
-    const addUploadFiles = (fileList: FileList | File[]) => {
-        const incoming = Array.from(fileList);
-        const files = incoming.filter(isImageUpload);
-        const metadataFiles = incoming.filter((file) => !isImageUpload(file) && isMetadataUpload(file));
-        if (files.length === 0 && metadataFiles.length === 0) {
-            addToast("Choose image files or companion metadata files.", "info");
+    const addUploadFiles = async (fileList: FileList | File[]) => {
+        const originalFiles = Array.from(fileList);
+        const ignoredSystemFiles = originalFiles.filter(isIgnoredFilesystemFile).length;
+        const incoming = originalFiles.filter((file) => !isIgnoredFilesystemFile(file));
+        const zipClassification = await classifyZipUploads(incoming.filter(isZipUpload));
+        const zipPackages = zipClassification.geospatialZipPackages;
+        const rasterCandidates = incoming.filter((file) => !isZipUpload(file) && (isGeospatialRasterSource(file) || isGeospatialRasterSidecar(file)));
+        const rasterGroups = groupGeospatialRasterFiles(rasterCandidates);
+        const groupedRasterFiles = new Set(rasterGroups.flat());
+        const shapefileSidecars = incoming.filter((file) => !isZipUpload(file) && !groupedRasterFiles.has(file) && isShapefileSidecar(file));
+        const shapefileGroups = groupShapefileSidecars(shapefileSidecars);
+        const groupedSidecars = new Set(shapefileGroups.flat());
+        const files = incoming.filter((file) => !isZipUpload(file) && !groupedRasterFiles.has(file) && !groupedSidecars.has(file) && isImageUpload(file));
+        const metadataFiles = [
+            ...incoming.filter((file) => !isZipUpload(file) && !groupedRasterFiles.has(file) && !groupedSidecars.has(file) && !isImageUpload(file) && isMetadataUpload(file)),
+            ...zipClassification.metadataFiles,
+        ];
+        const directMetadataFileCount = metadataFiles.length - zipClassification.metadataFiles.length;
+        const orphanSidecars = shapefileSidecars.filter((file) => !groupedSidecars.has(file));
+        const queuedNonZipFileCount = files.length + rasterGroups.flat().length + shapefileGroups.flat().length + directMetadataFileCount + orphanSidecars.length;
+        const nonZipFileCount = incoming.filter((file) => !isZipUpload(file)).length;
+        const unsupportedFiles = Math.max(0, nonZipFileCount - queuedNonZipFileCount) + zipClassification.unsupportedZipCount;
+        if (files.length === 0 && metadataFiles.length === 0 && zipPackages.length === 0 && shapefileGroups.length === 0 && rasterGroups.length === 0) {
+            const ignoredText = ignoredSystemFiles + unsupportedFiles > 0 ? ` Ignored ${ignoredSystemFiles + unsupportedFiles} unsupported or system file(s).` : "";
+            addToast(`Choose image files, zipped geospatial packages, shapefile/raster sidecars, or companion metadata files.${ignoredText}`, "info");
             return;
+        }
+        if (orphanSidecars.length > 0) {
+            addToast(`Ignored ${orphanSidecars.length} shapefile sidecar file(s) without a matching .shp.`, "info");
+        }
+        if (unsupportedFiles > 0 || ignoredSystemFiles > 0) {
+            addToast(`Ignored ${unsupportedFiles + ignoredSystemFiles} unsupported or system file(s).`, "info");
+        }
+        if (zipClassification.metadataFiles.length > 0) {
+            addToast(`Expanded ${zipClassification.metadataFiles.length} companion metadata file(s) from ZIP archives.`, "success");
         }
         if (metadataFiles.length > 0) {
             setMetadataItems((prev) => [
@@ -556,17 +809,89 @@ export const EnrichmentWorkbench: React.FC = () => {
                     id: `metadata-${crypto.randomUUID()}`,
                     file,
                     name: file.name,
+                    sourcePath: fileDisplayName(file),
                     size: file.size,
                 })),
                 ...prev,
             ]);
         }
-        if (files.length > 0) {
+        const geospatialItems: UploadItem[] = [
+            ...zipPackages.map((file) => ({
+                id: `upload-${crypto.randomUUID()}`,
+                kind: "geospatial" as const,
+                file,
+                files: [file],
+                name: fileDisplayName(file),
+                sourcePath: fileDisplayName(file),
+                size: file.size,
+                sourceFileCount: 1,
+                status: "queued" as UploadStatus,
+                message: "Ready to process geospatial package",
+                milestones: [{
+                    id: crypto.randomUUID(),
+                    at: milestoneTime(),
+                    status: "active" as const,
+                    label: "Queued geospatial package",
+                    detail: formatBytes(file.size),
+                }],
+            })),
+            ...shapefileGroups.map((group) => {
+                const size = group.reduce((sum, file) => sum + file.size, 0);
+                const name = geospatialPackageNameFromGroup(group);
+                return {
+                    id: `upload-${crypto.randomUUID()}`,
+                    kind: "geospatial" as const,
+                    file: group[0],
+                    files: group,
+                    name,
+                    sourcePath: relativePathForFile(group[0]),
+                    size,
+                    sourceFileCount: group.length,
+                    status: "queued" as UploadStatus,
+                    message: "Ready to zip and process shapefile package",
+                    milestones: [{
+                        id: crypto.randomUUID(),
+                        at: milestoneTime(),
+                        status: "active" as const,
+                        label: "Queued shapefile sidecars",
+                        detail: `${group.length} file(s), ${formatBytes(size)}`,
+                    }],
+                };
+            }),
+            ...rasterGroups.map((group) => {
+                const size = group.reduce((sum, file) => sum + file.size, 0);
+                const name = geospatialRasterPackageNameFromGroup(group);
+                return {
+                    id: `upload-${crypto.randomUUID()}`,
+                    kind: "geospatial" as const,
+                    file: group.find(isGeospatialRasterSource) || group[0],
+                    files: group,
+                    name,
+                    sourcePath: relativePathForFile(group.find(isGeospatialRasterSource) || group[0]),
+                    size,
+                    sourceFileCount: group.length,
+                    status: "queued" as UploadStatus,
+                    message: "Ready to package and process geospatial raster",
+                    milestones: [{
+                        id: crypto.randomUUID(),
+                        at: milestoneTime(),
+                        status: "active" as const,
+                        label: "Queued geospatial raster",
+                        detail: `${group.length} file(s), ${formatBytes(size)}`,
+                    }],
+                };
+            }),
+        ];
+        if (files.length > 0 || geospatialItems.length > 0) {
             setUploadItems((prev) => [
+                ...geospatialItems,
                 ...files.map((file) => ({
                     id: `upload-${crypto.randomUUID()}`,
+                    kind: "image" as const,
                     file,
-                    name: file.name,
+                    files: [file],
+                    name: fileDisplayName(file),
+                    sourcePath: fileDisplayName(file),
                     size: file.size,
                     status: "queued" as UploadStatus,
                     message: "Ready to process",
@@ -582,7 +907,45 @@ export const EnrichmentWorkbench: React.FC = () => {
             ]);
         }
         setActivePanel("upload");
-        setStatus(`${files.length} image file(s) queued. ${metadataFiles.length} companion metadata file(s) available.`);
+        setStatus(`${files.length} image file(s), ${geospatialItems.length} geospatial package(s), and ${metadataFiles.length} companion metadata file(s) queued.`);
+    };
+
+    const handleChooseUploadDirectory = async () => {
+        const picker = (window as Window & {
+            showDirectoryPicker?: (options?: { mode?: "read" | "readwrite" }) => Promise<FileSystemDirectoryHandleLike>;
+        }).showDirectoryPicker;
+        if (typeof picker !== "function") {
+            directoryInputRef.current?.click();
+            return;
+        }
+
+        try {
+            const directory = await picker({ mode: "read" });
+            setStatus(`Walking ${directory.name}...`);
+            const files = await filesFromDirectoryHandle(directory);
+            if (files.length === 0) {
+                setStatus(`${directory.name} did not contain any files.`);
+                addToast("Selected folder did not contain any files.", "info");
+                return;
+            }
+            await addUploadFiles(files);
+        } catch (error: any) {
+            if (error?.name === "AbortError") return;
+            setStatus(`Folder scan failed: ${error.message || String(error)}`);
+            addToast("Folder scan failed.", "error");
+        }
+    };
+
+    const handleUploadDrop = async (event: React.DragEvent<HTMLElement>) => {
+        event.preventDefault();
+        const transfer = event.dataTransfer;
+        try {
+            setStatus("Walking dropped files...");
+            await addUploadFiles(await filesFromDataTransfer(transfer));
+        } catch (error: any) {
+            setStatus(`Drop scan failed: ${error.message || String(error)}`);
+            addToast("Drop scan failed.", "error");
+        }
     };
 
     const removeUploadItem = (id: string) => {
@@ -623,7 +986,7 @@ export const EnrichmentWorkbench: React.FC = () => {
         }
         const queued = uploadItems.filter((item) => item.status === "queued" || item.status === "failed");
         if (queued.length === 0) {
-            addToast("Queue one or more image files first.", "info");
+            addToast("Queue one or more image files or geospatial packages first.", "info");
             return;
         }
 
@@ -631,15 +994,18 @@ export const EnrichmentWorkbench: React.FC = () => {
         const controller = new AbortController();
         uploadAbortRef.current = controller;
         setBusyOperation("upload");
-        setStatus(`Processing ${queued.length} uploaded image file(s).`);
+        setStatus(`Processing ${queued.length} uploaded item(s).`);
 
         try {
-            const { definition, promptVersion } = await withTimeout(
-                getHistoricalMapDefinition(),
-                "Loading historical map prompt",
-                15_000,
-            );
-            const outputSchema = JSON.parse(definition.output_schema_json);
+            const needsHistoricalMapPrompt = queued.some((item) => item.kind === "image");
+            const historicalMapPrompt = needsHistoricalMapPrompt
+                ? await withTimeout(
+                    getHistoricalMapDefinition(),
+                    "Loading historical map prompt",
+                    15_000,
+                )
+                : null;
+            const outputSchema = historicalMapPrompt ? JSON.parse(historicalMapPrompt.definition.output_schema_json) : {};
             const modelParams = normalizeModelParams(selectedModelProfile.defaultModel, selectedModelProfile.modelParams ?? {});
             const batchDefaults = parseJsonField(batchDefaultsText, defaultBatchDefaults);
             const ocrEngineLabel = selectedVisionProfile
@@ -653,9 +1019,12 @@ export const EnrichmentWorkbench: React.FC = () => {
                 try {
                     if (controller.signal.aborted) throw new Error("Upload processing canceled.");
 
-                    updateUploadItem(item.id, { status: "hashing", message: "Calculating SHA-256 checksum" });
-                    appendUploadMilestone(item.id, "active", "Hashing", "Calculating SHA-256 checksum in the browser.");
-                    const buffer = await item.file.arrayBuffer();
+                    updateUploadItem(item.id, { status: "hashing", message: item.kind === "geospatial" ? "Preparing package and calculating SHA-256 checksum" : "Calculating SHA-256 checksum" });
+                    appendUploadMilestone(item.id, "active", item.kind === "geospatial" ? "Packaging" : "Hashing", item.kind === "geospatial" ? "Building one ZIP payload for the geospatial package." : "Calculating SHA-256 checksum in the browser.");
+                    const packagePayload = item.kind === "geospatial"
+                        ? await buildGeospatialPackageBuffer(item)
+                        : { buffer: await item.file.arrayBuffer(), fileName: item.file.name, sourceFileCount: 1 };
+                    const buffer = packagePayload.buffer;
                     const checksum = await checksumArrayBuffer(buffer);
                     appendUploadMilestone(item.id, "done", "Checksum ready", `sha256:${checksum}`);
                     if (controller.signal.aborted) throw new Error("Upload processing canceled.");
@@ -663,23 +1032,25 @@ export const EnrichmentWorkbench: React.FC = () => {
                     updateUploadItem(item.id, {
                         checksum,
                         status: "processing",
-                        message: `Uploading original, building IIIF tiles, and extracting text with ${ocrEngineLabel}`,
+                        message: item.kind === "geospatial"
+                            ? "Uploading package, analyzing GIS metadata, and creating vector derivatives"
+                            : `Uploading original, building IIIF tiles, and extracting text with ${ocrEngineLabel}`,
                         error: undefined,
                     });
                     setStatus(`Processing ${index + 1} / ${queued.length}: ${item.name}`);
 
                     const jobId = `upload-${crypto.randomUUID()}`;
                     appendUploadMilestone(item.id, "active", "Proxy request started", `Job ${jobId}. Watch the proxy terminal for [upload:${jobId}] logs.`);
-                    const companionMetadata = metadataForImage(item.name);
+                    const companionMetadata = item.kind === "image" ? metadataForImage(item) : [];
                     const metadataDocuments = await Promise.all(companionMetadata.map((metadata) => readMetadataPayload(metadata.file)));
-                    if (metadataDocuments.length > 0) {
-                        appendUploadMilestone(item.id, "done", "Companion metadata attached", metadataDocuments.map((document) => document.name).join(", "));
-                    }
+                    if (metadataDocuments.length > 0) appendUploadMilestone(item.id, "done", "Companion metadata attached", metadataDocuments.map((document) => document.name).join(", "));
                     let heartbeatCount = 0;
                     const heartbeat = window.setInterval(() => {
                         heartbeatCount += 1;
                         const elapsed = heartbeatCount * 20;
-                        const detail = `${formatElapsed(elapsed)} waiting on proxy. The active step may be S3 upload, IIIF tile generation, or ${selectedVisionProfile ? "Google Vision OCR" : "OpenAI extraction"}.`;
+                        const detail = item.kind === "geospatial"
+                            ? `${formatElapsed(elapsed)} waiting on proxy. The active step may be S3 upload, shapefile analysis, derivative generation, or Aardvark writing.`
+                            : `${formatElapsed(elapsed)} waiting on proxy. The active step may be S3 upload, IIIF tile generation, or ${selectedVisionProfile ? "Google Vision OCR" : "OpenAI extraction"}.`;
                         updateUploadItem(item.id, {
                             message: `Still processing in proxy: ${detail}`,
                         });
@@ -690,34 +1061,56 @@ export const EnrichmentWorkbench: React.FC = () => {
                     }, 20_000);
                     let response;
                     try {
-                        response = await enrichmentProxyClient.processUploadedImage({
-                            jobId,
-                            storageProfileId: selectedStorageProfile.id,
-                            modelProfileId: selectedModelProfile.id,
-                            visionProfileId: selectedVisionProfile?.id,
-                            file: {
-                                name: item.file.name,
-                                type: item.file.type,
-                                size: item.file.size,
+                        if (item.kind === "geospatial") {
+                            response = await enrichmentProxyClient.processGeospatialPackage({
+                                jobId,
+                                storageProfileId: selectedStorageProfile.id,
+                                modelProfileId: selectedModelProfile.id,
+                                file: {
+                                    name: packagePayload.fileName,
+                                    type: "application/zip",
+                                    size: buffer.byteLength,
+                                    checksum,
+                                    base64: base64FromArrayBuffer(buffer),
+                                    sourceFileCount: packagePayload.sourceFileCount,
+                                },
                                 checksum,
-                                base64: base64FromArrayBuffer(buffer),
-                            },
-                            checksum,
-                            systemPrompt: String(promptVersion.system_prompt || ""),
-                            userPrompt: String(promptVersion.user_prompt_template || "")
-                                .replaceAll("{{asset_id}}", checksum)
-                                .replaceAll("{{file_name}}", item.file.name),
-                            model: selectedModelProfile.defaultModel,
-                            modelParams,
-                            outputSchema,
-                            batchDefaults,
-                            metadataDocuments,
-                        }, controller.signal);
+                                model: selectedModelProfile.defaultModel,
+                                modelParams,
+                                batchDefaults,
+                            }, controller.signal);
+                        } else {
+                            const promptVersion = historicalMapPrompt?.promptVersion;
+                            if (!promptVersion) throw new Error("Historical map prompt was not loaded.");
+                            response = await enrichmentProxyClient.processUploadedImage({
+                                jobId,
+                                storageProfileId: selectedStorageProfile.id,
+                                modelProfileId: selectedModelProfile.id,
+                                visionProfileId: selectedVisionProfile?.id,
+                                file: {
+                                    name: item.file.name,
+                                    type: item.file.type,
+                                    size: item.file.size,
+                                    checksum,
+                                    base64: base64FromArrayBuffer(buffer),
+                                },
+                                checksum,
+                                systemPrompt: String(promptVersion.system_prompt || ""),
+                                userPrompt: String(promptVersion.user_prompt_template || "")
+                                    .replaceAll("{{asset_id}}", checksum)
+                                    .replaceAll("{{file_name}}", item.file.name),
+                                model: selectedModelProfile.defaultModel,
+                                modelParams,
+                                outputSchema,
+                                batchDefaults,
+                                metadataDocuments,
+                            }, controller.signal);
+                        }
                     } finally {
                         window.clearInterval(heartbeat);
                     }
                     appendProxyMilestones(item.id, response.proxyMilestones);
-                    appendUploadMilestone(item.id, "done", "Proxy response received", response.cached ? "Existing S3 artifacts reused." : "S3 artifacts and extraction response returned.");
+                    appendUploadMilestone(item.id, "done", "Proxy response received", item.kind === "geospatial" ? "Geospatial artifacts and Aardvark JSON returned." : response.cached ? "Existing S3 artifacts reused." : "S3 artifacts and extraction response returned.");
                     if (controller.signal.aborted) throw new Error("Upload processing canceled.");
 
                     updateUploadItem(item.id, { status: "publishing", message: "Publishing Aardvark metadata into DuckDB" });
@@ -732,17 +1125,21 @@ export const EnrichmentWorkbench: React.FC = () => {
                     await withTimeout(upsertResource(resource, distributions), `Publishing ${item.name}`, 30_000);
                     published += 1;
                     appendUploadMilestone(item.id, "done", "DuckDB publish complete", resource.id);
+                    const responseConfidence = "confidence" in response ? response.confidence : undefined;
+                    const responseReviewPayload = item.kind === "geospatial"
+                        ? ("manifest" in response ? response.manifest : undefined)
+                        : ("extraction" in response ? response.extraction : undefined);
 
                     updateUploadItem(item.id, {
                         status: response.cached ? "cached" : "completed",
                         message: response.cached ? "Already processed; local DuckDB record refreshed" : "Processed and published",
                         resourceId: resource.id,
-                        confidence: response.confidence,
-                        extraction: response.extraction,
+                        confidence: responseConfidence,
+                        extraction: responseReviewPayload,
                         artifacts: response.artifacts,
                         error: undefined,
                     });
-                    setExpandedTextReviewId(item.id);
+                    if (item.kind === "image") setExpandedTextReviewId(item.id);
                 } catch (error: any) {
                     if (String(error.message || "").includes("canceled")) throw error;
                     failed += 1;
@@ -1275,24 +1672,40 @@ export const EnrichmentWorkbench: React.FC = () => {
                                 <label
                                     className="flex min-h-40 cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed border-indigo-200 bg-indigo-50/50 px-4 py-6 text-center text-slate-700 hover:bg-indigo-50 dark:border-indigo-900 dark:bg-indigo-950/20 dark:text-slate-200 dark:hover:bg-indigo-950/40"
                                     onDragOver={(event) => event.preventDefault()}
-                                    onDrop={(event) => {
-                                        event.preventDefault();
-                                        addUploadFiles(event.dataTransfer.files);
-                                    }}
+                                    onDrop={(event) => void handleUploadDrop(event)}
                                 >
                                     <input
                                         type="file"
                                         multiple
-                                        accept="image/*,.tif,.tiff,.jp2,.j2k,.txt,.xml,.fgdc,.iso"
+                                        accept="image/*,.tif,.tiff,.jp2,.j2k,.sid,.img,.zip,.shp,.shx,.dbf,.prj,.cpg,.sbn,.sbx,.qix,.tfw,.tifw,.jgw,.j2w,.sdw,.wld,.aux,.ovr,.rrd,.txt,.xml,.fgdc,.iso,.met"
                                         className="sr-only"
                                         onChange={(event) => {
-                                            if (event.currentTarget.files) addUploadFiles(event.currentTarget.files);
+                                            if (event.currentTarget.files) void addUploadFiles(event.currentTarget.files);
                                             event.currentTarget.value = "";
                                         }}
                                     />
-                                    <span className="text-sm font-semibold">Drop Image Assets</span>
-                                    <span className="mt-1 text-xs text-slate-500 dark:text-slate-400">JPEG, PNG, WebP, TIFF, JP2, TXT, FGDC XML, ISO XML</span>
+                                    <span className="text-sm font-semibold">Drop Images or Data Packages</span>
+                                    <span className="mt-1 text-xs text-slate-500 dark:text-slate-400">Images, ZIP/SHP packages, or georeferenced raster sidecars for COGs</span>
                                 </label>
+                                <input
+                                    ref={directoryInputRef}
+                                    type="file"
+                                    multiple
+                                    className="sr-only"
+                                    onChange={(event) => {
+                                        if (event.currentTarget.files) void addUploadFiles(event.currentTarget.files);
+                                        event.currentTarget.value = "";
+                                    }}
+                                    {...({ webkitdirectory: "", directory: "" } as Record<string, string>)}
+                                />
+                                <button
+                                    type="button"
+                                    onClick={() => void handleChooseUploadDirectory()}
+                                    disabled={isUploading}
+                                    className="rounded border border-indigo-300 px-3 py-2 text-xs font-medium text-indigo-700 hover:bg-indigo-50 disabled:opacity-40 dark:border-indigo-700 dark:text-indigo-200 dark:hover:bg-indigo-950/30"
+                                >
+                                    Choose Folder
+                                </button>
                                 {metadataItems.length > 0 && (
                                     <div className="rounded-md border border-gray-200 bg-gray-50 p-2 dark:border-slate-800 dark:bg-slate-950/50">
                                         <div className="mb-1 text-[11px] font-semibold uppercase text-slate-500 dark:text-slate-400">Companion Metadata</div>
@@ -1352,7 +1765,8 @@ export const EnrichmentWorkbench: React.FC = () => {
                                                             ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-200"
                                                             : "bg-indigo-50 text-indigo-700 dark:bg-indigo-950/40 dark:text-indigo-200"
                                                         }`}>{item.status}</span>
-                                                    <span className="text-slate-500 dark:text-slate-400">{formatBytes(item.size)}</span>
+                                                    <span className="rounded bg-slate-100 px-2 py-0.5 text-[11px] font-medium text-slate-600 dark:bg-slate-800 dark:text-slate-300">{item.kind === "geospatial" ? "geospatial" : "image"}</span>
+                                                    <span className="text-slate-500 dark:text-slate-400">{formatBytes(item.size)}{item.sourceFileCount && item.sourceFileCount > 1 ? ` · ${item.sourceFileCount} files` : ""}</span>
                                                 </div>
                                                 <div className="mt-1 text-slate-600 dark:text-slate-300">{item.message}</div>
                                                 {item.error && <div className="mt-1 whitespace-pre-wrap font-mono text-red-700 dark:text-red-300">{item.error}</div>}
@@ -1361,13 +1775,18 @@ export const EnrichmentWorkbench: React.FC = () => {
                                                 {item.artifacts && (
                                                     <div className="mt-2 flex flex-wrap gap-2">
                                                         <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.originalUrl} target="_blank" rel="noreferrer">Original</a>
-                                                        <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.thumbnailUrl} target="_blank" rel="noreferrer">Thumbnail</a>
-                                                        <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.iiifInfoUrl} target="_blank" rel="noreferrer">IIIF</a>
-                                                        <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.extractionUrl} target="_blank" rel="noreferrer">Extraction</a>
+                                                        {item.artifacts.thumbnailUrl && <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.thumbnailUrl} target="_blank" rel="noreferrer">Thumbnail</a>}
+                                                        {item.artifacts.iiifInfoUrl && <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.iiifInfoUrl} target="_blank" rel="noreferrer">IIIF</a>}
+                                                        {item.artifacts.extractionUrl && <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.extractionUrl} target="_blank" rel="noreferrer">Extraction</a>}
+                                                        {item.artifacts.manifestUrl && <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.manifestUrl} target="_blank" rel="noreferrer">Manifest</a>}
+                                                        {item.artifacts.geojsonUrl && <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.geojsonUrl} target="_blank" rel="noreferrer">GeoJSON</a>}
+                                                        {item.artifacts.geoParquetUrl && <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.geoParquetUrl} target="_blank" rel="noreferrer">GeoParquet</a>}
+                                                        {item.artifacts.pmtilesUrl && <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.pmtilesUrl} target="_blank" rel="noreferrer">PMTiles</a>}
+                                                        {item.artifacts.cogUrl && <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.cogUrl} target="_blank" rel="noreferrer">COG</a>}
                                                         <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.aardvarkUrl} target="_blank" rel="noreferrer">Aardvark</a>
                                                     </div>
                                                 )}
-                                                {item.artifacts && item.extraction !== undefined && item.extraction !== null && (() => {
+                                                {item.kind === "image" && item.artifacts?.iiifInfoUrl && item.extraction !== undefined && item.extraction !== null && (() => {
                                                     const textAnnotations = normalizeTextExtractionAnnotations(item.extraction);
                                                     if (textAnnotations.length === 0) return null;
                                                     const isExpanded = expandedTextReviewId === item.id;

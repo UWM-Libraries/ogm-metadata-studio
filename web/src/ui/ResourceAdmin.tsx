@@ -3,13 +3,13 @@ import maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import { Resource } from '../aardvark/model';
 import { queryResourceById } from '../duckdb/duckdbClient';
-import { Link } from './Link';
+import { textToLngLatBounds, type LngLatBoundsTuple } from './viewers/maplibreBounds';
 
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 
 const MAP_STYLE = "https://demotiles.maplibre.org/style.json";
 
-const AdminStaticMap: React.FC<{ bounds: [[number, number], [number, number]] }> = ({ bounds }) => {
+const AdminStaticMap: React.FC<{ bounds: LngLatBoundsTuple }> = ({ bounds }) => {
     const containerRef = useRef<HTMLDivElement>(null);
     const mapRef = useRef<maplibregl.Map | null>(null);
 
@@ -22,7 +22,7 @@ const AdminStaticMap: React.FC<{ bounds: [[number, number], [number, number]] }>
         const map = new maplibregl.Map({
             container: containerRef.current,
             style: MAP_STYLE,
-            center: [(bounds[0][1] + bounds[1][1]) / 2, (bounds[0][0] + bounds[1][0]) / 2],
+            center: [(bounds[0][0] + bounds[1][0]) / 2, (bounds[0][1] + bounds[1][1]) / 2],
             zoom: 4,
             scrollZoom: false,
             dragPan: false,
@@ -30,9 +30,8 @@ const AdminStaticMap: React.FC<{ bounds: [[number, number], [number, number]] }>
         });
         mapRef.current = map;
         map.on('load', () => {
-            const [minY, minX] = bounds[0];
-            const [maxY, maxX] = bounds[1];
-            map.fitBounds([[minX, minY], [maxX, maxY]], { padding: 20 });
+            const [[minX, minY], [maxX, maxY]] = bounds;
+            map.fitBounds(bounds, { padding: 20 });
             map.addSource('bbox', {
                 type: 'geojson',
                 data: {
@@ -127,24 +126,7 @@ export const ResourceAdmin: React.FC<ResourceAdminProps> = ({ id, onBack }) => {
         return <div className="p-8 text-center text-red-500">Resource not found: {id}</div>;
     }
 
-    // Parse Bounds for Mini Map [[minY, minX], [maxY, maxX]]
-    let bounds: [[number, number], [number, number]] | null = null;
-    if (resource.dcat_bbox) {
-        const bboxStr = resource.dcat_bbox;
-        const envelopeMatch = bboxStr.match(/ENVELOPE\s*\(\s*(-?\d+\.?\d*)\s*,\s*(-?\d+\.?\d*)\s*,\s*(-?\d+\.?\d*)\s*,\s*(-?\d+\.?\d*)\s*\)/i);
-        if (envelopeMatch) {
-            const minX = parseFloat(envelopeMatch[1]);
-            const maxX = parseFloat(envelopeMatch[2]);
-            const maxY = parseFloat(envelopeMatch[3]);
-            const minY = parseFloat(envelopeMatch[4]);
-            bounds = [[minY, minX], [maxY, maxX]];
-        } else {
-            const parts = bboxStr.split(',').map(s => parseFloat(s.trim()));
-            if (parts.length === 4 && parts.every(n => !isNaN(n))) {
-                bounds = [[parts[1], parts[0]], [parts[3], parts[2]]];
-            }
-        }
-    }
+    const bounds = textToLngLatBounds(resource.dcat_bbox || undefined);
 
     return (
         <div className="max-w-7xl mx-auto w-full bg-white dark:bg-slate-900 min-h-full p-6">

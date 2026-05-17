@@ -1,9 +1,10 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 import { ResourceViewer } from './ResourceViewer';
 import { detectViewerConfig } from './resource/viewerConfig';
 import { Resource } from '../aardvark/model';
 import React from 'react';
+import type { SelectableGeoJsonFeature } from './viewers/geospatialFeature';
 
 vi.mock('./resource/viewerConfig', () => ({
     detectViewerConfig: vi.fn(),
@@ -22,8 +23,27 @@ vi.mock('./viewers/IiifImageViewer', () => ({
 }));
 
 vi.mock('./viewers/MapLibreResourceViewer', () => ({
-    MapLibreResourceViewer: ({ protocol, url, layerId }: { protocol: string; url: string; layerId?: string }) => (
-        <div data-testid="maplibre-viewer" data-protocol={protocol} data-url={url} data-layer-id={layerId ?? ''}>MapLibre</div>
+    MapLibreResourceViewer: ({ protocol, url, layerId, selectedFeature }: { protocol: string; url: string; layerId?: string; selectedFeature?: { id: string } | null }) => (
+        <div data-testid="maplibre-viewer" data-protocol={protocol} data-url={url} data-layer-id={layerId ?? ''} data-selected-id={selectedFeature?.id ?? ''}>MapLibre</div>
+    ),
+}));
+
+vi.mock('./viewers/AttributePreviewTable', () => ({
+    AttributePreviewTable: ({ url, selectedFeatureId, onSelectFeature }: { url: string; selectedFeatureId?: string; onSelectFeature?: (feature: SelectableGeoJsonFeature) => void }) => (
+        <button
+            type="button"
+            data-testid="attribute-preview"
+            data-url={url}
+            data-selected-id={selectedFeatureId ?? ''}
+            onClick={() => onSelectFeature?.({
+                id: 'feature-1',
+                rowIndex: 1,
+                properties: { Name: 'Selected footprint' },
+                geometry: { type: 'Point', coordinates: [-119, 39] },
+            })}
+        >
+            Attributes
+        </button>
     ),
 }));
 
@@ -137,5 +157,33 @@ describe('ResourceViewer', () => {
         const element = screen.getByTestId('maplibre-viewer');
         expect(element).toBeInTheDocument();
         expect(element).toHaveAttribute('data-protocol', 'arcgis_feature_layer');
+    });
+
+    it('renders attribute preview for map viewers with table data', () => {
+        vi.mocked(detectViewerConfig).mockReturnValue({
+            protocol: 'pmtiles',
+            endpoint: 'http://localhost/data.pmtiles',
+            attributeTableEndpoint: 'http://localhost/data.geojson',
+        });
+
+        render(<ResourceViewer resource={mockResource} />);
+
+        expect(screen.getByTestId('maplibre-viewer')).toHaveAttribute('data-protocol', 'pmtiles');
+        expect(screen.getByTestId('attribute-preview')).toHaveAttribute('data-url', 'http://localhost/data.geojson');
+    });
+
+    it('passes table feature selections into the map viewer', () => {
+        vi.mocked(detectViewerConfig).mockReturnValue({
+            protocol: 'pmtiles',
+            endpoint: 'http://localhost/data.pmtiles',
+            attributeTableEndpoint: 'http://localhost/data.geojson',
+        });
+
+        render(<ResourceViewer resource={mockResource} />);
+
+        fireEvent.click(screen.getByTestId('attribute-preview'));
+
+        expect(screen.getByTestId('maplibre-viewer')).toHaveAttribute('data-selected-id', 'feature-1');
+        expect(screen.getByTestId('attribute-preview')).toHaveAttribute('data-selected-id', 'feature-1');
     });
 });

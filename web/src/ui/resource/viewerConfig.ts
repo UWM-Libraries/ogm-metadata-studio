@@ -1,11 +1,12 @@
 import { Distribution, Resource } from '../../aardvark/model';
-import { geoJsonToBounds } from '../viewers/maplibreBounds';
+import { envelopeToBounds, geoJsonToBounds } from '../viewers/maplibreBounds';
 
 export interface ViewerConfig {
     protocol: string;
     endpoint: string;
     geometry?: string; // GeoJSON string
     textExtractionEndpoint?: string;
+    attributeTableEndpoint?: string;
 }
 
 function referenceUrl(refs: Record<string, unknown>, keys: string[]): string | undefined {
@@ -29,6 +30,66 @@ function referenceUrl(refs: Record<string, unknown>, keys: string[]): string | u
         if (found) return found;
     }
     return undefined;
+}
+
+function referenceUrlByExtension(refs: Record<string, unknown>, extension: string): string | undefined {
+    const normalizedExtension = extension.toLowerCase();
+    const seen = new Set<unknown>();
+    const extract = (value: unknown): string | undefined => {
+        if (seen.has(value)) return undefined;
+        if (value && typeof value === "object") seen.add(value);
+        if (typeof value === "string") {
+            const trimmed = value.trim();
+            if (!/^https?:\/\//i.test(trimmed)) return undefined;
+            const path = trimmed.split(/[?#]/, 1)[0].toLowerCase();
+            return path.endsWith(normalizedExtension) ? trimmed : undefined;
+        }
+        if (Array.isArray(value)) {
+            for (const item of value) {
+                const found = extract(item);
+                if (found) return found;
+            }
+        }
+        if (value && typeof value === "object") {
+            const candidate = value as Record<string, unknown>;
+            const direct = extract(candidate.url) || extract(candidate["@id"]) || extract(candidate.id);
+            if (direct) return direct;
+            for (const nested of Object.values(candidate)) {
+                const found = extract(nested);
+                if (found) return found;
+            }
+        }
+        return undefined;
+    };
+
+    for (const value of Object.values(refs)) {
+        const found = extract(value);
+        if (found) return found;
+    }
+    return undefined;
+}
+
+function referenceCogUrl(refs: Record<string, unknown>): string | undefined {
+    return referenceUrl(refs, [
+        "https://www.cogeo.org/",
+        "http://www.cogeo.org/",
+        "cog",
+        "cloud_optimized_geotiff",
+    ])
+        || referenceUrlByExtension(refs, ".cog.tif")
+        || referenceUrlByExtension(refs, ".cog.tiff");
+}
+
+function pmtilesSiblingFromGeoJson(url: string | undefined): string | undefined {
+    if (!url) return undefined;
+    try {
+        const parsed = new URL(url);
+        if (!/\/derivatives\/[^/?#]+\.geojson$/i.test(parsed.pathname)) return undefined;
+        parsed.pathname = parsed.pathname.replace(/\.geojson$/i, ".pmtiles");
+        return parsed.toString();
+    } catch {
+        return undefined;
+    }
 }
 
 function refsFromDistributions(distributions: Distribution[]): Record<string, unknown> {
@@ -60,12 +121,9 @@ function extractionEndpointFromIiif(iiifUrl: string | undefined): string | undef
 // Helper: Extract Geometry (BBox to Polygon or Centroid? GBL usually expects BBox as Polygon)
 export function getViewerGeometry(resource: Resource): string | undefined {
     const parseEnvelope = (str: string): string | null => {
-        const envelopeMatch = str.match(/ENVELOPE\s*\(\s*(-?\d+\.?\d*)\s*,\s*(-?\d+\.?\d*)\s*,\s*(-?\d+\.?\d*)\s*,\s*(-?\d+\.?\d*)\s*\)/i);
-        if (envelopeMatch) {
-            const w = parseFloat(envelopeMatch[1]);
-            const e = parseFloat(envelopeMatch[2]);
-            const n = parseFloat(envelopeMatch[3]);
-            const s = parseFloat(envelopeMatch[4]);
+        const bounds = envelopeToBounds(str);
+        if (bounds) {
+            const [[w, s], [e, n]] = bounds;
 
             // GeoJSON Polygon [ [ [w, n], [e, n], [e, s], [w, s], [w, n] ] ]
             const geojson = {
@@ -88,7 +146,7 @@ export function getViewerGeometry(resource: Resource): string | undefined {
         // Is it JSON?
         try {
             JSON.parse(resource.locn_geometry);
-            return resource.locn_geometry;
+            if (geoJsonToBounds(resource.locn_geometry)) return resource.locn_geometry;
         } catch {
             // Not native JSON. Is it ENVELOPE?
             const parsed = parseEnvelope(resource.locn_geometry);
@@ -183,6 +241,52 @@ export function detectViewerConfig(resource: Resource, distributions: Distributi
             protocol: "xyz",
             endpoint: xyz,
             geometry: getViewerGeometry(resource),
+            ...(textExtractionEndpoint ? { textExtractionEndpoint } : {}),
+        };
+    }
+
+    const cog = referenceCogUrl(refs);
+    if (cog) {
+        return {
+            protocol: "cog",
+            endpoint: cog,
+            geometry: getViewerGeometry(resource),
+            ...(textExtractionEndpoint ? { textExtractionEndpoint } : {}),
+        };
+    }
+
+    const geojson = referenceUrl(refs, [
+        "geojson",
+        "application/geo+json",
+        "https://opengeometadata.org/reference/geojson",
+    ]) || referenceUrlByExtension(refs, ".geojson");
+
+    // PMTiles vector tile derivative. For locally generated geospatial packages,
+    // older imports may only have kept the GeoJSON downloadUrl entry, so infer the
+    // sibling PMTiles URL when it follows the studio derivative layout.
+    const pmtiles = referenceUrl(refs, [
+        "pmtiles",
+        "application/vnd.pmtiles",
+        "https://opengeometadata.org/reference/pmtiles",
+        "https://pmtiles.io/",
+    ]) || referenceUrlByExtension(refs, ".pmtiles") || pmtilesSiblingFromGeoJson(geojson);
+    if (pmtiles) {
+        return {
+            protocol: "pmtiles",
+            endpoint: pmtiles,
+            geometry: getViewerGeometry(resource),
+            ...(geojson ? { attributeTableEndpoint: geojson } : {}),
+            ...(textExtractionEndpoint ? { textExtractionEndpoint } : {}),
+        };
+    }
+
+    // GeoJSON vector derivative
+    if (geojson) {
+        return {
+            protocol: "geojson",
+            endpoint: geojson,
+            geometry: getViewerGeometry(resource),
+            attributeTableEndpoint: geojson,
             ...(textExtractionEndpoint ? { textExtractionEndpoint } : {}),
         };
     }

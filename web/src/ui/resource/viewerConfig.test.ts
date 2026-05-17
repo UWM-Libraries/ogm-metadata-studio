@@ -131,6 +131,111 @@ describe('viewerConfig', () => {
             });
         });
 
+        it('detects Cloud Optimized GeoTIFF references', () => {
+            const resource = {
+                ...baseResource,
+                dct_references_s: JSON.stringify({ "https://www.cogeo.org/": "http://example.com/map.cog.tif" })
+            };
+            expect(detectViewerConfig(resource)).toEqual({
+                protocol: "cog",
+                endpoint: "http://example.com/map.cog.tif",
+                geometry: undefined
+            });
+        });
+
+        it('detects generated COG URLs by extension in generic references', () => {
+            const resource = {
+                ...baseResource,
+                dct_references_s: JSON.stringify({
+                    "http://schema.org/downloadUrl": [
+                        { url: "http://example.com/source.tif", label: "Source raster" },
+                        { url: "http://example.com/derivatives/map.cog.tif?version=1", label: "COG" },
+                    ],
+                })
+            };
+            expect(detectViewerConfig(resource)).toEqual({
+                protocol: "cog",
+                endpoint: "http://example.com/derivatives/map.cog.tif?version=1",
+                geometry: undefined
+            });
+        });
+
+        it('detects PMTiles vector tile derivatives before GeoJSON', () => {
+            const resource = {
+                ...baseResource,
+                dct_references_s: JSON.stringify({
+                    "pmtiles": { url: "http://example.com/data.pmtiles", label: "PMTiles vector tiles" },
+                    "geojson": { url: "http://example.com/data.geojson", label: "GeoJSON viewer derivative" },
+                })
+            };
+            expect(detectViewerConfig(resource)).toEqual({
+                protocol: "pmtiles",
+                endpoint: "http://example.com/data.pmtiles",
+                geometry: undefined,
+                attributeTableEndpoint: "http://example.com/data.geojson"
+            });
+        });
+
+        it('detects PMTiles URLs by extension in generic references', () => {
+            const resource = {
+                ...baseResource,
+                dct_references_s: JSON.stringify({
+                    "http://schema.org/downloadUrl": [
+                        { url: "http://example.com/source.zip", label: "Source" },
+                        { url: "http://example.com/data.pmtiles?version=1", label: "PMTiles" },
+                    ],
+                })
+            };
+            expect(detectViewerConfig(resource)).toEqual({
+                protocol: "pmtiles",
+                endpoint: "http://example.com/data.pmtiles?version=1",
+                geometry: undefined
+            });
+        });
+
+        it('infers PMTiles sibling URLs from generated GeoJSON derivatives', () => {
+            const resource = {
+                ...baseResource,
+                dct_references_s: JSON.stringify({
+                    "http://schema.org/downloadUrl": [
+                        { url: "http://example.com/uploads/geodata-1/derivatives/data.geojson", label: "GeoJSON viewer derivative" },
+                    ],
+                })
+            };
+            expect(detectViewerConfig(resource)).toEqual({
+                protocol: "pmtiles",
+                endpoint: "http://example.com/uploads/geodata-1/derivatives/data.pmtiles",
+                geometry: undefined,
+                attributeTableEndpoint: "http://example.com/uploads/geodata-1/derivatives/data.geojson"
+            });
+        });
+
+        it('detects GeoJSON vector derivatives', () => {
+            const resource = {
+                ...baseResource,
+                dct_references_s: JSON.stringify({ "geojson": { url: "http://example.com/data.geojson", label: "GeoJSON viewer derivative" } })
+            };
+            expect(detectViewerConfig(resource)).toEqual({
+                protocol: "geojson",
+                endpoint: "http://example.com/data.geojson",
+                geometry: undefined,
+                attributeTableEndpoint: "http://example.com/data.geojson"
+            });
+        });
+
+        it('detects GeoJSON URLs by extension in generic references', () => {
+            const resource = {
+                ...baseResource,
+                dct_references_s: JSON.stringify({ "http://schema.org/downloadUrl": "http://example.com/export/data.geojson" })
+            };
+            expect(detectViewerConfig(resource)).toEqual({
+                protocol: "geojson",
+                endpoint: "http://example.com/export/data.geojson",
+                geometry: undefined,
+                attributeTableEndpoint: "http://example.com/export/data.geojson"
+            });
+        });
+
         it('detects ArcGIS Feature Layer', () => {
             const resource = { ...baseResource, dct_references_s: JSON.stringify({ "arcgis_feature_layer": "http://example.com/feature" }) };
             expect(detectViewerConfig(resource)).toEqual({
@@ -207,6 +312,15 @@ describe('viewerConfig', () => {
 
         it('returns undefined if ENVELOPE is invalid', () => {
             const resource = { ...base, locn_geometry: 'INVALID' };
+            expect(getViewerGeometry(resource)).toBeUndefined();
+        });
+
+        it('ignores projected coordinate geometry', () => {
+            const resource = {
+                ...base,
+                locn_geometry: '{"type":"Polygon","coordinates":[[[692906.124,3984670.74],[696416.156,3984670.74],[696416.156,3981529.584],[692906.124,3981529.584],[692906.124,3984670.74]]]}',
+                dcat_bbox: 'ENVELOPE(692906.124,696416.156,3984670.74,3981529.584)',
+            };
             expect(getViewerGeometry(resource)).toBeUndefined();
         });
     });

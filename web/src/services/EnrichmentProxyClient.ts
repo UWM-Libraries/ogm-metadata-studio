@@ -53,6 +53,15 @@ export interface UploadedImageFilePayload {
     base64: string;
 }
 
+export interface UploadedPackageFilePayload {
+    name: string;
+    type: string;
+    size: number;
+    checksum: string;
+    base64: string;
+    sourceFileCount?: number;
+}
+
 export interface CompanionMetadataPayload {
     name: string;
     type: string;
@@ -87,6 +96,7 @@ export interface ProcessUploadedImageResponse {
         iiifInfoUrl: string;
         extractionUrl: string;
         aardvarkUrl: string;
+        cogUrl?: string;
     };
     extraction: unknown;
     rawResponse?: unknown;
@@ -111,6 +121,46 @@ export interface ProcessUploadedImageResponse {
         tileCount: number;
         scaleFactors: number[];
     };
+}
+
+export interface ProcessGeospatialPackageRequest {
+    jobId: string;
+    storageProfileId: string;
+    modelProfileId: string;
+    file: UploadedPackageFilePayload;
+    checksum: string;
+    model: string;
+    modelParams: Record<string, unknown>;
+    batchDefaults: Record<string, unknown>;
+}
+
+export interface ProcessGeospatialPackageResponse {
+    cached: boolean;
+    checksum: string;
+    resourceId?: string;
+    fileName: string;
+    artifacts: {
+        originalUrl: string;
+        manifestUrl: string;
+        aardvarkUrl: string;
+        geojsonUrl?: string;
+        geoParquetUrl?: string;
+        pmtilesUrl?: string;
+        cogUrl?: string;
+        thumbnailUrl?: string;
+    };
+    manifest: unknown;
+    rawResponse?: unknown;
+    usage?: unknown;
+    aardvarkJson: Record<string, unknown>;
+    distributions: Distribution[];
+    aardvarkEvidence?: Array<Record<string, unknown>>;
+    proxyMilestones?: Array<{
+        at: string;
+        elapsed_ms: number;
+        label: string;
+        detail?: Record<string, unknown>;
+    }>;
 }
 
 export interface ProcessedS3Resource {
@@ -284,6 +334,15 @@ export class EnrichmentProxyClient {
 
     async processUploadedImage(request: ProcessUploadedImageRequest, signal?: AbortSignal): Promise<ProcessUploadedImageResponse> {
         const res = await fetchWithTimeout(`${this.baseUrl}/api/uploads/process-image`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: safeJsonStringify(request),
+        }, ENRICHMENT_TIMEOUT_MS, signal);
+        return parseResponse(res);
+    }
+
+    async processGeospatialPackage(request: ProcessGeospatialPackageRequest, signal?: AbortSignal): Promise<ProcessGeospatialPackageResponse> {
+        const res = await fetchWithTimeout(`${this.baseUrl}/api/uploads/process-geospatial-package`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: safeJsonStringify(request),
