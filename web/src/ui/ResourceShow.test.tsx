@@ -4,12 +4,22 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { ResourceShow } from './ResourceShow';
 import * as duckdbClient from '../duckdb/duckdbClient';
 import { databaseService } from '../services/DatabaseService';
+import * as processedResourceRecovery from '../services/processedResourceRecovery';
 
 // Mock dependencies
 vi.mock('../duckdb/duckdbClient', () => ({
     queryResourceById: vi.fn(),
     querySimilarResources: vi.fn(),
-    getSearchNeighbors: vi.fn()
+    getSearchNeighbors: vi.fn(),
+    queryDistributionsForResource: vi.fn()
+}));
+
+vi.mock('../duckdb/dbInit', () => ({
+    waitForDuckDbRestore: vi.fn().mockResolvedValue(undefined)
+}));
+
+vi.mock('../services/processedResourceRecovery', () => ({
+    recoverProcessedS3ResourceToLocalCatalog: vi.fn()
 }));
 
 vi.mock('../services/DatabaseService', () => ({
@@ -30,6 +40,7 @@ vi.mock('./resource/SimilarResourcesCarousel', () => ({ SimilarResourcesCarousel
 vi.mock('./resource/ResourceHeader', () => ({
     ResourceHeader: ({ onDelete }: any) => <button onClick={() => onDelete('1')}>Delete Resource</button>
 }));
+vi.mock('./resource/ResourceDistributions', () => ({ ResourceDistributions: () => <div>Resource Distributions</div> }));
 
 const mockResource = {
     id: '1',
@@ -40,6 +51,10 @@ const mockResource = {
 describe('ResourceShow Component', () => {
     beforeEach(() => {
         vi.resetAllMocks();
+        vi.mocked(duckdbClient.queryDistributionsForResource).mockResolvedValue([]);
+        vi.mocked(duckdbClient.querySimilarResources).mockResolvedValue([]);
+        vi.mocked(duckdbClient.getSearchNeighbors).mockResolvedValue({ position: 0, total: 0 });
+        vi.mocked(processedResourceRecovery.recoverProcessedS3ResourceToLocalCatalog).mockResolvedValue(null);
     });
 
     it('renders loading state initially', async () => {
@@ -68,6 +83,28 @@ describe('ResourceShow Component', () => {
         await waitFor(() => {
             expect(screen.getByText('Resource not found: 999')).toBeDefined();
         });
+    });
+
+    it('recovers a missing processed resource from S3', async () => {
+        vi.mocked(duckdbClient.queryResourceById).mockResolvedValue(null);
+        vi.mocked(processedResourceRecovery.recoverProcessedS3ResourceToLocalCatalog).mockResolvedValue({
+            resource: mockResource as any,
+            distributions: [],
+            storageProfileId: 's3-profile',
+            storageProfileName: 'S3 profile',
+            s3Resource: { resourceId: '1' } as any,
+        });
+        vi.mocked(duckdbClient.querySimilarResources).mockResolvedValue([]);
+        vi.mocked(duckdbClient.getSearchNeighbors).mockResolvedValue({ position: 1, total: 1 });
+
+        render(<ResourceShow id="1" onBack={() => { }} />);
+
+        await waitFor(() => {
+            expect(screen.getByText('Resource Viewer')).toBeDefined();
+        });
+        expect(processedResourceRecovery.recoverProcessedS3ResourceToLocalCatalog).toHaveBeenCalledWith('1', expect.objectContaining({
+            signal: expect.any(AbortSignal),
+        }));
     });
 
     it('handles delete action', async () => {

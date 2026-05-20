@@ -1,16 +1,13 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { upsertResource, deleteResource, upsertThumbnail, upsertStaticMap, ensureEmbeddings } from './mutations';
 import * as dbInit from './dbInit';
-import * as lifecycle from './lifecycle';
 import * as queries from './queries';
 
 // Mock dependencies
 vi.mock('./dbInit', () => ({
     getDuckDbContext: vi.fn(),
-}));
-
-vi.mock('./lifecycle', () => ({
-    saveDb: vi.fn(),
+    saveResourceOverlayToIndexedDB: vi.fn(),
+    saveResourceDeleteOverlayToIndexedDB: vi.fn(),
 }));
 
 vi.mock('./queries', () => ({
@@ -23,13 +20,13 @@ class MockWorker {
     terminate = vi.fn();
     onmessage: ((e: MessageEvent) => void) | null = null;
     constructor() {
-        // Bind the instance global tracker to this instance
-        // Actually, the code uses strict instance.
-        // We'll capture the instance in a global var for the test to access.
-        globalTestWorker = this;
+        trackMockWorker(this);
     }
 }
 let globalTestWorker: MockWorker | null = null;
+function trackMockWorker(worker: MockWorker) {
+    globalTestWorker = worker;
+}
 vi.stubGlobal('Worker', MockWorker);
 
 // Mock DuckDB Context
@@ -55,6 +52,7 @@ describe('DuckDB Mutations', () => {
                 id: 'test-1',
                 dct_title_s: 'Test Title',
                 dct_subject_sm: ['History', 'Maps'],
+                extra: {},
             };
             const distributions = [{ relation_key: 'file', url: 'http://example.com/file.zip', label: 'Download' }];
 
@@ -75,14 +73,29 @@ describe('DuckDB Mutations', () => {
             // FTS Index
             expect(mockConn.query).toHaveBeenCalledWith(expect.stringContaining('INSERT INTO search_index'));
 
-            // Save DB
-            expect(lifecycle.saveDb).toHaveBeenCalled();
+            expect(dbInit.saveResourceOverlayToIndexedDB).toHaveBeenCalledWith(expect.objectContaining({
+                id: 'test-1',
+                dct_references_s: expect.stringContaining('http://example.com/file.zip'),
+            }));
+        });
+
+        it('skips IndexedDB overlay save when requested', async () => {
+            const resource = {
+                id: 'test-skip-save',
+                dct_title_s: 'Test Title',
+                extra: {},
+            };
+
+            await upsertResource(resource as any, [], { skipSave: true });
+
+            expect(dbInit.saveResourceOverlayToIndexedDB).not.toHaveBeenCalled();
         });
 
         it('handles geometry updates from envelope', async () => {
             const resource = {
                 id: 'test-geo',
                 dcat_bbox: 'ENVELOPE(1, 2, 3, 4)', // minX, maxX, maxY, minY ? No, DuckDB ST_MakeEnvelope usage
+                extra: {},
             };
 
             await upsertResource(resource as any);
@@ -99,7 +112,7 @@ describe('DuckDB Mutations', () => {
             expect(mockConn.query).toHaveBeenCalledWith(expect.stringContaining("DELETE FROM resources_mv"));
             expect(mockConn.query).toHaveBeenCalledWith(expect.stringContaining("DELETE FROM distributions"));
             expect(mockConn.query).toHaveBeenCalledWith(expect.stringContaining("DELETE FROM search_index"));
-            expect(lifecycle.saveDb).toHaveBeenCalled();
+            expect(dbInit.saveResourceDeleteOverlayToIndexedDB).toHaveBeenCalledWith('del-1');
         });
     });
 

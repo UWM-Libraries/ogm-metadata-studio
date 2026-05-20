@@ -619,6 +619,34 @@ export async function loadRecordsFromIndexedDB(): Promise<AardvarkJson[]> {
     });
 }
 
+export async function loadResourceFromIndexedDB(id: string): Promise<AardvarkJson | null> {
+    if (!id) return null;
+    return new Promise((resolve) => {
+        const req = indexedDB.open(INDEXEDDB_NAME, INDEXEDDB_VERSION);
+        req.onupgradeneeded = (e: any) => {
+            const db = e.target.result as IDBDatabase;
+            if (!db.objectStoreNames.contains(INDEXEDDB_STORE)) db.createObjectStore(INDEXEDDB_STORE);
+            if (!db.objectStoreNames.contains(INDEXEDDB_RECORDS_STORE)) db.createObjectStore(INDEXEDDB_RECORDS_STORE, { keyPath: "id" });
+        };
+        req.onsuccess = (e: any) => {
+            const db = e.target.result as IDBDatabase;
+            const tx = db.transaction([INDEXEDDB_RECORDS_STORE], "readonly");
+            const get = tx.objectStore(INDEXEDDB_RECORDS_STORE).get(id);
+            get.onsuccess = () => {
+                resolve(get.result ? get.result as AardvarkJson : null);
+            };
+            get.onerror = () => {
+                console.warn(`[IndexedDB] Failed to load resource ${id} from records store`, get.error);
+                resolve(null);
+            };
+        };
+        req.onerror = () => {
+            console.warn("[IndexedDB] Failed to open DB for resource lookup", req.error);
+            resolve(null);
+        };
+    });
+}
+
 export async function loadDeletedResourceIdsFromIndexedDB(): Promise<string[]> {
     return new Promise((resolve) => {
         const req = indexedDB.open(INDEXEDDB_NAME, INDEXEDDB_VERSION);
