@@ -7,15 +7,21 @@ import {
     ProxyStorageProfile,
     ProxyVisionProfile,
     syncProxyProfilesToDuckDb,
-    upsertResource,
 } from "../../duckdb/duckdbClient";
-import { enrichmentProxyClient, ProcessedS3Resource, ProxyConfig } from "../../services/EnrichmentProxyClient";
+import {
+    enrichmentProxyClient,
+    ProcessedS3Resource,
+    type ProcessGeospatialPackageResponse,
+    type ProcessUploadedImageResponse,
+    ProxyConfig,
+} from "../../services/EnrichmentProxyClient";
 import { DUCKDB_RESTORED_EVENT, DUCKDB_RESTORE_PROGRESS_EVENT, getDuckDbRestoreStatus } from "../../duckdb/dbInit";
 import { safeJsonStringify } from "../../duckdb/json";
-import { Distribution, resourceFromJson } from "../../aardvark/model";
 import { useToast } from "../shared/ToastContext";
 import { IiifImageViewer } from "../viewers/IiifImageViewer";
 import { normalizeTextExtractionAnnotations } from "../viewers/textExtractionOverlay";
+import { withBasePath } from "../../utils/basePath";
+import { publishAardvarkResponseToLocalCatalog } from "../../services/processedResourceRecovery";
 import {
     basenameFromPath,
     fileDisplayName,
@@ -31,6 +37,8 @@ type BusyOperation = "" | "upload" | "regenerate" | "refresh";
 type EnrichmentPhase = "starting" | "requesting" | "storing" | "completed" | "failed";
 type UploadStatus = "queued" | "hashing" | "processing" | "publishing" | "completed" | "cached" | "failed";
 type UploadKind = "image" | "geospatial";
+
+const STREAMING_GEOSPATIAL_THRESHOLD_BYTES = 512 * 1024 * 1024;
 
 interface EnrichmentMilestone {
     id: string;
@@ -76,12 +84,15 @@ interface UploadItem {
         thumbnailUrl?: string;
         iiifInfoUrl?: string;
         extractionUrl?: string;
+        aiEnrichmentsUrl?: string;
         manifestUrl?: string;
         aardvarkUrl: string;
         geojsonUrl?: string;
         geoParquetUrl?: string;
         pmtilesUrl?: string;
         cogUrl?: string;
+        archivalSupplementUrl?: string;
+        archivalSupplementJsonUrl?: string;
     };
     error?: string;
     milestones?: EnrichmentMilestone[];
@@ -93,6 +104,23 @@ interface MetadataUploadItem {
     name: string;
     sourcePath?: string;
     size: number;
+}
+
+interface FolderScanSummaryItem {
+    name: string;
+    kind: "file" | "directory";
+    fileCount: number;
+    size: number;
+}
+
+interface FolderScanSummary {
+    rootName: string;
+    totalFiles: number;
+    imageCount: number;
+    geospatialCount: number;
+    metadataCount: number;
+    ignoredCount: number;
+    topLevelItems: FolderScanSummaryItem[];
 }
 
 const blankStorageProfile = (): ProxyStorageProfile => ({
@@ -144,6 +172,16 @@ const defaultBatchDefaults = {
     subjects: [],
     themes: [],
 };
+
+function defaultBatchDefaultsPayload() {
+    return {
+        ...defaultBatchDefaults,
+        resourceClass: [...defaultBatchDefaults.resourceClass],
+        resourceType: [...defaultBatchDefaults.resourceType],
+        subjects: [...defaultBatchDefaults.subjects],
+        themes: [...defaultBatchDefaults.themes],
+    };
+}
 
 function parseJsonField<T>(text: string, fallback: T): T {
     try {
@@ -391,6 +429,107 @@ function isIgnoredFilesystemFile(file: File): boolean {
     return name === ".DS_Store" || name === "Thumbs.db" || name.startsWith("._");
 }
 
+function commonRootSegment(files: File[]): string {
+    const firstSegments = files
+        .map((file) => relativePathForFile(file).split("/").filter(Boolean))
+        .filter((parts) => parts.length > 1)
+        .map((parts) => parts[0]);
+    if (firstSegments.length === 0) return "";
+    const first = firstSegments[0];
+    return firstSegments.every((segment) => segment === first) ? first : "";
+}
+
+function topLevelPartsForPath(pathName: string, rootName: string): string[] {
+    const parts = String(pathName || "").replace(/\\/g, "/").split("/").filter(Boolean);
+    if (rootName && parts[0] === rootName) return parts.slice(1);
+    return parts;
+}
+
+function normalizedPackageNameForDedupe(name: string): string {
+    return basenameFromPath(name)
+        .replace(/\.zip$/i, "")
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "");
+}
+
+function zipPackageDedupeKey(file: File, rootName: string): string {
+    const parts = topLevelPartsForPath(relativePathForFile(file), rootName);
+    return normalizedPackageNameForDedupe(parts[parts.length - 1] || file.name);
+}
+
+function expandedGeospatialGroupDedupeKey(files: File[], rootName: string): string {
+    const primary = files.find(isGeospatialRasterSource) || files.find((file) => /\.shp$/i.test(file.name)) || files[0];
+    const parts = topLevelPartsForPath(relativePathForFile(primary), rootName);
+    const packageName = parts.length > 1
+        ? parts[0]
+        : stripKnownRasterExtension(basenameFromPath(relativePathForFile(primary))).replace(/\.shp$/i, "").replace(/\.[^.]+$/i, "");
+    return normalizedPackageNameForDedupe(packageName);
+}
+
+function imageDirectoryKey(file: File, rootName: string): string {
+    const parts = topLevelPartsForPath(relativePathForFile(file), rootName);
+    return parts.length > 1 ? parts.slice(0, -1).join("/").toLowerCase() : "";
+}
+
+function imageFamilyStemForDerivativeDedupe(file: File): string {
+    return basenameFromPath(relativePathForFile(file))
+        .replace(/\.(jpe?g|png|webp|tiff?|jp2|j2k)$/i, "")
+        .replace(/[_-]\d+$/i, "")
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "");
+}
+
+function isLikelyAccessDerivativeImage(file: File): boolean {
+    return /\.(jpe?g)$/i.test(file.name);
+}
+
+function isPreferredSourceImage(file: File): boolean {
+    return /\.(tiff?|jp2|j2k)$/i.test(file.name);
+}
+
+function derivativeImageDedupeKey(file: File, rootName: string): string {
+    return `${imageDirectoryKey(file, rootName)}:${imageFamilyStemForDerivativeDedupe(file)}`;
+}
+
+function buildFolderScanSummary(
+    files: File[],
+    counts: Pick<FolderScanSummary, "imageCount" | "geospatialCount" | "metadataCount" | "ignoredCount">,
+): FolderScanSummary | null {
+    if (files.length === 0) return null;
+    const rootName = commonRootSegment(files) || "Selected files";
+    const groups = new Map<string, FolderScanSummaryItem>();
+    for (const file of files) {
+        const parts = topLevelPartsForPath(relativePathForFile(file), rootName);
+        const name = parts[0] || file.name;
+        const kind = parts.length > 1 ? "directory" : "file";
+        const existing = groups.get(name);
+        groups.set(name, {
+            name,
+            kind: existing?.kind === "directory" || kind === "directory" ? "directory" : "file",
+            fileCount: (existing?.fileCount || 0) + 1,
+            size: (existing?.size || 0) + file.size,
+        });
+    }
+    return {
+        rootName,
+        totalFiles: files.length,
+        ...counts,
+        topLevelItems: Array.from(groups.values()).sort((a, b) => {
+            if (a.kind !== b.kind) return a.kind === "directory" ? -1 : 1;
+            return a.name.localeCompare(b.name);
+        }),
+    };
+}
+
+function resourcePageHref(resourceId: string | undefined): string {
+    return resourceId ? withBasePath(`/resources/${encodeURIComponent(resourceId)}`) : "";
+}
+
+function metadataSourceGroupName(item: MetadataUploadItem, rootName: string): string {
+    const parts = topLevelPartsForPath(item.sourcePath || item.name, rootName);
+    return parts[0] || item.name;
+}
+
 async function readMetadataPayload(file: File) {
     return {
         name: file.name,
@@ -411,7 +550,8 @@ async function buildGeospatialPackageBuffer(item: UploadItem): Promise<{ buffer:
     }
     const zip = new JSZip();
     for (const file of files) {
-        zip.file(relativePathForFile(file), file);
+        const modified = Number.isFinite(file.lastModified) && file.lastModified > 0 ? new Date(file.lastModified) : undefined;
+        zip.file(relativePathForFile(file), file, modified ? { date: modified } : undefined);
     }
     const buffer = await zip.generateAsync({ type: "arraybuffer", compression: "DEFLATE" });
     return {
@@ -419,6 +559,12 @@ async function buildGeospatialPackageBuffer(item: UploadItem): Promise<{ buffer:
         fileName: item.name,
         sourceFileCount: files.length,
     };
+}
+
+function shouldStreamGeospatialItem(item: UploadItem): boolean {
+    return item.kind === "geospatial"
+        && item.size >= STREAMING_GEOSPATIAL_THRESHOLD_BYTES
+        && Boolean(item.files && item.files.length > 1);
 }
 
 function milestoneTime(date = new Date()): string {
@@ -467,13 +613,14 @@ export const EnrichmentWorkbench: React.FC = () => {
     const [storageDraft, setStorageDraft] = useState<ProxyStorageProfile>(blankStorageProfile);
     const [modelDraft, setModelDraft] = useState<ProxyModelProfile>(blankModelProfile);
     const [visionDraft, setVisionDraft] = useState<ProxyVisionProfile>(blankVisionProfile);
-    const [batchDefaultsText, setBatchDefaultsText] = useState(pretty(defaultBatchDefaults));
     const [status, setStatus] = useState("");
     const [busyOperation, setBusyOperation] = useState<BusyOperation>("");
     const [runProgress, setRunProgress] = useState<EnrichmentProgress | null>(null);
     const [uploadItems, setUploadItems] = useState<UploadItem[]>([]);
     const [expandedTextReviewId, setExpandedTextReviewId] = useState<string | null>(null);
     const [metadataItems, setMetadataItems] = useState<MetadataUploadItem[]>([]);
+    const [folderScanSummary, setFolderScanSummary] = useState<FolderScanSummary | null>(null);
+    const [reprocessExistingUploads, setReprocessExistingUploads] = useState(false);
     const [inventoryResources, setInventoryResources] = useState<ProcessedS3Resource[]>([]);
     const [inventoryQuery, setInventoryQuery] = useState("");
     const [inventoryStatus, setInventoryStatus] = useState("");
@@ -517,6 +664,20 @@ export const EnrichmentWorkbench: React.FC = () => {
         () => uploadItems.filter((item) => item.status === "completed" || item.status === "cached").length,
         [uploadItems],
     );
+    const metadataSourceGroups = useMemo(() => {
+        const groups = new Map<string, { name: string; fileCount: number; size: number }>();
+        const rootName = folderScanSummary?.rootName || "";
+        for (const item of metadataItems) {
+            const name = metadataSourceGroupName(item, rootName);
+            const existing = groups.get(name);
+            groups.set(name, {
+                name,
+                fileCount: (existing?.fileCount || 0) + 1,
+                size: (existing?.size || 0) + item.size,
+            });
+        }
+        return Array.from(groups.values()).sort((a, b) => b.fileCount - a.fileCount || a.name.localeCompare(b.name));
+    }, [folderScanSummary?.rootName, metadataItems]);
     const isBusy = busyOperation !== "";
     const isUploading = busyOperation === "upload";
     const isRegenerating = busyOperation === "regenerate";
@@ -771,6 +932,7 @@ export const EnrichmentWorkbench: React.FC = () => {
         const originalFiles = Array.from(fileList);
         const ignoredSystemFiles = originalFiles.filter(isIgnoredFilesystemFile).length;
         const incoming = originalFiles.filter((file) => !isIgnoredFilesystemFile(file));
+        const rootName = commonRootSegment(incoming);
         const zipClassification = await classifyZipUploads(incoming.filter(isZipUpload));
         const zipPackages = zipClassification.geospatialZipPackages;
         const rasterCandidates = incoming.filter((file) => !isZipUpload(file) && (isGeospatialRasterSource(file) || isGeospatialRasterSidecar(file)));
@@ -778,19 +940,45 @@ export const EnrichmentWorkbench: React.FC = () => {
         const groupedRasterFiles = new Set(rasterGroups.flat());
         const shapefileSidecars = incoming.filter((file) => !isZipUpload(file) && !groupedRasterFiles.has(file) && isShapefileSidecar(file));
         const shapefileGroups = groupShapefileSidecars(shapefileSidecars);
+        const expandedPackageKeys = new Set(
+            [...shapefileGroups, ...rasterGroups]
+                .map((group) => expandedGeospatialGroupDedupeKey(group, rootName))
+                .filter(Boolean),
+        );
+        const duplicateZipFiles = new Set(zipPackages.filter((file) => expandedPackageKeys.has(zipPackageDedupeKey(file, rootName))));
+        const dedupedZipPackages = zipPackages.filter((file) => !duplicateZipFiles.has(file));
+        const duplicateZipCount = zipPackages.length - dedupedZipPackages.length;
         const groupedSidecars = new Set(shapefileGroups.flat());
-        const files = incoming.filter((file) => !isZipUpload(file) && !groupedRasterFiles.has(file) && !groupedSidecars.has(file) && isImageUpload(file));
+        const imageCandidates = incoming.filter((file) => !isZipUpload(file) && !groupedRasterFiles.has(file) && !groupedSidecars.has(file) && isImageUpload(file));
+        const preferredImageKeys = new Set(
+            [...imageCandidates, ...rasterGroups.flat()]
+                .filter(isPreferredSourceImage)
+                .map((file) => derivativeImageDedupeKey(file, rootName))
+                .filter((key) => !key.endsWith(":")),
+        );
+        const derivativeImageFiles = new Set(
+            imageCandidates.filter((file) => isLikelyAccessDerivativeImage(file) && preferredImageKeys.has(derivativeImageDedupeKey(file, rootName))),
+        );
+        const files = imageCandidates.filter((file) => !derivativeImageFiles.has(file));
+        const derivativeImageCount = derivativeImageFiles.size;
         const metadataFiles = [
-            ...incoming.filter((file) => !isZipUpload(file) && !groupedRasterFiles.has(file) && !groupedSidecars.has(file) && !isImageUpload(file) && isMetadataUpload(file)),
+            ...incoming.filter((file) => !isZipUpload(file) && !groupedRasterFiles.has(file) && !groupedSidecars.has(file) && !imageCandidates.includes(file) && isMetadataUpload(file)),
             ...zipClassification.metadataFiles,
         ];
         const directMetadataFileCount = metadataFiles.length - zipClassification.metadataFiles.length;
         const orphanSidecars = shapefileSidecars.filter((file) => !groupedSidecars.has(file));
-        const queuedNonZipFileCount = files.length + rasterGroups.flat().length + shapefileGroups.flat().length + directMetadataFileCount + orphanSidecars.length;
+        const queuedNonZipFileCount = files.length + derivativeImageCount + rasterGroups.flat().length + shapefileGroups.flat().length + directMetadataFileCount + orphanSidecars.length;
         const nonZipFileCount = incoming.filter((file) => !isZipUpload(file)).length;
         const unsupportedFiles = Math.max(0, nonZipFileCount - queuedNonZipFileCount) + zipClassification.unsupportedZipCount;
-        if (files.length === 0 && metadataFiles.length === 0 && zipPackages.length === 0 && shapefileGroups.length === 0 && rasterGroups.length === 0) {
-            const ignoredText = ignoredSystemFiles + unsupportedFiles > 0 ? ` Ignored ${ignoredSystemFiles + unsupportedFiles} unsupported or system file(s).` : "";
+        const folderSummary = buildFolderScanSummary(incoming.filter((file) => !duplicateZipFiles.has(file) && !derivativeImageFiles.has(file)), {
+            imageCount: files.length,
+            geospatialCount: dedupedZipPackages.length + shapefileGroups.length + rasterGroups.length,
+            metadataCount: metadataFiles.length,
+            ignoredCount: unsupportedFiles + ignoredSystemFiles + duplicateZipCount + derivativeImageCount,
+        });
+        setFolderScanSummary(folderSummary);
+        if (files.length === 0 && metadataFiles.length === 0 && dedupedZipPackages.length === 0 && shapefileGroups.length === 0 && rasterGroups.length === 0) {
+            const ignoredText = ignoredSystemFiles + unsupportedFiles + duplicateZipCount + derivativeImageCount > 0 ? ` Ignored ${ignoredSystemFiles + unsupportedFiles + duplicateZipCount + derivativeImageCount} unsupported, duplicate, derivative, or system file(s).` : "";
             addToast(`Choose image files, zipped geospatial packages, shapefile/raster sidecars, or companion metadata files.${ignoredText}`, "info");
             return;
         }
@@ -799,6 +987,12 @@ export const EnrichmentWorkbench: React.FC = () => {
         }
         if (unsupportedFiles > 0 || ignoredSystemFiles > 0) {
             addToast(`Ignored ${unsupportedFiles + ignoredSystemFiles} unsupported or system file(s).`, "info");
+        }
+        if (duplicateZipCount > 0) {
+            addToast(`Skipped ${duplicateZipCount} ZIP package(s) because matching expanded folder(s) were selected.`, "info");
+        }
+        if (derivativeImageCount > 0) {
+            addToast(`Skipped ${derivativeImageCount} JPEG derivative(s) because matching TIFF/JPEG2000 source image(s) were selected.`, "info");
         }
         if (zipClassification.metadataFiles.length > 0) {
             addToast(`Expanded ${zipClassification.metadataFiles.length} companion metadata file(s) from ZIP archives.`, "success");
@@ -816,7 +1010,7 @@ export const EnrichmentWorkbench: React.FC = () => {
             ]);
         }
         const geospatialItems: UploadItem[] = [
-            ...zipPackages.map((file) => ({
+            ...dedupedZipPackages.map((file) => ({
                 id: `upload-${crypto.randomUUID()}`,
                 kind: "geospatial" as const,
                 file,
@@ -1007,7 +1201,7 @@ export const EnrichmentWorkbench: React.FC = () => {
                 : null;
             const outputSchema = historicalMapPrompt ? JSON.parse(historicalMapPrompt.definition.output_schema_json) : {};
             const modelParams = normalizeModelParams(selectedModelProfile.defaultModel, selectedModelProfile.modelParams ?? {});
-            const batchDefaults = parseJsonField(batchDefaultsText, defaultBatchDefaults);
+            const batchDefaults = defaultBatchDefaultsPayload();
             const ocrEngineLabel = selectedVisionProfile
                 ? `Google Cloud Vision ${selectedVisionProfile.featureType || "DOCUMENT_TEXT_DETECTION"}`
                 : "OpenAI vision extraction";
@@ -1019,112 +1213,167 @@ export const EnrichmentWorkbench: React.FC = () => {
                 try {
                     if (controller.signal.aborted) throw new Error("Upload processing canceled.");
 
-                    updateUploadItem(item.id, { status: "hashing", message: item.kind === "geospatial" ? "Preparing package and calculating SHA-256 checksum" : "Calculating SHA-256 checksum" });
-                    appendUploadMilestone(item.id, "active", item.kind === "geospatial" ? "Packaging" : "Hashing", item.kind === "geospatial" ? "Building one ZIP payload for the geospatial package." : "Calculating SHA-256 checksum in the browser.");
-                    const packagePayload = item.kind === "geospatial"
-                        ? await buildGeospatialPackageBuffer(item)
-                        : { buffer: await item.file.arrayBuffer(), fileName: item.file.name, sourceFileCount: 1 };
-                    const buffer = packagePayload.buffer;
-                    const checksum = await checksumArrayBuffer(buffer);
-                    appendUploadMilestone(item.id, "done", "Checksum ready", `sha256:${checksum}`);
-                    if (controller.signal.aborted) throw new Error("Upload processing canceled.");
-
-                    updateUploadItem(item.id, {
-                        checksum,
-                        status: "processing",
-                        message: item.kind === "geospatial"
-                            ? "Uploading package, analyzing GIS metadata, and creating vector derivatives"
-                            : `Uploading original, building IIIF tiles, and extracting text with ${ocrEngineLabel}`,
-                        error: undefined,
-                    });
                     setStatus(`Processing ${index + 1} / ${queued.length}: ${item.name}`);
-
                     const jobId = `upload-${crypto.randomUUID()}`;
                     appendUploadMilestone(item.id, "active", "Proxy request started", `Job ${jobId}. Watch the proxy terminal for [upload:${jobId}] logs.`);
                     const companionMetadata = item.kind === "image" ? metadataForImage(item) : [];
                     const metadataDocuments = await Promise.all(companionMetadata.map((metadata) => readMetadataPayload(metadata.file)));
                     if (metadataDocuments.length > 0) appendUploadMilestone(item.id, "done", "Companion metadata attached", metadataDocuments.map((document) => document.name).join(", "));
-                    let heartbeatCount = 0;
-                    const heartbeat = window.setInterval(() => {
-                        heartbeatCount += 1;
-                        const elapsed = heartbeatCount * 20;
-                        const detail = item.kind === "geospatial"
-                            ? `${formatElapsed(elapsed)} waiting on proxy. The active step may be S3 upload, shapefile analysis, derivative generation, or Aardvark writing.`
-                            : `${formatElapsed(elapsed)} waiting on proxy. The active step may be S3 upload, IIIF tile generation, or ${selectedVisionProfile ? "Google Vision OCR" : "OpenAI extraction"}.`;
+
+                    let response: ProcessUploadedImageResponse | ProcessGeospatialPackageResponse;
+                    if (shouldStreamGeospatialItem(item)) {
+                        const sourceFiles = item.files && item.files.length > 0 ? item.files : [item.file];
                         updateUploadItem(item.id, {
-                            message: `Still processing in proxy: ${detail}`,
+                            status: "processing",
+                            message: `Streaming ${sourceFiles.length} large source file(s) to the proxy for packaging`,
+                            error: undefined,
                         });
-                        console.debug("[Upload pipeline]", { file: item.name, jobId, elapsedSeconds: elapsed, phase: "proxy-wait" });
-                        if (heartbeatCount % 3 === 0) {
-                            appendUploadMilestone(item.id, "active", "Still waiting on proxy", detail);
-                        }
-                    }, 20_000);
-                    let response;
-                    try {
-                        if (item.kind === "geospatial") {
-                            response = await enrichmentProxyClient.processGeospatialPackage({
+                        appendUploadMilestone(item.id, "active", "Streaming to proxy", "Large expanded geospatial packages are packaged by the proxy to avoid browser memory limits.");
+                        let heartbeatCount = 0;
+                        let streamingPhase = "streaming files to the proxy";
+                        const heartbeat = window.setInterval(() => {
+                            heartbeatCount += 1;
+                            const elapsed = heartbeatCount * 20;
+                            const detail = `${formatElapsed(elapsed)} while ${streamingPhase}. Large geospatial packages may spend most of their time in upload, ZIP packaging, S3 multipart upload, or COG generation.`;
+                            updateUploadItem(item.id, { message: `Still processing in proxy: ${detail}` });
+                            console.debug("[Upload pipeline]", { file: item.name, jobId, elapsedSeconds: elapsed, phase: "large-geospatial-stream" });
+                            if (heartbeatCount % 3 === 0) appendUploadMilestone(item.id, "active", "Still waiting on proxy", detail);
+                        }, 20_000);
+                        try {
+                            const session = await enrichmentProxyClient.createGeospatialUploadSession({
                                 jobId,
                                 storageProfileId: selectedStorageProfile.id,
                                 modelProfileId: selectedModelProfile.id,
-                                file: {
-                                    name: packagePayload.fileName,
-                                    type: "application/zip",
-                                    size: buffer.byteLength,
-                                    checksum,
-                                    base64: base64FromArrayBuffer(buffer),
-                                    sourceFileCount: packagePayload.sourceFileCount,
-                                },
-                                checksum,
                                 model: selectedModelProfile.defaultModel,
                                 modelParams,
                                 batchDefaults,
+                                forceReprocess: reprocessExistingUploads,
+                                fileName: item.name,
                             }, controller.signal);
-                        } else {
-                            const promptVersion = historicalMapPrompt?.promptVersion;
-                            if (!promptVersion) throw new Error("Historical map prompt was not loaded.");
-                            response = await enrichmentProxyClient.processUploadedImage({
+                            for (let fileIndex = 0; fileIndex < sourceFiles.length; fileIndex += 1) {
+                                const sourceFile = sourceFiles[fileIndex];
+                                const pathName = relativePathForFile(sourceFile);
+                                streamingPhase = `streaming ${fileIndex + 1} / ${sourceFiles.length}: ${pathName}`;
+                                updateUploadItem(item.id, { message: streamingPhase });
+                                const uploaded = await enrichmentProxyClient.uploadGeospatialSessionFile(session.sessionId, pathName, sourceFile, controller.signal);
+                                appendUploadMilestone(item.id, "done", "Streamed file", `${uploaded.path} · ${formatBytes(uploaded.size)} · sha256:${uploaded.checksum}`);
+                            }
+                            streamingPhase = "proxy-side ZIP packaging, checksumming, S3 upload, and derivative generation";
+                            appendUploadMilestone(item.id, "active", "Proxy packaging started", "The proxy is creating the ZIP payload, computing checksums, uploading to S3, and generating derivatives.");
+                            response = await enrichmentProxyClient.completeGeospatialUploadSession(session.sessionId, {
                                 jobId,
                                 storageProfileId: selectedStorageProfile.id,
                                 modelProfileId: selectedModelProfile.id,
-                                visionProfileId: selectedVisionProfile?.id,
-                                file: {
-                                    name: item.file.name,
-                                    type: item.file.type,
-                                    size: item.file.size,
-                                    checksum,
-                                    base64: base64FromArrayBuffer(buffer),
-                                },
-                                checksum,
-                                systemPrompt: String(promptVersion.system_prompt || ""),
-                                userPrompt: String(promptVersion.user_prompt_template || "")
-                                    .replaceAll("{{asset_id}}", checksum)
-                                    .replaceAll("{{file_name}}", item.file.name),
                                 model: selectedModelProfile.defaultModel,
                                 modelParams,
-                                outputSchema,
                                 batchDefaults,
-                                metadataDocuments,
+                                forceReprocess: reprocessExistingUploads,
+                                fileName: item.name,
                             }, controller.signal);
+                            updateUploadItem(item.id, { checksum: response.checksum });
+                        } finally {
+                            window.clearInterval(heartbeat);
                         }
-                    } finally {
-                        window.clearInterval(heartbeat);
+                    } else {
+                        updateUploadItem(item.id, { status: "hashing", message: item.kind === "geospatial" ? "Preparing package and calculating SHA-256 checksum" : "Calculating SHA-256 checksum" });
+                        appendUploadMilestone(item.id, "active", item.kind === "geospatial" ? "Packaging" : "Hashing", item.kind === "geospatial" ? "Building one ZIP payload for the geospatial package." : "Calculating SHA-256 checksum in the browser.");
+                        const packagePayload = item.kind === "geospatial"
+                            ? await buildGeospatialPackageBuffer(item)
+                            : { buffer: await item.file.arrayBuffer(), fileName: item.file.name, sourceFileCount: 1 };
+                        const buffer = packagePayload.buffer;
+                        const checksum = await checksumArrayBuffer(buffer);
+                        appendUploadMilestone(item.id, "done", "Checksum ready", `sha256:${checksum}`);
+                        if (controller.signal.aborted) throw new Error("Upload processing canceled.");
+
+                        updateUploadItem(item.id, {
+                            checksum,
+                            status: "processing",
+                            message: item.kind === "geospatial"
+                                ? "Uploading package, analyzing GIS metadata, and creating vector derivatives"
+                                : `Uploading original, building IIIF tiles, and extracting text with ${ocrEngineLabel}`,
+                            error: undefined,
+                        });
+                        let heartbeatCount = 0;
+                        const heartbeat = window.setInterval(() => {
+                            heartbeatCount += 1;
+                            const elapsed = heartbeatCount * 20;
+                            const detail = item.kind === "geospatial"
+                                ? `${formatElapsed(elapsed)} waiting on proxy. The active step may be S3 upload, shapefile analysis, derivative generation, or Aardvark writing.`
+                                : `${formatElapsed(elapsed)} waiting on proxy. The active step may be S3 upload, IIIF tile generation, or ${selectedVisionProfile ? "Google Vision OCR" : "OpenAI extraction"}.`;
+                            updateUploadItem(item.id, {
+                                message: `Still processing in proxy: ${detail}`,
+                            });
+                            console.debug("[Upload pipeline]", { file: item.name, jobId, elapsedSeconds: elapsed, phase: "proxy-wait" });
+                            if (heartbeatCount % 3 === 0) {
+                                appendUploadMilestone(item.id, "active", "Still waiting on proxy", detail);
+                            }
+                        }, 20_000);
+                        try {
+                            if (item.kind === "geospatial") {
+                                response = await enrichmentProxyClient.processGeospatialPackage({
+                                    jobId,
+                                    storageProfileId: selectedStorageProfile.id,
+                                    modelProfileId: selectedModelProfile.id,
+                                    file: {
+                                        name: packagePayload.fileName,
+                                        type: "application/zip",
+                                        size: buffer.byteLength,
+                                        checksum,
+                                        base64: base64FromArrayBuffer(buffer),
+                                        sourceFileCount: packagePayload.sourceFileCount,
+                                    },
+                                    checksum,
+                                    forceReprocess: reprocessExistingUploads,
+                                    model: selectedModelProfile.defaultModel,
+                                    modelParams,
+                                    batchDefaults,
+                                }, controller.signal);
+                            } else {
+                                const promptVersion = historicalMapPrompt?.promptVersion;
+                                if (!promptVersion) throw new Error("Historical map prompt was not loaded.");
+                                response = await enrichmentProxyClient.processUploadedImage({
+                                    jobId,
+                                    storageProfileId: selectedStorageProfile.id,
+                                    modelProfileId: selectedModelProfile.id,
+                                    visionProfileId: selectedVisionProfile?.id,
+                                    file: {
+                                        name: item.file.name,
+                                        type: item.file.type,
+                                        size: item.file.size,
+                                        checksum,
+                                        base64: base64FromArrayBuffer(buffer),
+                                        modifiedAt: Number.isFinite(item.file.lastModified) && item.file.lastModified > 0 ? new Date(item.file.lastModified).toISOString() : undefined,
+                                    },
+                                    checksum,
+                                    forceReprocess: reprocessExistingUploads,
+                                    systemPrompt: String(promptVersion.system_prompt || ""),
+                                    userPrompt: String(promptVersion.user_prompt_template || "")
+                                        .replaceAll("{{asset_id}}", checksum)
+                                        .replaceAll("{{file_name}}", item.file.name),
+                                    model: selectedModelProfile.defaultModel,
+                                    modelParams,
+                                    outputSchema,
+                                    batchDefaults,
+                                    metadataDocuments,
+                                }, controller.signal);
+                            }
+                        } finally {
+                            window.clearInterval(heartbeat);
+                        }
                     }
                     appendProxyMilestones(item.id, response.proxyMilestones);
                     appendUploadMilestone(item.id, "done", "Proxy response received", item.kind === "geospatial" ? "Geospatial artifacts and Aardvark JSON returned." : response.cached ? "Existing S3 artifacts reused." : "S3 artifacts and extraction response returned.");
                     if (controller.signal.aborted) throw new Error("Upload processing canceled.");
 
                     updateUploadItem(item.id, { status: "publishing", message: "Publishing Aardvark metadata into DuckDB" });
-                    appendUploadMilestone(item.id, "active", "DuckDB publish started", "Upserting resource and distribution rows.");
-                    const resource = resourceFromJson(response.aardvarkJson);
-                    const distributions: Distribution[] = (response.distributions || []).map((distribution) => ({
-                        resource_id: resource.id,
-                        relation_key: String(distribution.relation_key),
-                        url: String(distribution.url),
-                        label: distribution.label ? String(distribution.label) : undefined,
-                    }));
-                    await withTimeout(upsertResource(resource, distributions), `Publishing ${item.name}`, 30_000);
+                    appendUploadMilestone(item.id, "active", "Local catalog publish started", "Upserting resource rows and saving the restore overlay.");
+                    const { resource } = await withTimeout(
+                        publishAardvarkResponseToLocalCatalog(response, { label: item.name }),
+                        `Publishing ${item.name}`,
+                        30_000,
+                    );
                     published += 1;
-                    appendUploadMilestone(item.id, "done", "DuckDB publish complete", resource.id);
+                    appendUploadMilestone(item.id, "done", "Local catalog save verified", `${resource.id} read back from DuckDB and IndexedDB.`);
                     const responseConfidence = "confidence" in response ? response.confidence : undefined;
                     const responseReviewPayload = item.kind === "geospatial"
                         ? ("manifest" in response ? response.manifest : undefined)
@@ -1204,7 +1453,7 @@ export const EnrichmentWorkbench: React.FC = () => {
 
             startRegenerationProgress(resources.length);
             const modelParams = normalizeModelParams(selectedModelProfile.defaultModel, selectedModelProfile.modelParams ?? {});
-            const batchDefaults = parseJsonField(batchDefaultsText, defaultBatchDefaults);
+            const batchDefaults = defaultBatchDefaultsPayload();
             let published = 0;
             let failed = 0;
 
@@ -1267,14 +1516,11 @@ export const EnrichmentWorkbench: React.FC = () => {
                         detail: response.resourceId,
                     });
 
-                    const resource = resourceFromJson(response.aardvarkJson);
-                    const distributions: Distribution[] = (response.distributions || []).map((distribution) => ({
-                        resource_id: resource.id,
-                        relation_key: String(distribution.relation_key),
-                        url: String(distribution.url),
-                        label: distribution.label ? String(distribution.label) : undefined,
-                    }));
-                    await withTimeout(upsertResource(resource, distributions), `Publishing ${name}`, 30_000);
+                    const { resource } = await withTimeout(
+                        publishAardvarkResponseToLocalCatalog(response, { label: name }),
+                        `Publishing ${name}`,
+                        30_000,
+                    );
                     published += 1;
                     updateRunProgress({
                         completed: published,
@@ -1285,7 +1531,7 @@ export const EnrichmentWorkbench: React.FC = () => {
                     }, {
                         status: "done",
                         label: `Published ${resource.id}`,
-                        detail: resource.dct_title_s,
+                        detail: `${resource.dct_title_s || name} saved to DuckDB and IndexedDB.`,
                     });
                 } catch (error: any) {
                     if (String(error.message || "").includes("canceled")) throw error;
@@ -1409,14 +1655,11 @@ export const EnrichmentWorkbench: React.FC = () => {
                         detail: response.resourceId,
                     });
 
-                    const resource = resourceFromJson(response.aardvarkJson);
-                    const distributions: Distribution[] = (response.distributions || []).map((distribution) => ({
-                        resource_id: resource.id,
-                        relation_key: String(distribution.relation_key),
-                        url: String(distribution.url),
-                        label: distribution.label ? String(distribution.label) : undefined,
-                    }));
-                    await withTimeout(upsertResource(resource, distributions), `Publishing ${name}`, 30_000);
+                    const { resource } = await withTimeout(
+                        publishAardvarkResponseToLocalCatalog(response, { label: name }),
+                        `Publishing ${name}`,
+                        30_000,
+                    );
                     published += 1;
                     updateRunProgress({
                         completed: published,
@@ -1427,7 +1670,7 @@ export const EnrichmentWorkbench: React.FC = () => {
                     }, {
                         status: "done",
                         label: `Published ${resource.id}`,
-                        detail: resource.dct_title_s,
+                        detail: `${resource.dct_title_s || name} saved to DuckDB and IndexedDB.`,
                     });
                 } catch (error: any) {
                     if (String(error.message || "").includes("canceled")) throw error;
@@ -1607,6 +1850,34 @@ export const EnrichmentWorkbench: React.FC = () => {
         });
     };
 
+    const uploadActionControls = (
+        <div className="flex flex-wrap items-center gap-2">
+            <button type="button" onClick={processUploads} disabled={isBusy || isRestoring || processableUploadCount === 0 || !selectedStorageId || !selectedModelId} className="rounded bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white disabled:opacity-40">
+                {isUploading ? "Processing..." : "Process Uploads"}
+            </button>
+            <button type="button" onClick={regenerateAardvarkFromS3} disabled={isBusy || isRestoring || !selectedStorageId || !selectedModelId} className="rounded border border-indigo-300 px-3 py-1.5 text-xs font-medium text-indigo-700 disabled:opacity-40 dark:border-indigo-700 dark:text-indigo-200">
+                {isRegenerating ? "Regenerating..." : "Regenerate S3 Aardvark"}
+            </button>
+            <button type="button" onClick={refreshLocalAardvarkFromS3} disabled={isBusy || isRestoring || !selectedStorageId} className="rounded border border-emerald-300 px-3 py-1.5 text-xs font-medium text-emerald-700 disabled:opacity-40 dark:border-emerald-700 dark:text-emerald-200">
+                {isRefreshing ? "Refreshing..." : "Refresh Local from S3"}
+            </button>
+            {isUploading && <button type="button" onClick={cancelUpload} className="rounded border border-amber-300 px-3 py-1.5 text-xs text-amber-800 dark:border-amber-700 dark:text-amber-200">Cancel</button>}
+            {isRegenerating && <button type="button" onClick={cancelRun} className="rounded border border-amber-300 px-3 py-1.5 text-xs text-amber-800 dark:border-amber-700 dark:text-amber-200">Cancel Regeneration</button>}
+            {isRefreshing && <button type="button" onClick={cancelRun} className="rounded border border-amber-300 px-3 py-1.5 text-xs text-amber-800 dark:border-amber-700 dark:text-amber-200">Cancel Refresh</button>}
+            <button type="button" onClick={clearFinishedUploads} disabled={isUploading || completedUploadCount === 0} className="rounded border border-gray-300 px-3 py-1.5 text-xs disabled:opacity-40 dark:border-slate-700">Clear Finished</button>
+            <label className="flex items-center gap-2 rounded border border-gray-200 px-2 py-1.5 text-xs text-slate-700 dark:border-slate-700 dark:text-slate-200">
+                <input
+                    type="checkbox"
+                    checked={reprocessExistingUploads}
+                    onChange={(event) => setReprocessExistingUploads(event.currentTarget.checked)}
+                    disabled={isUploading}
+                    className="h-3.5 w-3.5"
+                />
+                Re-process existing
+            </label>
+        </div>
+    );
+
     return (
         <div className="flex h-full min-h-0 flex-col gap-4">
             <div className="flex flex-wrap items-center gap-2 border-b border-gray-200 pb-3 dark:border-slate-800">
@@ -1654,6 +1925,18 @@ export const EnrichmentWorkbench: React.FC = () => {
                             </div>
                         </div>
                     )}
+                    <div className="sticky top-0 z-10 rounded-lg border border-gray-200 bg-white/95 p-3 text-xs shadow-sm backdrop-blur dark:border-slate-800 dark:bg-slate-900/95">
+                        <div className="flex flex-wrap items-center gap-3">
+                            <div className="min-w-0 flex-1">
+                                <div className="font-semibold text-slate-900 dark:text-slate-100">Batch Actions</div>
+                                <div className="text-slate-500 dark:text-slate-400">
+                                    {processableUploadCount} waiting · {completedUploadCount} published · {metadataItems.length} companion metadata file{metadataItems.length === 1 ? "" : "s"}
+                                    {!reprocessExistingUploads ? " · accessioned items will be skipped" : " · full reprocessing enabled"}
+                                </div>
+                            </div>
+                            {uploadActionControls}
+                        </div>
+                    </div>
                     <div className="grid grid-cols-1 gap-3 lg:grid-cols-[minmax(320px,420px)_1fr]">
                         <section className="rounded-lg border border-gray-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
                             <div className="grid grid-cols-1 gap-3 text-xs">
@@ -1706,36 +1989,92 @@ export const EnrichmentWorkbench: React.FC = () => {
                                 >
                                     Choose Folder
                                 </button>
-                                {metadataItems.length > 0 && (
+                                {folderScanSummary && (
                                     <div className="rounded-md border border-gray-200 bg-gray-50 p-2 dark:border-slate-800 dark:bg-slate-950/50">
-                                        <div className="mb-1 text-[11px] font-semibold uppercase text-slate-500 dark:text-slate-400">Companion Metadata</div>
-                                        <div className="flex flex-col gap-1">
-                                            {metadataItems.map((item) => (
-                                                <div key={item.id} className="flex items-center gap-2 rounded bg-white px-2 py-1 dark:bg-slate-900">
+                                        <div className="mb-2 flex flex-wrap items-center gap-2">
+                                            <div className="min-w-0 flex-1">
+                                                <div className="truncate text-[11px] font-semibold uppercase text-slate-500 dark:text-slate-400">Folder Scan</div>
+                                                <div className="truncate font-medium text-slate-900 dark:text-slate-100">{folderScanSummary.rootName}</div>
+                                            </div>
+                                            <div className="text-right text-[11px] text-slate-500 dark:text-slate-400">
+                                                {folderScanSummary.totalFiles.toLocaleString()} files
+                                            </div>
+                                        </div>
+                                        <div className="mb-2 grid grid-cols-2 gap-1 text-[11px] text-slate-600 dark:text-slate-300">
+                                            <span>{folderScanSummary.geospatialCount} geospatial package{folderScanSummary.geospatialCount === 1 ? "" : "s"}</span>
+                                            <span>{folderScanSummary.imageCount} image{folderScanSummary.imageCount === 1 ? "" : "s"}</span>
+                                            <span>{folderScanSummary.metadataCount} metadata file{folderScanSummary.metadataCount === 1 ? "" : "s"}</span>
+                                            <span>{folderScanSummary.ignoredCount} ignored</span>
+                                        </div>
+                                        <div className="max-h-44 overflow-auto rounded border border-gray-100 bg-white dark:border-slate-800 dark:bg-slate-900">
+                                            {folderScanSummary.topLevelItems.slice(0, 28).map((item) => (
+                                                <div key={`${item.kind}:${item.name}`} className="flex items-center gap-2 border-b border-gray-100 px-2 py-1 last:border-b-0 dark:border-slate-800">
                                                     <span className="min-w-0 flex-1 truncate font-mono">{item.name}</span>
-                                                    <span className="shrink-0 text-slate-500 dark:text-slate-400">{formatBytes(item.size)}</span>
-                                                    <button type="button" onClick={() => removeMetadataItem(item.id)} disabled={isUploading} className="shrink-0 rounded border border-gray-300 px-1.5 py-0.5 disabled:opacity-40 dark:border-slate-700">Remove</button>
+                                                    <span className="shrink-0 text-slate-500 dark:text-slate-400">
+                                                        {item.kind === "directory" ? `${item.fileCount.toLocaleString()} files` : formatBytes(item.size)}
+                                                    </span>
                                                 </div>
                                             ))}
+                                            {folderScanSummary.topLevelItems.length > 28 && (
+                                                <div className="px-2 py-1 text-slate-500 dark:text-slate-400">
+                                                    + {(folderScanSummary.topLevelItems.length - 28).toLocaleString()} more top-level item{folderScanSummary.topLevelItems.length - 28 === 1 ? "" : "s"}
+                                                </div>
+                                            )}
                                         </div>
                                     </div>
                                 )}
-                                <div className="flex flex-wrap items-center gap-2">
-                                    <button type="button" onClick={processUploads} disabled={isBusy || isRestoring || processableUploadCount === 0 || !selectedStorageId || !selectedModelId} className="rounded bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white disabled:opacity-40">
-                                        {isUploading ? "Processing..." : "Process Uploads"}
-                                    </button>
-                                    <button type="button" onClick={regenerateAardvarkFromS3} disabled={isBusy || isRestoring || !selectedStorageId || !selectedModelId} className="rounded border border-indigo-300 px-3 py-1.5 text-xs font-medium text-indigo-700 disabled:opacity-40 dark:border-indigo-700 dark:text-indigo-200">
-                                        {isRegenerating ? "Regenerating..." : "Regenerate S3 Aardvark"}
-                                    </button>
-                                    <button type="button" onClick={refreshLocalAardvarkFromS3} disabled={isBusy || isRestoring || !selectedStorageId} className="rounded border border-emerald-300 px-3 py-1.5 text-xs font-medium text-emerald-700 disabled:opacity-40 dark:border-emerald-700 dark:text-emerald-200">
-                                        {isRefreshing ? "Refreshing..." : "Refresh Local from S3"}
-                                    </button>
-                                    {isUploading && <button type="button" onClick={cancelUpload} className="rounded border border-amber-300 px-3 py-1.5 text-xs text-amber-800 dark:border-amber-700 dark:text-amber-200">Cancel</button>}
-                                    {isRegenerating && <button type="button" onClick={cancelRun} className="rounded border border-amber-300 px-3 py-1.5 text-xs text-amber-800 dark:border-amber-700 dark:text-amber-200">Cancel Regeneration</button>}
-                                    {isRefreshing && <button type="button" onClick={cancelRun} className="rounded border border-amber-300 px-3 py-1.5 text-xs text-amber-800 dark:border-amber-700 dark:text-amber-200">Cancel Refresh</button>}
-                                    <button type="button" onClick={clearFinishedUploads} disabled={isUploading || completedUploadCount === 0} className="rounded border border-gray-300 px-3 py-1.5 text-xs disabled:opacity-40 dark:border-slate-700">Clear Finished</button>
-                                </div>
-                                <textarea value={batchDefaultsText} onChange={(e) => setBatchDefaultsText(e.target.value)} className="h-52 w-full rounded border px-2 py-1 font-mono text-xs dark:border-slate-700 dark:bg-slate-950" />
+                                {metadataItems.length > 0 && (
+                                    <div className="rounded-md border border-gray-200 bg-gray-50 p-2 dark:border-slate-800 dark:bg-slate-950/50">
+                                        <div className="mb-2 flex flex-wrap items-center gap-2">
+                                            <div className="min-w-0 flex-1">
+                                                <div className="text-[11px] font-semibold uppercase text-slate-500 dark:text-slate-400">Companion Metadata</div>
+                                                <div className="text-slate-600 dark:text-slate-300">
+                                                    {metadataItems.length.toLocaleString()} file{metadataItems.length === 1 ? "" : "s"} grouped by top-level source
+                                                </div>
+                                            </div>
+                                            <button
+                                                type="button"
+                                                onClick={() => setMetadataItems([])}
+                                                disabled={isUploading}
+                                                className="rounded border border-gray-300 px-2 py-1 text-[11px] disabled:opacity-40 dark:border-slate-700"
+                                            >
+                                                Clear
+                                            </button>
+                                        </div>
+                                        <div className="rounded border border-gray-100 bg-white dark:border-slate-800 dark:bg-slate-900">
+                                            {metadataSourceGroups.slice(0, 10).map((group) => (
+                                                <div key={group.name} className="flex items-center gap-2 border-b border-gray-100 px-2 py-1 last:border-b-0 dark:border-slate-800">
+                                                    <span className="min-w-0 flex-1 truncate font-mono">{group.name}</span>
+                                                    <span className="shrink-0 text-slate-500 dark:text-slate-400">
+                                                        {group.fileCount.toLocaleString()} file{group.fileCount === 1 ? "" : "s"} · {formatBytes(group.size)}
+                                                    </span>
+                                                </div>
+                                            ))}
+                                            {metadataSourceGroups.length > 10 && (
+                                                <div className="px-2 py-1 text-slate-500 dark:text-slate-400">
+                                                    + {(metadataSourceGroups.length - 10).toLocaleString()} more metadata source{metadataSourceGroups.length - 10 === 1 ? "" : "s"}
+                                                </div>
+                                            )}
+                                        </div>
+                                        <details className="mt-2">
+                                            <summary className="cursor-pointer text-[11px] font-medium text-indigo-700 dark:text-indigo-300">Show individual files</summary>
+                                            <div className="mt-2 max-h-52 overflow-auto rounded border border-gray-100 bg-white dark:border-slate-800 dark:bg-slate-900">
+                                                {metadataItems.slice(0, 80).map((item) => (
+                                                    <div key={item.id} className="flex items-center gap-2 border-b border-gray-100 px-2 py-1 last:border-b-0 dark:border-slate-800">
+                                                        <span className="min-w-0 flex-1 truncate font-mono">{item.sourcePath || item.name}</span>
+                                                        <span className="shrink-0 text-slate-500 dark:text-slate-400">{formatBytes(item.size)}</span>
+                                                        <button type="button" onClick={() => removeMetadataItem(item.id)} disabled={isUploading} className="shrink-0 rounded border border-gray-300 px-1.5 py-0.5 disabled:opacity-40 dark:border-slate-700">Remove</button>
+                                                    </div>
+                                                ))}
+                                                {metadataItems.length > 80 && (
+                                                    <div className="px-2 py-1 text-slate-500 dark:text-slate-400">
+                                                        + {(metadataItems.length - 80).toLocaleString()} more file{metadataItems.length - 80 === 1 ? "" : "s"}
+                                                    </div>
+                                                )}
+                                            </div>
+                                        </details>
+                                    </div>
+                                )}
                             </div>
                         </section>
 
@@ -1774,15 +2113,19 @@ export const EnrichmentWorkbench: React.FC = () => {
                                                 {item.resourceId && <div className="mt-1 truncate text-emerald-700 dark:text-emerald-300">Published {item.resourceId}{item.confidence != null ? ` · confidence ${item.confidence}` : ""}</div>}
                                                 {item.artifacts && (
                                                     <div className="mt-2 flex flex-wrap gap-2">
+                                                        {item.resourceId && <a className="rounded border border-emerald-200 px-2 py-1 text-emerald-700 hover:bg-emerald-50 dark:border-emerald-800 dark:text-emerald-300 dark:hover:bg-emerald-950/40" href={resourcePageHref(item.resourceId)} target="_blank" rel="noreferrer">Resource Page</a>}
                                                         <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.originalUrl} target="_blank" rel="noreferrer">Original</a>
                                                         {item.artifacts.thumbnailUrl && <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.thumbnailUrl} target="_blank" rel="noreferrer">Thumbnail</a>}
                                                         {item.artifacts.iiifInfoUrl && <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.iiifInfoUrl} target="_blank" rel="noreferrer">IIIF</a>}
                                                         {item.artifacts.extractionUrl && <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.extractionUrl} target="_blank" rel="noreferrer">Extraction</a>}
+                                                        {item.artifacts.aiEnrichmentsUrl && <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.aiEnrichmentsUrl} target="_blank" rel="noreferrer">AI Enrichments</a>}
                                                         {item.artifacts.manifestUrl && <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.manifestUrl} target="_blank" rel="noreferrer">Manifest</a>}
                                                         {item.artifacts.geojsonUrl && <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.geojsonUrl} target="_blank" rel="noreferrer">GeoJSON</a>}
                                                         {item.artifacts.geoParquetUrl && <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.geoParquetUrl} target="_blank" rel="noreferrer">GeoParquet</a>}
                                                         {item.artifacts.pmtilesUrl && <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.pmtilesUrl} target="_blank" rel="noreferrer">PMTiles</a>}
                                                         {item.artifacts.cogUrl && <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.cogUrl} target="_blank" rel="noreferrer">COG</a>}
+                                                        {item.artifacts.archivalSupplementUrl && <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.archivalSupplementUrl} target="_blank" rel="noreferrer">Accession</a>}
+                                                        {item.artifacts.archivalSupplementJsonUrl && <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.archivalSupplementJsonUrl} target="_blank" rel="noreferrer">Accession JSON</a>}
                                                         <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.aardvarkUrl} target="_blank" rel="noreferrer">Aardvark</a>
                                                     </div>
                                                 )}
@@ -1989,6 +2332,8 @@ export const EnrichmentWorkbench: React.FC = () => {
                                         { key: "thumbnail", ok: resource.hasThumbnail, href: resource.artifacts.thumbnailUrl },
                                         { key: "iiif", ok: resource.hasIiif, href: resource.artifacts.iiifInfoUrl },
                                         { key: "extraction", ok: resource.hasExtraction, href: resource.artifacts.extractionUrl },
+                                        { key: "ai", ok: Boolean(resource.hasAiEnrichments), href: resource.artifacts.aiEnrichmentsUrl || "" },
+                                        { key: "accession", ok: Boolean(resource.hasArchivalSupplement), href: resource.artifacts.archivalSupplementUrl || "" },
                                         { key: "aardvark", ok: resource.hasAardvark, href: resource.artifacts.aardvarkUrl },
                                     ];
                                     return (

@@ -73,6 +73,8 @@ Use `Regenerate S3 Aardvark` when the extraction response and derivative assets 
 
 Inventory sync remains available for staged S3 assets, prompt response review, and draft workflows. Prompt responses and draft provenance are kept in DuckDB/IndexedDB and in `records.duckdb` exports. Aardvark JSON exports remain clean.
 
+For shareable provenance, the project now drafts a companion `ai-enrichments.json` standard alongside `aardvark.json`. The companion document is designed to hold OpenAI/Google Vision prompts and responses, extracted map text, derived placenames, field evidence, and query-time indexing hints while keeping Aardvark focused on reviewed catalog metadata. New image-processing runs write `ai-enrichments.json` beside `aardvark.json` and preserve the exact rendered OpenAI prompts, provider, model, model parameters, request payload with binary image bytes redacted, and raw/parsed provider responses. See [OpenGeoMetadata AI Enrichments](ai-enrichments.md) and the schema at [`schemas/ai-enrichments/schema.json`](../schemas/ai-enrichments/schema.json).
+
 ## Geospatial Package Uploads
 
 For GIS datasets made of several sibling files, submit one logical package per dataset. A `.zip` file is the canonical format. The browser also accepts loose shapefile sidecars dropped together, such as `.shp`, `.shx`, `.dbf`, `.prj`, `.cpg`, `.sbn`, `.sbx`, `.qix`, and `.shp.xml`; it groups files by basename and creates the ZIP payload before sending it to the proxy.

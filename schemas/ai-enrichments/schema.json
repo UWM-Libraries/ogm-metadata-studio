@@ -1,0 +1,823 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opengeometadata.org/schema/ai-enrichments/schema.json",
+  "title": "OpenGeoMetadata AI Enrichments",
+  "description": "A companion metadata document for Aardvark records that preserves AI/OCR provenance, third-party API prompts and responses, extracted map text, derived placenames, and the derived metadata record used for OpenGeoMetadata-style discovery.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "standard",
+    "resourceId",
+    "createdAt",
+    "generatedBy",
+    "sourceAssets",
+    "apiCalls",
+    "prompts",
+    "extractedMapText",
+    "derivedPlacenames",
+    "derivedMetadata"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "const": "0.1.0",
+      "description": "Version of the OpenGeoMetadata AI Enrichments schema used by this document."
+    },
+    "standard": {
+      "type": "string",
+      "const": "OpenGeoMetadata AI Enrichments"
+    },
+    "resourceId": {
+      "$ref": "#/$defs/nonEmptyString",
+      "description": "Identifier of the accompanying Aardvark record. This SHOULD match aardvark.json/id."
+    },
+    "createdAt": {
+      "$ref": "#/$defs/dateTimeString"
+    },
+    "updatedAt": {
+      "$ref": "#/$defs/dateTimeString"
+    },
+    "generatedBy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "$ref": "#/$defs/nonEmptyString" },
+        "version": { "type": "string" },
+        "url": { "$ref": "#/$defs/uriString" },
+        "workflow": { "type": "string" },
+        "workflowVersion": { "type": "string" },
+        "environment": { "type": "string" },
+        "notes": { "type": "string" }
+      }
+    },
+    "sourceAssets": {
+      "type": "array",
+      "description": "Original files, image derivatives, OCR inputs, companion metadata, and other source artifacts used to generate the enrichment.",
+      "items": { "$ref": "#/$defs/sourceAsset" }
+    },
+    "artifacts": {
+      "type": "object",
+      "description": "URLs or checksums for sibling and derivative artifacts produced by the enrichment workflow.",
+      "additionalProperties": false,
+      "properties": {
+        "aardvarkJson": { "$ref": "#/$defs/link" },
+        "aiEnrichmentsJson": { "$ref": "#/$defs/link" },
+        "legacyEnrichmentResponse": { "$ref": "#/$defs/link" },
+        "original": { "$ref": "#/$defs/link" },
+        "thumbnail": { "$ref": "#/$defs/link" },
+        "iiifImage": { "$ref": "#/$defs/link" },
+        "cloudOptimizedGeoTiff": { "$ref": "#/$defs/link" },
+        "archivalSupplement": { "$ref": "#/$defs/link" },
+        "archivalSupplementJson": { "$ref": "#/$defs/link" },
+        "metadataSources": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/link" }
+        },
+        "derivatives": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/link" }
+        }
+      }
+    },
+    "apiCalls": {
+      "type": "array",
+      "description": "Every third-party API interaction used to create the enrichment, including OCR, OpenAI extraction, OpenAI metadata writing, geocoding, embedding, or other external services.",
+      "items": { "$ref": "#/$defs/apiCall" }
+    },
+    "prompts": {
+      "type": "array",
+      "description": "Rendered prompts and prompt metadata. API calls that use a prompt SHOULD reference it by id in apiCalls[].promptIds.",
+      "items": { "$ref": "#/$defs/prompt" }
+    },
+    "extractedMapText": {
+      "type": "array",
+      "description": "OCR or vision-derived text printed on the map, using normalized image-space bounding boxes.",
+      "items": { "$ref": "#/$defs/textSegment" }
+    },
+    "textGroups": {
+      "type": "array",
+      "description": "Optional consolidated text labels derived from adjacent OCR text segments, such as grouped street names or multi-word feature labels.",
+      "items": { "$ref": "#/$defs/textGroup" }
+    },
+    "derivedPlacenames": {
+      "type": "array",
+      "description": "Place, feature, and named-map-label candidates derived from the extracted text and optional geocoding.",
+      "items": { "$ref": "#/$defs/placename" }
+    },
+    "mapExtent": {
+      "description": "Estimated geographic map extent, when inferred or known.",
+      "anyOf": [
+        { "$ref": "#/$defs/geoBbox" },
+        { "type": "null" }
+      ]
+    },
+    "description": {
+      "type": "string",
+      "description": "Machine-generated description or summary of the resource, derived from extraction evidence."
+    },
+    "debug": {
+      "type": "object",
+      "description": "Workflow notes, limitations, and strategy summaries. Values SHOULD be non-secret strings or JSON primitives.",
+      "additionalProperties": { "$ref": "#/$defs/jsonValue" }
+    },
+    "derivedMetadata": {
+      "$ref": "#/$defs/derivedMetadata"
+    },
+    "indexingHints": {
+      "$ref": "#/$defs/indexingHints"
+    },
+    "review": {
+      "$ref": "#/$defs/review"
+    },
+    "extensions": {
+      "$ref": "#/$defs/extensions"
+    }
+  },
+  "$defs": {
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "uriString": {
+      "type": "string",
+      "format": "uri"
+    },
+    "dateTimeString": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[A-Fa-f0-9]{64}$"
+    },
+    "jsonValue": {
+      "description": "Any valid JSON value.",
+      "oneOf": [
+        { "type": "null" },
+        { "type": "boolean" },
+        { "type": "number" },
+        { "type": "string" },
+        {
+          "type": "array",
+          "items": { "$ref": "#/$defs/jsonValue" }
+        },
+        {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/jsonValue" }
+        }
+      ]
+    },
+    "extensions": {
+      "type": "object",
+      "description": "Namespaced extension data. Extension keys SHOULD be URI-like or institution-scoped strings.",
+      "additionalProperties": { "$ref": "#/$defs/jsonValue" }
+    },
+    "checksum": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "value"],
+      "properties": {
+        "algorithm": {
+          "type": "string",
+          "enum": ["SHA-256", "SHA-1", "MD5", "ETag", "other"]
+        },
+        "value": { "$ref": "#/$defs/nonEmptyString" },
+        "purpose": { "type": "string" }
+      }
+    },
+    "link": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["url"],
+      "properties": {
+        "url": { "$ref": "#/$defs/uriString" },
+        "label": { "type": "string" },
+        "relation": { "type": "string" },
+        "mediaType": { "type": "string" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "byteSize": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "createdAt": { "$ref": "#/$defs/dateTimeString" },
+        "role": { "type": "string" }
+      }
+    },
+    "sourceAsset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "role"],
+      "properties": {
+        "id": { "$ref": "#/$defs/nonEmptyString" },
+        "role": {
+          "type": "string",
+          "enum": [
+            "original",
+            "ocr_input",
+            "analysis_derivative",
+            "thumbnail",
+            "iiif_image",
+            "cloud_optimized_geotiff",
+            "companion_metadata",
+            "derived_metadata",
+            "other"
+          ]
+        },
+        "fileName": { "type": "string" },
+        "path": { "type": "string" },
+        "url": { "$ref": "#/$defs/uriString" },
+        "mediaType": { "type": "string" },
+        "byteSize": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "modifiedAt": { "$ref": "#/$defs/dateTimeString" },
+        "width": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "checksums": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/checksum" }
+        },
+        "notes": { "type": "string" },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Inline or external request/response payload. Use redacted=true when secrets, keys, cookies, or sensitive source text were removed.",
+      "properties": {
+        "rawJson": { "$ref": "#/$defs/jsonValue" },
+        "rawText": { "type": "string" },
+        "parsedJson": { "$ref": "#/$defs/jsonValue" },
+        "uri": { "$ref": "#/$defs/uriString" },
+        "mediaType": { "type": "string" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "redacted": { "type": "boolean" },
+        "redactionNotes": { "type": "string" }
+      },
+      "anyOf": [
+        { "required": ["rawJson"] },
+        { "required": ["rawText"] },
+        { "required": ["parsedJson"] },
+        { "required": ["uri"] }
+      ]
+    },
+    "message": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "content"],
+      "properties": {
+        "role": {
+          "type": "string",
+          "enum": ["system", "developer", "user", "assistant", "tool", "other"]
+        },
+        "content": { "type": "string" },
+        "mediaType": { "type": "string" },
+        "sourceAssetIds": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "prompt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "purpose", "provider"],
+      "anyOf": [
+        { "required": ["messages"] },
+        { "required": ["systemPrompt"] },
+        { "required": ["userPrompt"] }
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/nonEmptyString" },
+        "label": { "type": "string" },
+        "purpose": { "$ref": "#/$defs/callPurpose" },
+        "provider": { "type": "string" },
+        "model": { "type": "string" },
+        "version": { "type": "string" },
+        "createdAt": { "$ref": "#/$defs/dateTimeString" },
+        "renderedAt": { "$ref": "#/$defs/dateTimeString" },
+        "systemPrompt": { "type": "string" },
+        "userPrompt": { "type": "string" },
+        "messages": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/message" }
+        },
+        "outputSchema": { "$ref": "#/$defs/jsonValue" },
+        "variables": { "$ref": "#/$defs/jsonValue" },
+        "sourceCallId": { "type": "string" },
+        "checksum": { "$ref": "#/$defs/checksum" },
+        "notes": { "type": "string" },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "callPurpose": {
+      "type": "string",
+      "enum": [
+        "map_text_extraction",
+        "ocr",
+        "metadata_generation",
+        "placename_extraction",
+        "geocoding",
+        "embedding",
+        "storage",
+        "validation",
+        "other"
+      ]
+    },
+    "apiCall": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "provider", "purpose", "request", "response"],
+      "properties": {
+        "id": { "$ref": "#/$defs/nonEmptyString" },
+        "sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "provider": {
+          "type": "string",
+          "description": "Examples: openai, google_cloud_vision, aws_s3, geocoding_provider."
+        },
+        "service": { "type": "string" },
+        "endpoint": { "$ref": "#/$defs/uriString" },
+        "method": {
+          "type": "string",
+          "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "other"]
+        },
+        "purpose": { "$ref": "#/$defs/callPurpose" },
+        "model": { "type": "string" },
+        "modelParams": { "$ref": "#/$defs/jsonValue" },
+        "profileId": { "type": "string" },
+        "promptIds": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "sourceAssetIds": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "startedAt": { "$ref": "#/$defs/dateTimeString" },
+        "completedAt": { "$ref": "#/$defs/dateTimeString" },
+        "durationMs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "running", "completed", "failed", "skipped"]
+        },
+        "request": { "$ref": "#/$defs/apiRequest" },
+        "response": { "$ref": "#/$defs/apiResponse" },
+        "error": { "type": "string" },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "apiRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "promptIds": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "systemPrompt": { "type": "string" },
+        "userPrompt": { "type": "string" },
+        "messages": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/message" }
+        },
+        "modelParams": { "$ref": "#/$defs/jsonValue" },
+        "outputSchema": { "$ref": "#/$defs/jsonValue" },
+        "assets": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/link" }
+        },
+        "payload": { "$ref": "#/$defs/payload" },
+        "redactions": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "apiResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "anyOf": [
+        { "required": ["raw"] },
+        { "required": ["parsed"] },
+        { "required": ["error"] }
+      ],
+      "properties": {
+        "statusCode": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 599
+        },
+        "raw": { "$ref": "#/$defs/payload" },
+        "parsed": { "$ref": "#/$defs/payload" },
+        "usage": { "$ref": "#/$defs/jsonValue" },
+        "headers": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "error": { "type": "string" },
+        "redactions": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "normalizedBox": {
+      "type": "array",
+      "description": "Normalized [x1, y1, x2, y2] image-space bounding box measured from the upper-left corner.",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1
+      }
+    },
+    "textRole": {
+      "type": "string",
+      "enum": [
+        "title",
+        "coordinate",
+        "label",
+        "street",
+        "scale",
+        "legend",
+        "publisher",
+        "date",
+        "grid",
+        "marginalia",
+        "other"
+      ]
+    },
+    "textSegment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "content"],
+      "properties": {
+        "id": { "$ref": "#/$defs/nonEmptyString" },
+        "content": { "$ref": "#/$defs/nonEmptyString" },
+        "normalizedContent": { "type": "string" },
+        "role": { "$ref": "#/$defs/textRole" },
+        "language": { "type": "string" },
+        "approxBbox": { "$ref": "#/$defs/normalizedBox" },
+        "confidence": { "$ref": "#/$defs/confidence" },
+        "sourceCallId": { "type": "string" },
+        "sourceResponsePath": { "type": "string" },
+        "sourceAssetIds": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "legacyIndex": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "readingOrder": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "page": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "rotationDegrees": { "type": "number" },
+        "reasoning": { "type": "string" },
+        "raw": { "$ref": "#/$defs/jsonValue" },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "textGroup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "content", "sourceTextIds"],
+      "properties": {
+        "id": { "$ref": "#/$defs/nonEmptyString" },
+        "content": { "$ref": "#/$defs/nonEmptyString" },
+        "normalizedContent": { "type": "string" },
+        "role": { "$ref": "#/$defs/textRole" },
+        "approxBbox": { "$ref": "#/$defs/normalizedBox" },
+        "confidence": { "$ref": "#/$defs/confidence" },
+        "sourceTextIds": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "sourceTextIndices": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "sourceCallId": { "type": "string" },
+        "reasoning": { "type": "string" },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "placename": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name"],
+      "properties": {
+        "id": { "$ref": "#/$defs/nonEmptyString" },
+        "name": { "$ref": "#/$defs/nonEmptyString" },
+        "normalizedName": { "type": "string" },
+        "type": {
+          "type": "string",
+          "enum": [
+            "city",
+            "town",
+            "village",
+            "county",
+            "state_province",
+            "country",
+            "region",
+            "neighborhood",
+            "street",
+            "railroad",
+            "waterbody",
+            "mountain",
+            "landmark",
+            "building",
+            "park",
+            "administrative_area",
+            "other"
+          ]
+        },
+        "sourceTextIds": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "sourceTextIndices": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "approxBbox": { "$ref": "#/$defs/normalizedBox" },
+        "confidence": { "$ref": "#/$defs/confidence" },
+        "authority": { "type": "string" },
+        "authorityId": { "type": "string" },
+        "uri": { "$ref": "#/$defs/uriString" },
+        "coordinates": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["lon", "lat"],
+          "properties": {
+            "lon": {
+              "type": "number",
+              "minimum": -180,
+              "maximum": 180
+            },
+            "lat": {
+              "type": "number",
+              "minimum": -90,
+              "maximum": 90
+            }
+          }
+        },
+        "geocoding": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "sourceCallId": { "type": "string" },
+            "matchType": { "type": "string" },
+            "confidence": { "$ref": "#/$defs/confidence" },
+            "candidates": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/jsonValue" }
+            }
+          }
+        },
+        "status": {
+          "type": "string",
+          "enum": ["candidate", "confirmed", "rejected"]
+        },
+        "sourceCallId": { "type": "string" },
+        "reasoning": { "type": "string" },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "geoBbox": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["west", "south", "east", "north"],
+      "properties": {
+        "west": {
+          "type": "number",
+          "minimum": -180,
+          "maximum": 180
+        },
+        "south": {
+          "type": "number",
+          "minimum": -90,
+          "maximum": 90
+        },
+        "east": {
+          "type": "number",
+          "minimum": -180,
+          "maximum": 180
+        },
+        "north": {
+          "type": "number",
+          "minimum": -90,
+          "maximum": 90
+        },
+        "confidence": { "$ref": "#/$defs/confidence" },
+        "method": { "type": "string" },
+        "reasoning": { "type": "string" },
+        "sourceTextIds": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "sourceCallIds": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "fieldEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["field", "value"],
+      "properties": {
+        "field": { "$ref": "#/$defs/nonEmptyString" },
+        "value": { "$ref": "#/$defs/jsonValue" },
+        "sourceTextIds": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "sourcePlacenameIds": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "sourceCallIds": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "confidence": { "$ref": "#/$defs/confidence" },
+        "reasoning": { "type": "string" },
+        "reviewStatus": {
+          "type": "string",
+          "enum": ["machine_generated", "human_reviewed", "rejected"]
+        }
+      }
+    },
+    "distribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["relationKey", "url"],
+      "properties": {
+        "relationKey": { "$ref": "#/$defs/nonEmptyString" },
+        "url": { "$ref": "#/$defs/uriString" },
+        "label": { "type": "string" }
+      }
+    },
+    "derivedMetadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["standard", "record"],
+      "properties": {
+        "standard": {
+          "type": "string",
+          "const": "Aardvark"
+        },
+        "standardVersion": { "type": "string" },
+        "recordSchema": {
+          "type": "string",
+          "format": "uri",
+          "default": "https://opengeometadata.org/schema/geoblacklight-schema-aardvark.json"
+        },
+        "record": {
+          "type": "object",
+          "description": "The complete derived metadata record. For standard=Aardvark, this SHOULD be the same JSON object published as aardvark.json."
+        },
+        "distributions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/distribution" }
+        },
+        "fieldEvidence": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/fieldEvidence" }
+        },
+        "confidence": { "$ref": "#/$defs/confidence" },
+        "createdFromCallIds": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "normalizationNotes": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "indexValue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["value"],
+      "properties": {
+        "value": { "$ref": "#/$defs/nonEmptyString" },
+        "normalized": { "type": "string" },
+        "sourceIds": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "sourceKind": {
+          "type": "string",
+          "enum": ["map_text", "text_group", "placename", "metadata_field", "api_response", "other"]
+        },
+        "confidence": { "$ref": "#/$defs/confidence" },
+        "boost": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "indexField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["field", "values"],
+      "properties": {
+        "field": { "$ref": "#/$defs/nonEmptyString" },
+        "values": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/nonEmptyString" }
+        },
+        "sourceIds": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "confidence": { "$ref": "#/$defs/confidence" },
+        "boost": {
+          "type": "number",
+          "minimum": 0
+        },
+        "notes": { "type": "string" }
+      }
+    },
+    "indexingHints": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Recommended discovery-index inputs derived from the AI enrichment. These values can be indexed alongside Aardvark without changing aardvark.json.",
+      "properties": {
+        "fullText": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/indexValue" }
+        },
+        "mapText": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/indexValue" }
+        },
+        "placenames": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/indexValue" }
+        },
+        "keywords": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/indexValue" }
+        },
+        "fields": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/indexField" }
+        }
+      }
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["machine_generated", "human_reviewed", "published", "rejected", "deprecated"]
+        },
+        "reviewedBy": { "type": "string" },
+        "reviewedAt": { "$ref": "#/$defs/dateTimeString" },
+        "notes": { "type": "string" },
+        "changes": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/fieldEvidence" }
+        }
+      }
+    }
+  }
+}

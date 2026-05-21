@@ -458,6 +458,7 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
                                         <span className="line-clamp-3 whitespace-pre-wrap text-slate-100">{annotation.content}</span>
                                         <span className="mt-1 flex flex-wrap gap-2 text-[10px] uppercase text-slate-400">
                                             <span>{annotation.role}</span>
+                                            {annotation.source === "text_group" && <span>{annotation.sourceTextIndices?.length || 0} boxes</span>}
                                             {annotation.confidence !== undefined && <span>{Math.round(annotation.confidence * 100)}%</span>}
                                         </span>
                                     </span>

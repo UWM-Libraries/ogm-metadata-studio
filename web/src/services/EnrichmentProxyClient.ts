@@ -6,6 +6,7 @@ const DEFAULT_PROXY_URL = (import.meta.env.VITE_ENRICHMENT_PROXY_URL as string |
 const CONFIG_TIMEOUT_MS = 15_000;
 const SYNC_TIMEOUT_MS = 45_000;
 const ENRICHMENT_TIMEOUT_MS = 15 * 60_000;
+const LARGE_UPLOAD_TIMEOUT_MS = 60 * 60_000;
 
 export interface ProxyConfig {
     storageProfiles: ProxyStorageProfile[];
@@ -51,6 +52,7 @@ export interface UploadedImageFilePayload {
     size: number;
     checksum: string;
     base64: string;
+    modifiedAt?: string;
 }
 
 export interface UploadedPackageFilePayload {
@@ -76,6 +78,7 @@ export interface ProcessUploadedImageRequest {
     visionProfileId?: string;
     file: UploadedImageFilePayload;
     checksum: string;
+    forceReprocess?: boolean;
     systemPrompt: string;
     userPrompt: string;
     model: string;
@@ -95,9 +98,13 @@ export interface ProcessUploadedImageResponse {
         thumbnailUrl: string;
         iiifInfoUrl: string;
         extractionUrl: string;
+        aiEnrichmentsUrl?: string;
         aardvarkUrl: string;
         cogUrl?: string;
+        archivalSupplementUrl?: string;
+        archivalSupplementJsonUrl?: string;
     };
+    archivalSupplement?: unknown;
     extraction: unknown;
     rawResponse?: unknown;
     usage?: unknown;
@@ -129,9 +136,21 @@ export interface ProcessGeospatialPackageRequest {
     modelProfileId: string;
     file: UploadedPackageFilePayload;
     checksum: string;
+    forceReprocess?: boolean;
     model: string;
     modelParams: Record<string, unknown>;
     batchDefaults: Record<string, unknown>;
+}
+
+export interface CreateGeospatialUploadSessionRequest {
+    jobId: string;
+    storageProfileId: string;
+    modelProfileId: string;
+    model: string;
+    modelParams: Record<string, unknown>;
+    batchDefaults: Record<string, unknown>;
+    forceReprocess?: boolean;
+    fileName: string;
 }
 
 export interface ProcessGeospatialPackageResponse {
@@ -143,13 +162,17 @@ export interface ProcessGeospatialPackageResponse {
         originalUrl: string;
         manifestUrl: string;
         aardvarkUrl: string;
+        aiEnrichmentsUrl?: string;
         geojsonUrl?: string;
         geoParquetUrl?: string;
         pmtilesUrl?: string;
         cogUrl?: string;
         thumbnailUrl?: string;
+        archivalSupplementUrl?: string;
+        archivalSupplementJsonUrl?: string;
     };
     manifest: unknown;
+    archivalSupplement?: unknown;
     rawResponse?: unknown;
     usage?: unknown;
     aardvarkJson: Record<string, unknown>;
@@ -170,8 +193,10 @@ export interface ProcessedS3Resource {
     originalKey?: string;
     hasAardvark: boolean;
     hasExtraction: boolean;
+    hasAiEnrichments?: boolean;
     hasThumbnail: boolean;
     hasIiif: boolean;
+    hasArchivalSupplement?: boolean;
     metadataSourceCount: number;
     updatedAt?: string;
     sizeBytes?: number;
@@ -182,6 +207,9 @@ export interface ProcessedS3Resource {
         thumbnail: string;
         metadataSources: string;
         extraction: string;
+        aiEnrichments?: string;
+        archivalSupplement?: string;
+        archivalSupplementJson?: string;
         aardvark: string;
     };
     artifacts: {
@@ -189,6 +217,9 @@ export interface ProcessedS3Resource {
         thumbnailUrl: string;
         iiifInfoUrl: string;
         extractionUrl: string;
+        aiEnrichmentsUrl?: string;
+        archivalSupplementUrl?: string;
+        archivalSupplementJsonUrl?: string;
         aardvarkUrl: string;
     };
 }
@@ -328,7 +359,7 @@ export class EnrichmentProxyClient {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: safeJsonStringify(request),
-        }, ENRICHMENT_TIMEOUT_MS, signal);
+        }, LARGE_UPLOAD_TIMEOUT_MS, signal);
         return parseResponse(res);
     }
 
@@ -337,7 +368,7 @@ export class EnrichmentProxyClient {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: safeJsonStringify(request),
-        }, ENRICHMENT_TIMEOUT_MS, signal);
+        }, LARGE_UPLOAD_TIMEOUT_MS, signal);
         return parseResponse(res);
     }
 
@@ -346,7 +377,39 @@ export class EnrichmentProxyClient {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: safeJsonStringify(request),
-        }, ENRICHMENT_TIMEOUT_MS, signal);
+        }, LARGE_UPLOAD_TIMEOUT_MS, signal);
+        return parseResponse(res);
+    }
+
+    async createGeospatialUploadSession(request: CreateGeospatialUploadSessionRequest, signal?: AbortSignal): Promise<{ sessionId: string }> {
+        const res = await fetchWithTimeout(`${this.baseUrl}/api/uploads/geospatial-sessions`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: safeJsonStringify(request),
+        }, CONFIG_TIMEOUT_MS, signal);
+        return parseResponse(res);
+    }
+
+    async uploadGeospatialSessionFile(sessionId: string, pathName: string, file: File, signal?: AbortSignal): Promise<{ path: string; size: number; checksum: string }> {
+        const url = new URL(`${this.baseUrl}/api/uploads/geospatial-sessions/${encodeURIComponent(sessionId)}/files`);
+        url.searchParams.set("path", pathName);
+        if (Number.isFinite(file.lastModified) && file.lastModified > 0) {
+            url.searchParams.set("modifiedAt", new Date(file.lastModified).toISOString());
+        }
+        const res = await fetchWithTimeout(url.toString(), {
+            method: "PUT",
+            headers: { "Content-Type": file.type || "application/octet-stream" },
+            body: file,
+        }, LARGE_UPLOAD_TIMEOUT_MS, signal);
+        return parseResponse(res);
+    }
+
+    async completeGeospatialUploadSession(sessionId: string, request: CreateGeospatialUploadSessionRequest, signal?: AbortSignal): Promise<ProcessGeospatialPackageResponse> {
+        const res = await fetchWithTimeout(`${this.baseUrl}/api/uploads/geospatial-sessions/complete`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: safeJsonStringify({ sessionId, request }),
+        }, LARGE_UPLOAD_TIMEOUT_MS, signal);
         return parseResponse(res);
     }
 

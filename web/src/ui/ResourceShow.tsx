@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Distribution, Resource } from '../aardvark/model';
 import { queryResourceById, querySimilarResources, getSearchNeighbors, FacetedSearchRequest, queryDistributionsForResource } from '../duckdb/duckdbClient';
 import { waitForDuckDbRestore } from '../duckdb/dbInit';
@@ -12,6 +12,7 @@ import { ResourceDistributions } from './resource/ResourceDistributions';
 import { databaseService } from '../services/DatabaseService';
 import { useToast } from './shared/ToastContext';
 import { withBasePath } from '../utils/basePath';
+import { recoverProcessedS3ResourceToLocalCatalog } from '../services/processedResourceRecovery';
 
 
 interface ResourceShowProps {
@@ -47,18 +48,45 @@ export const ResourceShow: React.FC<ResourceShowProps> = ({ id, onBack }) => {
     const [distributions, setDistributions] = useState<Distribution[]>([]);
     const [similarResources, setSimilarResources] = useState<Resource[]>([]);
     const [loading, setLoading] = useState(true);
+    const [recoveryMessage, setRecoveryMessage] = useState<string | null>(null);
     const [pagination, setPagination] = useState<{ prevId?: string, nextId?: string, position: number, total: number }>({ position: 0, total: 0 });
     const { addToast } = useToast();
+    const addToastRef = useRef(addToast);
 
     useEffect(() => {
+        addToastRef.current = addToast;
+    }, [addToast]);
+
+    useEffect(() => {
+        const controller = new AbortController();
+        let canceled = false;
         const load = async () => {
             setLoading(true);
+            setRecoveryMessage(null);
             try {
                 let r = await queryResourceById(id);
                 if (!r) {
                     await waitForDuckDbRestore();
                     r = await queryResourceById(id);
                 }
+                if (!r) {
+                    setRecoveryMessage("Looking for a saved processed copy in S3...");
+                    try {
+                        const recovered = await recoverProcessedS3ResourceToLocalCatalog(id, { signal: controller.signal });
+                        if (canceled) return;
+                        if (recovered) {
+                            r = recovered.resource;
+                            addToastRef.current(`Restored ${r.dct_title_s || r.id} from processed S3 artifacts.`, "success");
+                        }
+                    } catch (error) {
+                        if (!controller.signal.aborted) {
+                            console.info("Processed S3 recovery did not restore this resource", error);
+                        }
+                    } finally {
+                        if (!canceled) setRecoveryMessage(null);
+                    }
+                }
+                if (canceled) return;
                 setResource(r);
 
                 if (r) {
@@ -124,10 +152,14 @@ export const ResourceShow: React.FC<ResourceShowProps> = ({ id, onBack }) => {
                 console.error("Failed to load resource", e);
                 setDistributions([]);
             } finally {
-                setLoading(false);
+                if (!canceled) setLoading(false);
             }
         };
         load();
+        return () => {
+            canceled = true;
+            controller.abort();
+        };
     }, [id]);
 
     const navigateToId = (targetId: string) => {
@@ -153,7 +185,7 @@ export const ResourceShow: React.FC<ResourceShowProps> = ({ id, onBack }) => {
     };
 
     if (loading) {
-        return <div className="p-8 text-center text-slate-500">Loading resource...</div>;
+        return <div className="p-8 text-center text-slate-500">{recoveryMessage || "Loading resource..."}</div>;
     }
 
     if (!resource) {

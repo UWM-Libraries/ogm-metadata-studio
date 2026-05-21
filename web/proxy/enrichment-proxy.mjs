@@ -1,12 +1,13 @@
 import http from "node:http";
-import { existsSync, readFileSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createReadStream, createWriteStream, existsSync, readFileSync } from "node:fs";
+import { copyFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { pipeline } from "node:stream/promises";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const execFileAsync = promisify(execFile);
@@ -47,8 +48,18 @@ loadEnvFiles([
 const PORT = Number(process.env.ENRICHMENT_PROXY_PORT || 8787);
 const CONFIG_PATH = process.env.ENRICHMENT_PROXY_CONFIG || path.resolve(__dirname, "../local-enrichment.config.json");
 const DEFAULT_REGION = "us-east-1";
+const ARCHIVAL_ACCESSION_SUPPLEMENT_RELATION = "https://opengeometadata.org/reference/archival-accession-supplement";
+const ARCHIVAL_ACCESSION_SUPPLEMENT_JSON_RELATION = "https://opengeometadata.org/reference/archival-accession-supplement-json";
+const AI_ENRICHMENTS_SCHEMA_VERSION = "0.1.0";
+const AI_ENRICHMENTS_SCHEMA_URL = "https://opengeometadata.org/schema/ai-enrichments/schema.json";
+const AI_ENRICHMENTS_RELATION = "https://opengeometadata.org/reference/ai-enrichments";
 const S3_LIST_TIMEOUT_MS = Number(process.env.ENRICHMENT_PROXY_S3_LIST_TIMEOUT_MS || 30_000);
 const S3_OBJECT_TIMEOUT_MS = Number(process.env.ENRICHMENT_PROXY_S3_OBJECT_TIMEOUT_MS || 120_000);
+const S3_RETRY_ATTEMPTS = Math.max(1, Number(process.env.ENRICHMENT_PROXY_S3_RETRY_ATTEMPTS || 3));
+const S3_RETRY_BASE_DELAY_MS = Math.max(0, Number(process.env.ENRICHMENT_PROXY_S3_RETRY_BASE_DELAY_MS || 750));
+const S3_MULTIPART_THRESHOLD_BYTES = Math.max(5 * 1024 * 1024, Number(process.env.ENRICHMENT_PROXY_S3_MULTIPART_THRESHOLD_BYTES || 64 * 1024 * 1024));
+const S3_MULTIPART_PART_SIZE_BYTES = Math.max(5 * 1024 * 1024, Number(process.env.ENRICHMENT_PROXY_S3_MULTIPART_PART_SIZE_BYTES || 32 * 1024 * 1024));
+const GEOSPATIAL_DERIVATIVE_TIMEOUT_MS = Number(process.env.ENRICHMENT_PROXY_GEOSPATIAL_DERIVATIVE_TIMEOUT_MS || 60 * 60 * 1000);
 const COG_PREVIEW_TIMEOUT_MS = Number(process.env.ENRICHMENT_PROXY_COG_PREVIEW_TIMEOUT_MS || 120_000);
 const COG_PREVIEW_MAX_DIMENSION = Number(process.env.ENRICHMENT_PROXY_COG_PREVIEW_MAX_DIMENSION || 1400);
 const MAX_LIST_PAGES = Number(process.env.ENRICHMENT_PROXY_MAX_LIST_PAGES || 1000);
@@ -65,6 +76,10 @@ function safeJsonStringify(value, space) {
     const asNumber = Number(item);
     return Number.isSafeInteger(asNumber) ? asNumber : item.toString();
   }, space);
+}
+
+function sha256Text(value) {
+  return crypto.createHash("sha256").update(String(value || "")).digest("hex");
 }
 
 function createUploadLogger(jobId, fileName) {
@@ -99,6 +114,9 @@ const DEFAULT_CONFIG = {
     },
   ],
 };
+
+const geospatialUploadSessions = new Map();
+const GEOSPATIAL_UPLOAD_SESSION_TTL_MS = 6 * 60 * 60 * 1000;
 
 async function loadConfig() {
   try {
@@ -222,7 +240,7 @@ function objectUrl(profile, key, query = undefined) {
   }
   if (query) {
     for (const [keyName, value] of Object.entries(query)) {
-      if (value !== undefined && value !== null && value !== "") url.searchParams.set(keyName, String(value));
+      if (value !== undefined && value !== null) url.searchParams.set(keyName, String(value));
     }
   }
   return url;
@@ -244,6 +262,12 @@ function hmac(key, data, encoding) {
 
 function sha256(data) {
   return crypto.createHash("sha256").update(data).digest("hex");
+}
+
+async function sha256File(filePath) {
+  const hash = crypto.createHash("sha256");
+  for await (const chunk of createReadStream(filePath)) hash.update(chunk);
+  return hash.digest("hex");
 }
 
 function amzDateParts(date = new Date()) {
@@ -308,11 +332,46 @@ async function fetchWithTimeout(url, init = {}, timeoutMs = S3_LIST_TIMEOUT_MS) 
   }
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetryableS3Status(status) {
+  return [408, 425, 429, 500, 502, 503, 504].includes(Number(status));
+}
+
+function isRetryableS3Error(error) {
+  const message = String(error?.message || error || "");
+  return /timed out|abort|econnreset|econnrefused|enotfound|etimedout|socket|network|fetch failed/i.test(message);
+}
+
 async function signedFetch(profile, url, init = {}) {
-  const { timeoutMs = S3_LIST_TIMEOUT_MS, headers: initHeaders = {}, payloadHash, contentType, ...rest } = init;
+  const {
+    timeoutMs = S3_LIST_TIMEOUT_MS,
+    headers: initHeaders = {},
+    payloadHash,
+    contentType,
+    retryAttempts = S3_RETRY_ATTEMPTS,
+    ...rest
+  } = init;
   const method = rest.method || "GET";
-  const headers = { ...initHeaders, ...signS3Request(method, url, profile, { payloadHash, contentType }) };
-  return fetchWithTimeout(url, { ...rest, method, headers }, timeoutMs);
+  const attempts = Math.max(1, Number(retryAttempts || 1));
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const headers = { ...initHeaders, ...signS3Request(method, url, profile, { payloadHash, contentType }) };
+    try {
+      const response = await fetchWithTimeout(url, { ...rest, method, headers }, timeoutMs);
+      if (!isRetryableS3Status(response.status) || attempt === attempts) return response;
+      await response.arrayBuffer().catch(() => null);
+      lastError = new Error(`S3 retryable response ${response.status} for ${url.origin}${url.pathname}`);
+    } catch (error) {
+      lastError = error;
+      if (!isRetryableS3Error(error) || attempt === attempts) throw error;
+    }
+    const delay = S3_RETRY_BASE_DELAY_MS * (2 ** (attempt - 1));
+    if (delay > 0) await sleep(delay);
+  }
+  throw lastError || new Error(`S3 request failed for ${url.origin}${url.pathname}`);
 }
 
 function tagValues(xml, tag) {
@@ -327,6 +386,15 @@ function decodeXml(value) {
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, "\"")
     .replace(/&#39;/g, "'");
+}
+
+function encodeXmlText(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 function contentTypeForKey(key) {
@@ -494,22 +562,56 @@ function cogPreviewVsicurlCandidates(rawUrl, profile, key) {
   return candidates.map((candidate) => `/vsicurl/${candidate}`);
 }
 
-async function renderCogPreviewWithSource(sourcePath, outputPath, bbox, width, height) {
-  return tryExecFile("gdalwarp", [
+function cogPreviewRenderOptions(info) {
+  const bands = Array.isArray(info?.bands) ? info.bands : [];
+  const nonAlphaBands = bands.filter((band) => String(band?.colorInterpretation || "").toLowerCase() !== "alpha");
+  const firstBand = nonAlphaBands[0] || {};
+  const interpretations = nonAlphaBands.map((band) => String(band?.colorInterpretation || "").toLowerCase());
+  const hasPalette = interpretations.includes("palette") || Boolean(firstBand?.colorTable);
+  const hasRgb = interpretations.includes("red") && interpretations.includes("green") && interpretations.includes("blue");
+  const hasNonByteBand = nonAlphaBands.some((band) => String(band?.type || "").toLowerCase() !== "byte");
+  const layerType = String(firstBand?.metadata?.[""]?.LAYER_TYPE || "").toLowerCase();
+  return {
+    expandPalette: hasPalette,
+    resampling: hasPalette || layerType === "thematic" ? "near" : "bilinear",
+    scaleToByte: !hasPalette && (hasNonByteBand || (!hasRgb && nonAlphaBands.length <= 1)),
+  };
+}
+
+async function previewRenderOptionsForSource(sourcePath) {
+  const result = await inspectCogWithSource(sourcePath);
+  if (!result.ok) return cogPreviewRenderOptions(null);
+  try {
+    return cogPreviewRenderOptions(JSON.parse(result.stdout));
+  } catch {
+    return cogPreviewRenderOptions(null);
+  }
+}
+
+async function renderCogPreviewWithSource(sourcePath, outputPath, bbox, width, height, renderOptions) {
+  const warpedPath = path.join(path.dirname(outputPath), `${path.basename(outputPath, path.extname(outputPath))}.warped.tif`);
+  const warpResult = await tryExecFile("gdalwarp", [
     "--config", "GDAL_DISABLE_READDIR_ON_OPEN", "EMPTY_DIR",
     "--config", "CPL_VSIL_CURL_ALLOWED_EXTENSIONS", ".tif,.tiff,.TIF,.TIFF",
     "-overwrite",
     "-t_srs", "EPSG:4326",
     "-te", String(bbox.west), String(bbox.south), String(bbox.east), String(bbox.north),
     "-ts", String(width), String(height),
-    "-r", "bilinear",
+    "-r", renderOptions.resampling,
     "-dstalpha",
     "-multi",
     "-wo", "NUM_THREADS=ALL_CPUS",
-    "-of", "PNG",
+    "-of", "GTiff",
     sourcePath,
-    outputPath,
+    warpedPath,
   ], { timeoutMs: COG_PREVIEW_TIMEOUT_MS });
+  if (!warpResult.ok || !existsSync(warpedPath)) return warpResult;
+
+  const translateArgs = ["-of", "PNG"];
+  if (renderOptions.expandPalette) translateArgs.push("-expand", "rgba");
+  if (renderOptions.scaleToByte) translateArgs.push("-ot", "Byte", "-scale");
+  translateArgs.push(warpedPath, outputPath);
+  return tryExecFile("gdal_translate", translateArgs, { timeoutMs: COG_PREVIEW_TIMEOUT_MS });
 }
 
 async function inspectCogWithSource(sourcePath) {
@@ -570,6 +672,9 @@ async function previewCogArtifact(config, res, rawUrl, searchParams) {
   if (!await resolveCommandPath("gdalwarp")) {
     throw new Error("COG preview requires GDAL gdalwarp to be installed.");
   }
+  if (!await resolveCommandPath("gdal_translate")) {
+    throw new Error("COG preview requires GDAL gdal_translate to be installed.");
+  }
 
   const bbox = parseCogPreviewBbox(searchParams.get("bbox"));
   const width = parseCogPreviewDimension(searchParams.get("width"), 800);
@@ -579,7 +684,8 @@ async function previewCogArtifact(config, res, rawUrl, searchParams) {
     let lastError = "";
     for (const sourcePath of cogPreviewVsicurlCandidates(rawUrl, profile, key)) {
       const outputPath = path.join(tempRoot, `preview-${crypto.randomUUID()}.png`);
-      const result = await renderCogPreviewWithSource(sourcePath, outputPath, bbox, width, height);
+      const renderOptions = await previewRenderOptionsForSource(sourcePath);
+      const result = await renderCogPreviewWithSource(sourcePath, outputPath, bbox, width, height, renderOptions);
       if (result.ok && existsSync(outputPath)) {
         const png = await readFile(outputPath);
         res.writeHead(200, {
@@ -598,7 +704,8 @@ async function previewCogArtifact(config, res, rawUrl, searchParams) {
     const sourcePath = path.join(tempRoot, path.basename(key) || "source.cog.tif");
     const outputPath = path.join(tempRoot, "preview.png");
     await writeFile(sourcePath, await fetchObjectBuffer(profile, key));
-    const result = await renderCogPreviewWithSource(sourcePath, outputPath, bbox, width, height);
+    const renderOptions = await previewRenderOptionsForSource(sourcePath);
+    const result = await renderCogPreviewWithSource(sourcePath, outputPath, bbox, width, height, renderOptions);
     if (!result.ok || !existsSync(outputPath)) {
       throw new Error(`COG preview render failed: ${result.error || lastError || "GDAL did not create a PNG."}`);
     }
@@ -642,8 +749,21 @@ function uploadKeys(profile, resourceId, fileName) {
     thumbnail: `${root}/thumbnail/thumbnail.jpg`,
     metadataSources: `${root}/metadata_sources`,
     extraction: `${root}/enrichment_response.json`,
+    archivalSupplement: `${root}/archival_accession_supplement.md`,
+    archivalSupplementJson: `${root}/archival_accession_supplement.json`,
+    aiEnrichments: `${root}/ai-enrichments.json`,
     aardvark: `${root}/aardvark.json`,
   };
+}
+
+function hydrateUploadKeys(profile, keys, resourceId, fileName) {
+  const next = { ...uploadKeys(profile, resourceId, fileName), ...(keys || {}) };
+  next.root = next.root || `${uploadBasePrefix(profile)}/${resourceId}`;
+  next.metadataSources = next.metadataSources || `${next.root}/metadata_sources`;
+  next.archivalSupplement = next.archivalSupplement || `${next.root}/archival_accession_supplement.md`;
+  next.archivalSupplementJson = next.archivalSupplementJson || `${next.root}/archival_accession_supplement.json`;
+  next.aiEnrichments = next.aiEnrichments || `${next.root}/ai-enrichments.json`;
+  return next;
 }
 
 function geospatialUploadKeys(profile, resourceId, fileName) {
@@ -659,6 +779,8 @@ function geospatialUploadKeys(profile, resourceId, fileName) {
     pmtiles: `${root}/derivatives/${baseName}.pmtiles`,
     cog: `${root}/derivatives/${baseName}.cog.tif`,
     thumbnail: `${root}/thumbnail/thumbnail.jpg`,
+    archivalSupplement: `${root}/archival_accession_supplement.md`,
+    archivalSupplementJson: `${root}/archival_accession_supplement.json`,
     aardvark: `${root}/aardvark.json`,
   };
 }
@@ -673,7 +795,121 @@ async function objectExists(profile, key) {
   return true;
 }
 
+async function createMultipartUpload(profile, key, contentType) {
+  const response = await signedFetch(profile, objectUrl(profile, key, { uploads: "" }), {
+    method: "POST",
+    contentType,
+    timeoutMs: S3_OBJECT_TIMEOUT_MS,
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`S3 multipart upload creation failed for ${key}: ${response.status} ${text}`);
+  const uploadId = tagValues(text, "UploadId")[0] || "";
+  if (!uploadId) throw new Error(`S3 multipart upload creation did not return an UploadId for ${key}.`);
+  return uploadId;
+}
+
+async function uploadMultipartPart(profile, key, uploadId, partNumber, partBuffer) {
+  const payloadHash = sha256(partBuffer);
+  const response = await signedFetch(profile, objectUrl(profile, key, { partNumber, uploadId }), {
+    method: "PUT",
+    body: partBuffer,
+    payloadHash,
+    timeoutMs: S3_OBJECT_TIMEOUT_MS,
+  });
+  if (!response.ok) throw new Error(`S3 multipart part ${partNumber} upload failed for ${key}: ${response.status} ${await response.text()}`);
+  const etag = response.headers.get("etag") || response.headers.get("ETag") || "";
+  if (!etag) throw new Error(`S3 multipart part ${partNumber} upload for ${key} did not return an ETag.`);
+  return etag;
+}
+
+async function completeMultipartUpload(profile, key, uploadId, parts) {
+  const xml = [
+    "<CompleteMultipartUpload>",
+    ...parts.map((part) => [
+      "<Part>",
+      `<PartNumber>${part.partNumber}</PartNumber>`,
+      `<ETag>${encodeXmlText(part.etag)}</ETag>`,
+      "</Part>",
+    ].join("")),
+    "</CompleteMultipartUpload>",
+  ].join("");
+  const body = Buffer.from(xml, "utf8");
+  const response = await signedFetch(profile, objectUrl(profile, key, { uploadId }), {
+    method: "POST",
+    body,
+    payloadHash: sha256(body),
+    contentType: "application/xml",
+    timeoutMs: S3_OBJECT_TIMEOUT_MS,
+  });
+  if (!response.ok) throw new Error(`S3 multipart completion failed for ${key}: ${response.status} ${await response.text()}`);
+}
+
+async function abortMultipartUpload(profile, key, uploadId) {
+  if (!uploadId) return;
+  const response = await signedFetch(profile, objectUrl(profile, key, { uploadId }), {
+    method: "DELETE",
+    timeoutMs: S3_OBJECT_TIMEOUT_MS,
+    retryAttempts: 1,
+  });
+  if (!response.ok && response.status !== 404) {
+    console.warn(`[S3] Multipart abort failed for ${key}: ${response.status} ${await response.text().catch(() => "")}`);
+  }
+}
+
+async function putObjectBufferMultipart(profile, key, buffer, contentType) {
+  const uploadId = await createMultipartUpload(profile, key, contentType);
+  const partCount = Math.ceil(buffer.length / S3_MULTIPART_PART_SIZE_BYTES);
+  const parts = [];
+  try {
+    for (let index = 0; index < partCount; index += 1) {
+      const partNumber = index + 1;
+      const start = index * S3_MULTIPART_PART_SIZE_BYTES;
+      const end = Math.min(start + S3_MULTIPART_PART_SIZE_BYTES, buffer.length);
+      const partBuffer = buffer.subarray(start, end);
+      console.log(`[S3] Uploading multipart part ${partNumber}/${partCount} for ${key} (${formatBytes(partBuffer.length)})`);
+      const etag = await uploadMultipartPart(profile, key, uploadId, partNumber, partBuffer);
+      parts.push({ partNumber, etag });
+    }
+    await completeMultipartUpload(profile, key, uploadId, parts);
+  } catch (error) {
+    await abortMultipartUpload(profile, key, uploadId);
+    throw error;
+  }
+}
+
+async function putObjectFileMultipart(profile, key, filePath, contentType, fileSize) {
+  const uploadId = await createMultipartUpload(profile, key, contentType);
+  const partCount = Math.ceil(fileSize / S3_MULTIPART_PART_SIZE_BYTES);
+  const parts = [];
+  let partNumber = 1;
+  try {
+    for await (const partBuffer of createReadStream(filePath, { highWaterMark: S3_MULTIPART_PART_SIZE_BYTES })) {
+      console.log(`[S3] Uploading multipart file part ${partNumber}/${partCount} for ${key} (${formatBytes(partBuffer.length)})`);
+      const etag = await uploadMultipartPart(profile, key, uploadId, partNumber, partBuffer);
+      parts.push({ partNumber, etag });
+      partNumber += 1;
+    }
+    await completeMultipartUpload(profile, key, uploadId, parts);
+  } catch (error) {
+    await abortMultipartUpload(profile, key, uploadId);
+    throw error;
+  }
+}
+
+async function putObjectFile(profile, key, filePath, contentType) {
+  const info = await stat(filePath);
+  if (info.size >= S3_MULTIPART_THRESHOLD_BYTES) {
+    await putObjectFileMultipart(profile, key, filePath, contentType, info.size);
+    return;
+  }
+  await putObjectBuffer(profile, key, await readFile(filePath), contentType);
+}
+
 async function putObjectBuffer(profile, key, buffer, contentType) {
+  if (buffer.length >= S3_MULTIPART_THRESHOLD_BYTES) {
+    await putObjectBufferMultipart(profile, key, buffer, contentType);
+    return;
+  }
   const payloadHash = sha256(buffer);
   const response = await signedFetch(profile, objectUrl(profile, key), {
     method: "PUT",
@@ -1029,6 +1265,244 @@ function normalizedMergedBox(items, pageWidth, pageHeight) {
   ];
 }
 
+const OCR_TEXT_GROUPING_STRATEGY = "deterministic_collinear_bbox_clustering_v1";
+
+function isGroupableOcrText(entry) {
+  const content = String(entry?.content || "").trim();
+  const role = String(entry?.role || "other").toLowerCase();
+  if (!content || content.length < 2 || content.length > 48 || content.includes("\n")) return false;
+  if (["coordinate", "scale", "legend"].includes(role)) return false;
+  if (!/[A-Za-z]/.test(content)) return false;
+  const compact = content.replace(/\s+/g, "");
+  if (!compact) return false;
+  const alphaCount = (compact.match(/[A-Za-z]/g) || []).length;
+  if (alphaCount / compact.length < 0.5) return false;
+  if (/^[ivxlcdm]+$/i.test(compact) && compact.length <= 4) return false;
+  return true;
+}
+
+function pixelItemFromTextEntry(entry, index, pageWidth, pageHeight) {
+  if (!isGroupableOcrText(entry)) return null;
+  const box = Array.isArray(entry?.approx_bbox) ? entry.approx_bbox.map(Number) : [];
+  if (box.length !== 4 || box.some((value) => !Number.isFinite(value))) return null;
+  const [rawX1, rawY1, rawX2, rawY2] = box;
+  const x1 = Math.max(0, Math.min(pageWidth, Math.min(rawX1, rawX2) * pageWidth));
+  const y1 = Math.max(0, Math.min(pageHeight, Math.min(rawY1, rawY2) * pageHeight));
+  const x2 = Math.max(0, Math.min(pageWidth, Math.max(rawX1, rawX2) * pageWidth));
+  const y2 = Math.max(0, Math.min(pageHeight, Math.max(rawY1, rawY2) * pageHeight));
+  if (x2 <= x1 || y2 <= y1) return null;
+  return {
+    index,
+    content: String(entry.content).trim(),
+    role: String(entry.role || "other"),
+    confidence: Number.isFinite(Number(entry.confidence)) ? Number(entry.confidence) : 0.8,
+    box: {
+      x1,
+      y1,
+      x2,
+      y2,
+      width: x2 - x1,
+      height: y2 - y1,
+      cx: (x1 + x2) / 2,
+      cy: (y1 + y2) / 2,
+    },
+  };
+}
+
+function textItemsCompatible(a, b, medianHeight) {
+  const scale = Math.max(medianHeight, a.box.height, b.box.height, 1);
+  const distance = Math.hypot(b.box.cx - a.box.cx, b.box.cy - a.box.cy);
+  if (distance < scale * 0.45 || distance > scale * 2.85) return false;
+  const heightRatio = Math.max(a.box.height, b.box.height) / Math.max(1, Math.min(a.box.height, b.box.height));
+  if (heightRatio > 2.4) return false;
+  const widthRatio = Math.max(a.box.width, b.box.width) / Math.max(1, Math.min(a.box.width, b.box.width));
+  if (widthRatio > 5.5) return false;
+  return true;
+}
+
+function textItemsSimilarScale(a, b) {
+  const heightRatio = Math.max(a.box.height, b.box.height) / Math.max(1, Math.min(a.box.height, b.box.height));
+  const widthRatio = Math.max(a.box.width, b.box.width) / Math.max(1, Math.min(a.box.width, b.box.width));
+  return heightRatio <= 2.4 && widthRatio <= 5.5;
+}
+
+function textLineProposal(seed, second, items, medianHeight) {
+  if (!textItemsCompatible(seed, second, medianHeight)) return null;
+  const dx = second.box.cx - seed.box.cx;
+  const dy = second.box.cy - seed.box.cy;
+  const distance = Math.hypot(dx, dy);
+  if (distance <= 0) return null;
+  const ux = dx / distance;
+  const uy = dy / distance;
+  const scale = Math.max(medianHeight, seed.box.height, second.box.height, 1);
+  const candidates = items.map((item) => {
+    const itemDx = item.box.cx - seed.box.cx;
+    const itemDy = item.box.cy - seed.box.cy;
+    const projection = itemDx * ux + itemDy * uy;
+    const perpendicular = Math.abs(itemDx * uy - itemDy * ux);
+    return { item, projection, perpendicular };
+  })
+    .filter(({ item, projection, perpendicular }) => {
+      if (projection < -scale * 0.25 || projection > scale * 24) return false;
+      if (perpendicular > Math.max(scale * 0.9, item.box.height * 0.95)) return false;
+      return item.index === seed.index || textItemsSimilarScale(seed, item);
+    })
+    .sort((a, b) => a.projection - b.projection);
+
+  const chain = [];
+  for (const candidate of candidates) {
+    const previous = chain[chain.length - 1]?.item;
+    if (!previous) {
+      chain.push(candidate);
+      continue;
+    }
+    if (candidate.item.index === previous.index) continue;
+    const gap = candidate.projection - chain[chain.length - 1].projection;
+    if (gap > Math.max(scale * 3, previous.box.width * 1.2)) break;
+    if (!textItemsCompatible(previous, candidate.item, medianHeight)) continue;
+    const stepX = candidate.item.box.cx - previous.box.cx;
+    const stepY = candidate.item.box.cy - previous.box.cy;
+    const stepDistance = Math.hypot(stepX, stepY);
+    if (stepDistance <= 0) continue;
+    const directionAgreement = (stepX * ux + stepY * uy) / stepDistance;
+    if (directionAgreement < Math.cos(Math.PI / 6)) continue;
+    chain.push(candidate);
+  }
+
+  const uniqueItems = Array.from(new Map(chain.map(({ item }) => [item.index, item])).values());
+  if (!uniqueItems.some((item) => item.index === seed.index) || !uniqueItems.some((item) => item.index === second.index)) return null;
+  if (uniqueItems.length < 3) return null;
+  return uniqueItems;
+}
+
+function orderTextGroupItems(items) {
+  const minX = Math.min(...items.map((item) => item.box.cx));
+  const maxX = Math.max(...items.map((item) => item.box.cx));
+  const minY = Math.min(...items.map((item) => item.box.cy));
+  const maxY = Math.max(...items.map((item) => item.box.cy));
+  const xSpan = maxX - minX;
+  const ySpan = maxY - minY;
+  return [...items].sort((a, b) => {
+    if (xSpan >= ySpan * 0.35) return a.box.cx - b.box.cx;
+    return a.box.cy - b.box.cy;
+  });
+}
+
+function normalizedBoxFromTextItems(items, pageWidth, pageHeight) {
+  const x1 = Math.min(...items.map((item) => item.box.x1));
+  const y1 = Math.min(...items.map((item) => item.box.y1));
+  const x2 = Math.max(...items.map((item) => item.box.x2));
+  const y2 = Math.max(...items.map((item) => item.box.y2));
+  return [
+    Math.max(0, Math.min(1, x1 / pageWidth)),
+    Math.max(0, Math.min(1, y1 / pageHeight)),
+    Math.max(0, Math.min(1, x2 / pageWidth)),
+    Math.max(0, Math.min(1, y2 / pageHeight)),
+  ];
+}
+
+function roleForTextGroup(items) {
+  const roles = items.map((item) => String(item.role || "other").toLowerCase());
+  if (roles.includes("title")) return "title";
+  if (roles.includes("label")) return "label";
+  return "label";
+}
+
+function textGroupScore(items, medianHeight) {
+  const ordered = orderTextGroupItems(items);
+  const gaps = ordered.slice(1).map((item, index) => {
+    const previous = ordered[index];
+    return Math.hypot(item.box.cx - previous.box.cx, item.box.cy - previous.box.cy) / Math.max(medianHeight, item.box.height, previous.box.height, 1);
+  });
+  const averageGap = gaps.length > 0 ? gaps.reduce((sum, value) => sum + value, 0) / gaps.length : 0;
+  const charCount = ordered.reduce((sum, item) => sum + item.content.length, 0);
+  return ordered.length * 100 + charCount - averageGap * 8;
+}
+
+function textGroupLooksUseful(content) {
+  const tokens = String(content || "")
+    .split(/\s+/)
+    .map((token) => token.replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, ""))
+    .filter(Boolean);
+  if (tokens.length < 3) return false;
+  const shortTokenRatio = tokens.filter((token) => token.length <= 2).length / tokens.length;
+  if (shortTokenRatio > 0.5) return false;
+  const uniqueTokenRatio = new Set(tokens.map((token) => token.toLowerCase())).size / tokens.length;
+  if (uniqueTokenRatio < 0.6) return false;
+  return true;
+}
+
+function consolidateOcrTextEntries(entries, pageWidth, pageHeight) {
+  if (!Array.isArray(entries) || pageWidth <= 0 || pageHeight <= 0) {
+    return { groups: [], summary: { strategy: OCR_TEXT_GROUPING_STRATEGY, input_text_count: Array.isArray(entries) ? entries.length : 0, group_count: 0, grouped_text_count: 0 } };
+  }
+
+  const items = entries
+    .map((entry, index) => pixelItemFromTextEntry(entry, index, pageWidth, pageHeight))
+    .filter(Boolean);
+  if (items.length < 3) {
+    return { groups: [], summary: { strategy: OCR_TEXT_GROUPING_STRATEGY, input_text_count: entries.length, group_count: 0, grouped_text_count: 0 } };
+  }
+
+  const medianHeight = Math.max(1, median(items.map((item) => item.box.height)));
+  const proposalsByKey = new Map();
+  for (const seed of items) {
+    const nearby = items
+      .filter((item) => item.index !== seed.index && textItemsCompatible(seed, item, medianHeight))
+      .sort((a, b) => Math.hypot(a.box.cx - seed.box.cx, a.box.cy - seed.box.cy) - Math.hypot(b.box.cx - seed.box.cx, b.box.cy - seed.box.cy))
+      .slice(0, 10);
+    for (const second of nearby) {
+      const proposal = textLineProposal(seed, second, items, medianHeight);
+      if (!proposal) continue;
+      const key = proposal.map((item) => item.index).sort((a, b) => a - b).join(",");
+      const score = textGroupScore(proposal, medianHeight);
+      const existing = proposalsByKey.get(key);
+      if (!existing || score > existing.score) proposalsByKey.set(key, { items: proposal, score });
+    }
+  }
+
+  const used = new Set();
+  const proposals = Array.from(proposalsByKey.values())
+    .sort((a, b) => b.items.length - a.items.length || b.score - a.score || Math.min(...a.items.map((item) => item.index)) - Math.min(...b.items.map((item) => item.index)));
+  const groups = [];
+  for (const proposal of proposals) {
+    if (proposal.items.some((item) => used.has(item.index))) continue;
+    const ordered = orderTextGroupItems(proposal.items);
+    const content = ordered.map((item) => item.content).join(" ").replace(/\s+/g, " ").trim();
+    if (!content || content.length < 4) continue;
+    if (!textGroupLooksUseful(content)) continue;
+    const sourceIndices = ordered.map((item) => item.index);
+    const sourceSpan = Math.max(...sourceIndices) - Math.min(...sourceIndices) + 1;
+    if (sourceSpan > sourceIndices.length) continue;
+    for (const item of ordered) used.add(item.index);
+    const first = ordered[0].box;
+    const last = ordered[ordered.length - 1].box;
+    const angle = Math.atan2(last.cy - first.cy, last.cx - first.cx) * 180 / Math.PI;
+    groups.push({
+      content,
+      source_text_indices: sourceIndices,
+      source_text_count: ordered.length,
+      approx_bbox: normalizedBoxFromTextItems(ordered, pageWidth, pageHeight),
+      confidence: ordered.reduce((sum, item) => sum + Math.max(0, Math.min(1, item.confidence)), 0) / ordered.length,
+      role: roleForTextGroup(ordered),
+      orientation_degrees: Math.round(angle * 10) / 10,
+      reasoning: "Deterministic secondary OCR pass grouped adjacent boxes with similar size along a shared text baseline.",
+    });
+  }
+
+  groups.sort((a, b) => Math.min(...a.source_text_indices) - Math.min(...b.source_text_indices));
+  return {
+    groups,
+    summary: {
+      strategy: OCR_TEXT_GROUPING_STRATEGY,
+      input_text_count: entries.length,
+      candidate_text_count: items.length,
+      group_count: groups.length,
+      grouped_text_count: used.size,
+    },
+  };
+}
+
 function lineEntriesFromVisionWords(words, pageWidth, pageHeight) {
   const items = words.map((word) => {
     const content = textFromVisionWord(word).trim();
@@ -1177,9 +1651,12 @@ async function callGoogleVisionOcr(visionProfile, source) {
   const entries = entriesFromFullText.length > 0
     ? entriesFromFullText
     : textEntriesFromTextAnnotations(result.textAnnotations, source.width, source.height);
+  const consolidated = consolidateOcrTextEntries(entries, source.width, source.height);
   return {
     parsedResponse: {
       text: entries,
+      text_groups: consolidated.groups,
+      text_grouping_summary: consolidated.summary,
       placenames: [],
       map_bbox_estimate: {
         west: 0,
@@ -1191,16 +1668,33 @@ async function callGoogleVisionOcr(visionProfile, source) {
         reasoning: "Google Cloud Vision provides OCR text and image-space boxes only; geographic map extent is left for metadata writing or human review.",
       },
       description: fullText
-        ? `Google Cloud Vision OCR extracted ${entries.length} text segment(s).`
+        ? `Google Cloud Vision OCR extracted ${entries.length} text segment(s); a deterministic secondary pass consolidated ${consolidated.groups.length} text group(s).`
         : "Google Cloud Vision OCR did not return text.",
       debug: {
         ocr_strategy: `google_cloud_vision:${featureType}`,
+        text_grouping_strategy: OCR_TEXT_GROUPING_STRATEGY,
         placename_extraction_strategy: "deferred_to_openai_metadata_writer",
         bbox_inference_strategy: "not_inferred_from_ocr",
         limitations: "OCR boxes are generated by Google Cloud Vision. Placenames and descriptive metadata are prepared later by OpenAI from the OCR text.",
       },
     },
     rawResponse: body,
+    provider: "google_cloud_vision",
+    requestBody: {
+      endpoint,
+      requests: [{
+        image: {
+          content: "[redacted base64 image bytes]",
+          width: source.width,
+          height: source.height,
+          mimeType: source.mimeType || "image/jpeg",
+          originalBytes: source.originalBytes || null,
+          normalizedBytes: source.normalizedBytes || source.buffer?.length || null,
+        },
+        features: [{ type: featureType }],
+        ...(languageHints.length > 0 ? { imageContext: { languageHints } } : {}),
+      }],
+    },
     usage: { provider: "google_cloud_vision", featureType },
     confidence: entries.length > 0
       ? entries.reduce((sum, entry) => sum + Number(entry.confidence || 0), 0) / entries.length
@@ -1622,6 +2116,47 @@ function referencesFromResource(resource) {
   }
 }
 
+function referenceItems(value) {
+  return (Array.isArray(value) ? value : value ? [value] : [])
+    .map((item) => {
+      if (typeof item === "string") return { url: item, label: "" };
+      if (item && typeof item === "object") {
+        return {
+          url: String(item.url || item["@id"] || item.id || ""),
+          label: String(item.label || ""),
+        };
+      }
+      return { url: "", label: "" };
+    })
+    .filter((item) => item.url.trim());
+}
+
+function firstReferenceUrl(value) {
+  return referenceItems(value)[0]?.url || "";
+}
+
+function downloadUrlMatching(refs, pattern) {
+  return referenceItems(refs["http://schema.org/downloadUrl"])
+    .find((item) => pattern.test(`${item.label} ${item.url}`))?.url || "";
+}
+
+function geospatialArtifactUrlsForResource(profile, keys, resource, fallback = {}) {
+  const refs = referencesFromResource(resource);
+  return {
+    ...fallback,
+    originalUrl: downloadUrlMatching(refs, /original|package|zip/i) || fallback.originalUrl || accessUrlFor(profile, keys.original),
+    manifestUrl: firstReferenceUrl(refs["https://opengeometadata.org/reference/dataset-manifest"]) || fallback.manifestUrl || accessUrlFor(profile, keys.manifest),
+    aardvarkUrl: firstReferenceUrl(refs["https://opengeometadata.org/reference/aardvark-json"]) || fallback.aardvarkUrl || accessUrlFor(profile, keys.aardvark),
+    geojsonUrl: firstReferenceUrl(refs.geojson) || downloadUrlMatching(refs, /geojson/i) || fallback.geojsonUrl,
+    geoParquetUrl: downloadUrlMatching(refs, /geoparquet|parquet/i) || fallback.geoParquetUrl,
+    pmtilesUrl: firstReferenceUrl(refs.pmtiles) || downloadUrlMatching(refs, /pmtiles/i) || fallback.pmtilesUrl,
+    cogUrl: firstReferenceUrl(refs["https://www.cogeo.org/"]) || downloadUrlMatching(refs, /cloud optimized geotiff|cog|\.tiff?$/i) || fallback.cogUrl,
+    thumbnailUrl: firstReferenceUrl(refs["http://schema.org/thumbnailUrl"]) || fallback.thumbnailUrl,
+    archivalSupplementUrl: firstReferenceUrl(refs[ARCHIVAL_ACCESSION_SUPPLEMENT_RELATION]) || fallback.archivalSupplementUrl || accessUrlFor(profile, keys.archivalSupplement),
+    archivalSupplementJsonUrl: firstReferenceUrl(refs[ARCHIVAL_ACCESSION_SUPPLEMENT_JSON_RELATION]) || fallback.archivalSupplementJsonUrl || accessUrlFor(profile, keys.archivalSupplementJson),
+  };
+}
+
 function checksumFromResource(resource) {
   const identifiers = Array.isArray(resource?.dct_identifier_sm) ? resource.dct_identifier_sm : [];
   return identifiers.map(String).find((value) => /^[a-f0-9]{64}$/i.test(value)) || "";
@@ -1638,6 +2173,9 @@ function uploadKeysFromRoot(root, fileName = "original", originalKey = "") {
     thumbnail: `${cleanRoot}/thumbnail/thumbnail.jpg`,
     metadataSources: `${cleanRoot}/metadata_sources`,
     extraction: `${cleanRoot}/enrichment_response.json`,
+    archivalSupplement: `${cleanRoot}/archival_accession_supplement.md`,
+    archivalSupplementJson: `${cleanRoot}/archival_accession_supplement.json`,
+    aiEnrichments: `${cleanRoot}/ai-enrichments.json`,
     aardvark: `${cleanRoot}/aardvark.json`,
   };
 }
@@ -1656,7 +2194,10 @@ function artifactUrlsForResource(profile, keys, resource) {
     thumbnailUrl: refs["http://schema.org/thumbnailUrl"] || accessUrlFor(profile, keys.thumbnail),
     iiifInfoUrl: iiifReference ? (iiifReference.endsWith("/info.json") ? iiifReference : `${iiifReference.replace(/\/+$/, "")}/info.json`) : `${accessUrlFor(profile, keys.iiif)}/info.json`,
     extractionUrl: refs["https://opengeometadata.org/reference/enrichment-response"] || accessUrlFor(profile, keys.extraction),
+    aiEnrichmentsUrl: firstReferenceUrl(refs[AI_ENRICHMENTS_RELATION]) || refs[AI_ENRICHMENTS_RELATION] || accessUrlFor(profile, keys.aiEnrichments),
     aardvarkUrl: refs["https://opengeometadata.org/reference/aardvark-json"] || accessUrlFor(profile, keys.aardvark),
+    archivalSupplementUrl: refs[ARCHIVAL_ACCESSION_SUPPLEMENT_RELATION]?.url || refs[ARCHIVAL_ACCESSION_SUPPLEMENT_RELATION] || accessUrlFor(profile, keys.archivalSupplement),
+    archivalSupplementJsonUrl: refs[ARCHIVAL_ACCESSION_SUPPLEMENT_JSON_RELATION]?.url || refs[ARCHIVAL_ACCESSION_SUPPLEMENT_JSON_RELATION] || accessUrlFor(profile, keys.archivalSupplementJson),
     cogUrl,
   };
 }
@@ -1678,8 +2219,45 @@ function ensureReferenceJson(resource, artifacts) {
       ],
       "https://www.cogeo.org/": { url: artifacts.cogUrl, label: "Cloud Optimized GeoTIFF" },
     } : {}),
+    ...(artifacts.archivalSupplementUrl ? {
+      [ARCHIVAL_ACCESSION_SUPPLEMENT_RELATION]: { url: artifacts.archivalSupplementUrl, label: "Archival accession processing supplement" },
+    } : {}),
+    ...(artifacts.archivalSupplementJsonUrl ? {
+      [ARCHIVAL_ACCESSION_SUPPLEMENT_JSON_RELATION]: { url: artifacts.archivalSupplementJsonUrl, label: "Archival accession supplement JSON" },
+    } : {}),
     "https://opengeometadata.org/reference/enrichment-response": artifacts.extractionUrl,
+    ...(artifacts.aiEnrichmentsUrl ? {
+      [AI_ENRICHMENTS_RELATION]: { url: artifacts.aiEnrichmentsUrl, label: "OpenGeoMetadata AI Enrichments JSON" },
+    } : {}),
     "https://opengeometadata.org/reference/aardvark-json": artifacts.aardvarkUrl,
+  };
+  return {
+    ...resource,
+    dct_references_s: safeJsonStringify(nextRefs),
+  };
+}
+
+function ensureArchivalSupplementReferences(resource, artifacts) {
+  if (!artifacts.archivalSupplementUrl && !artifacts.archivalSupplementJsonUrl) return resource;
+  const refs = referencesFromResource(resource);
+  const downloadRefs = Array.isArray(refs["http://schema.org/downloadUrl"])
+    ? refs["http://schema.org/downloadUrl"]
+    : refs["http://schema.org/downloadUrl"] ? [refs["http://schema.org/downloadUrl"]] : [];
+  const hasSupplementDownload = downloadRefs.some((item) => {
+    const value = typeof item === "string" ? item : item?.url || item?.["@id"] || item?.id || "";
+    return value && value === artifacts.archivalSupplementUrl;
+  });
+  const nextRefs = {
+    ...refs,
+    ...(artifacts.archivalSupplementUrl ? {
+      "http://schema.org/downloadUrl": hasSupplementDownload
+        ? downloadRefs
+        : [...downloadRefs, { url: artifacts.archivalSupplementUrl, label: "Archival accession processing supplement" }],
+      [ARCHIVAL_ACCESSION_SUPPLEMENT_RELATION]: { url: artifacts.archivalSupplementUrl, label: "Archival accession processing supplement" },
+    } : {}),
+    ...(artifacts.archivalSupplementJsonUrl ? {
+      [ARCHIVAL_ACCESSION_SUPPLEMENT_JSON_RELATION]: { url: artifacts.archivalSupplementJsonUrl, label: "Archival accession supplement JSON" },
+    } : {}),
   };
   return {
     ...resource,
@@ -1701,8 +2279,10 @@ async function listProcessedUploadResources(profile, { includeIncomplete = false
         originalKey: "",
         hasAardvark: false,
         hasExtraction: false,
+        hasAiEnrichments: false,
         hasThumbnail: false,
         hasIiif: false,
+        hasArchivalSupplement: false,
         metadataSourceCount: 0,
         updatedAt: "",
         sizeBytes: 0,
@@ -1729,11 +2309,17 @@ async function listProcessedUploadResources(profile, { includeIncomplete = false
     match = key.match(/^(.*)\/enrichment_response\.json$/);
     if (match) touch(match[1]).hasExtraction = true;
 
+    match = key.match(/^(.*)\/ai-enrichments\.json$/);
+    if (match) touch(match[1]).hasAiEnrichments = true;
+
     match = key.match(/^(.*)\/thumbnail\/thumbnail\.jpg$/);
     if (match) touch(match[1]).hasThumbnail = true;
 
     match = key.match(/^(.*)\/iiif\/info\.json$/);
     if (match) touch(match[1]).hasIiif = true;
+
+    match = key.match(/^(.*)\/archival_accession_supplement\.md$/);
+    if (match) touch(match[1]).hasArchivalSupplement = true;
 
     match = key.match(/^(.*)\/metadata_sources\/[^/]+$/);
     if (match) touch(match[1]).metadataSourceCount += 1;
@@ -1758,6 +2344,9 @@ async function listProcessedUploadResources(profile, { includeIncomplete = false
           thumbnailUrl: accessUrlFor(profile, keys.thumbnail),
           iiifInfoUrl: `${accessUrlFor(profile, keys.iiif)}/info.json`,
           extractionUrl: accessUrlFor(profile, keys.extraction),
+          aiEnrichmentsUrl: accessUrlFor(profile, keys.aiEnrichments),
+          archivalSupplementUrl: accessUrlFor(profile, keys.archivalSupplement),
+          archivalSupplementJsonUrl: accessUrlFor(profile, keys.archivalSupplementJson),
           aardvarkUrl: accessUrlFor(profile, keys.aardvark),
         },
       };
@@ -1781,6 +2370,458 @@ async function readMetadataDocumentsFromS3(profile, keys, log = () => undefined)
     });
   }
   return documents;
+}
+
+function normalizedText(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function safeDateTime(value) {
+  const date = value ? new Date(value) : null;
+  return date && Number.isFinite(date.getTime()) ? date.toISOString() : undefined;
+}
+
+function withoutUndefined(value) {
+  if (Array.isArray(value)) {
+    return value.map(withoutUndefined).filter((item) => item !== undefined);
+  }
+  if (!value || typeof value !== "object") return value === undefined ? undefined : value;
+  const entries = Object.entries(value)
+    .map(([key, item]) => [key, withoutUndefined(item)])
+    .filter(([, item]) => item !== undefined);
+  return Object.fromEntries(entries);
+}
+
+function redactOpenAIRequestForPersistence(value) {
+  if (Array.isArray(value)) return value.map(redactOpenAIRequestForPersistence);
+  if (!value || typeof value !== "object") return value;
+  const next = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (key === "image_url" && typeof item === "string" && item.startsWith("data:")) {
+      const mediaType = item.match(/^data:([^;]+);base64,/)?.[1] || "image";
+      next[key] = `data:${mediaType};base64,[redacted image bytes]`;
+      continue;
+    }
+    next[key] = redactOpenAIRequestForPersistence(item);
+  }
+  return next;
+}
+
+function textRoleForAiEnrichments(entry) {
+  const content = normalizedText(entry?.content);
+  const role = String(entry?.role || "other");
+  if (/\b(?:st|street|ave|avenue|blvd|boulevard|way|road|rd|place|pl)\b\.?$/i.test(content)) return "street";
+  if (/\b(?:1[5-9]\d{2}|20\d{2})\b/.test(content)) return "date";
+  return ["title", "coordinate", "label", "scale", "legend", "other"].includes(role) ? role : "other";
+}
+
+function textSegmentId(index) {
+  return `text-${String(index + 1).padStart(4, "0")}`;
+}
+
+function extractionTextSegments(extraction, sourceCallId) {
+  return (Array.isArray(extraction?.text) ? extraction.text : [])
+    .map((entry, index) => withoutUndefined({
+      id: textSegmentId(index),
+      content: String(entry?.content || ""),
+      normalizedContent: normalizedText(entry?.content),
+      role: textRoleForAiEnrichments(entry),
+      approxBbox: entry?.approx_bbox,
+      confidence: typeof entry?.confidence === "number" ? Math.max(0, Math.min(1, entry.confidence)) : undefined,
+      sourceCallId,
+      sourceResponsePath: `/text/${index}`,
+      sourceAssetIds: ["source-original-image"],
+      legacyIndex: index,
+      readingOrder: index,
+      reasoning: entry?.reasoning,
+      raw: entry,
+    }))
+    .filter((entry) => entry.content.trim());
+}
+
+function extractionTextGroups(extraction, textSegments, sourceCallId) {
+  return (Array.isArray(extraction?.text_groups) ? extraction.text_groups : [])
+    .map((entry, index) => withoutUndefined({
+      id: `text-group-${String(index + 1).padStart(4, "0")}`,
+      content: String(entry?.content || ""),
+      normalizedContent: normalizedText(entry?.content),
+      role: textRoleForAiEnrichments(entry),
+      approxBbox: entry?.approx_bbox,
+      confidence: typeof entry?.confidence === "number" ? Math.max(0, Math.min(1, entry.confidence)) : undefined,
+      sourceTextIds: (Array.isArray(entry?.source_text_indices) ? entry.source_text_indices : [])
+        .map((sourceIndex) => textSegments[sourceIndex]?.id)
+        .filter(Boolean),
+      sourceTextIndices: Array.isArray(entry?.source_text_indices) ? entry.source_text_indices : undefined,
+      sourceCallId,
+      reasoning: entry?.reasoning || "Deterministically consolidated from adjacent OCR text segments.",
+    }))
+    .filter((entry) => entry.content.trim());
+}
+
+function sourceTextIdsForIndex(indices, textSegments) {
+  return (Array.isArray(indices) ? indices : [indices])
+    .map((index) => Number(index))
+    .filter((index) => Number.isInteger(index) && index >= 0)
+    .map((index) => textSegments[index]?.id)
+    .filter(Boolean);
+}
+
+function derivedPlacenamesForAiEnrichments(extraction, resource, textSegments, extractionCallId, metadataCallId) {
+  const places = [];
+  for (const [index, place] of (Array.isArray(extraction?.placenames) ? extraction.placenames : []).entries()) {
+    const name = normalizedText(place?.name);
+    if (!name) continue;
+    places.push(withoutUndefined({
+      id: `place-${String(index + 1).padStart(4, "0")}`,
+      name,
+      normalizedName: name,
+      type: place?.type || "other",
+      sourceTextIds: sourceTextIdsForIndex(place?.source_text_index, textSegments),
+      sourceTextIndices: Number.isInteger(Number(place?.source_text_index)) ? [Number(place.source_text_index)] : undefined,
+      confidence: typeof place?.confidence === "number" ? Math.max(0, Math.min(1, place.confidence)) : undefined,
+      status: "candidate",
+      sourceCallId: extractionCallId,
+      reasoning: place?.reasoning,
+    }));
+  }
+
+  const existing = new Set(places.map((place) => place.normalizedName.toLowerCase()));
+  for (const name of asStringArray(resource?.dct_spatial_sm)) {
+    if (existing.has(name.toLowerCase())) continue;
+    existing.add(name.toLowerCase());
+    places.push(withoutUndefined({
+      id: `place-${String(places.length + 1).padStart(4, "0")}`,
+      name,
+      normalizedName: name,
+      type: "other",
+      sourceTextIds: [],
+      confidence: 0.75,
+      status: "confirmed",
+      sourceCallId: metadataCallId,
+      reasoning: "Derived from the Aardvark metadata writer's spatial coverage output.",
+    }));
+  }
+  return places;
+}
+
+function aiEnrichmentLink(url, label, mediaType) {
+  return withoutUndefined({ url, label, mediaType });
+}
+
+function promptChecksum(systemPrompt, userPrompt) {
+  return sha256Text([systemPrompt || "", userPrompt || ""].join("\n"));
+}
+
+function openAiPromptRecord({ id, label, purpose, call }) {
+  if (!call?.systemPrompt && !call?.userPrompt) return null;
+  return withoutUndefined({
+    id,
+    label,
+    purpose,
+    provider: "openai",
+    model: call.model,
+    renderedAt: safeDateTime(call.completedAt) || new Date().toISOString(),
+    systemPrompt: call.systemPrompt,
+    userPrompt: call.userPrompt,
+    messages: [
+      call.systemPrompt ? { role: "system", content: call.systemPrompt } : null,
+      call.userPrompt ? { role: "user", content: call.userPrompt } : null,
+    ].filter(Boolean),
+    outputSchema: call.requestBody?.text?.format?.schema,
+    variables: call.variables,
+    sourceCallId: call.id,
+    checksum: {
+      algorithm: "SHA-256",
+      value: promptChecksum(call.systemPrompt, call.userPrompt),
+      purpose: "Checksum of the exact rendered prompt text persisted in this AI Enrichments record.",
+    },
+  });
+}
+
+function openAiApiCallRecord({ id, sequence, purpose, call, parsedResponse, sourceAssetIds = [] }) {
+  if (!call?.requestBody && !call?.rawResponse) return null;
+  return withoutUndefined({
+    id,
+    sequence,
+    provider: "openai",
+    service: "responses",
+    endpoint: "https://api.openai.com/v1/responses",
+    method: "POST",
+    purpose,
+    model: call.model || call.requestBody?.model,
+    modelParams: call.requestBody ? Object.fromEntries(Object.entries(call.requestBody)
+      .filter(([key]) => !["model", "input", "text"].includes(key))) : undefined,
+    promptIds: call.promptId ? [call.promptId] : undefined,
+    sourceAssetIds,
+    completedAt: safeDateTime(call.completedAt) || new Date().toISOString(),
+    status: call.error ? "failed" : "completed",
+    request: {
+      promptIds: call.promptId ? [call.promptId] : undefined,
+      systemPrompt: call.systemPrompt,
+      userPrompt: call.userPrompt,
+      messages: [
+        call.systemPrompt ? { role: "system", content: call.systemPrompt } : null,
+        call.userPrompt ? { role: "user", content: call.userPrompt } : null,
+      ].filter(Boolean),
+      outputSchema: call.requestBody?.text?.format?.schema,
+      payload: {
+        rawJson: redactOpenAIRequestForPersistence(call.requestBody),
+        redacted: true,
+        redactionNotes: "Image bytes and credentials are not persisted; rendered text prompts are preserved exactly.",
+      },
+      redactions: ["api_key", "input_image_bytes"],
+    },
+    response: {
+      raw: call.rawResponse ? { rawJson: call.rawResponse, redacted: false } : undefined,
+      parsed: parsedResponse ? { rawJson: parsedResponse, redacted: false } : undefined,
+      usage: call.usage,
+      error: call.error,
+    },
+    error: call.error,
+  });
+}
+
+function ocrApiCallRecord({ result, completedAt }) {
+  return withoutUndefined({
+    id: "call-google-vision-ocr",
+    sequence: 1,
+    provider: "google_cloud_vision",
+    service: "images:annotate",
+    endpoint: "https://vision.googleapis.com/v1/images:annotate",
+    method: "POST",
+    purpose: "ocr",
+    sourceAssetIds: ["source-original-image"],
+    completedAt: safeDateTime(completedAt) || new Date().toISOString(),
+    status: result?.error ? "failed" : "completed",
+    request: {
+      payload: {
+        rawJson: result?.requestBody || { note: "Request body was not persisted by this provider call." },
+        redacted: true,
+        redactionNotes: "Inline image bytes and API key are not persisted.",
+      },
+      redactions: ["api_key", "inline_image_bytes"],
+    },
+    response: {
+      raw: result?.rawResponse ? { rawJson: result.rawResponse, redacted: false } : undefined,
+      parsed: result?.parsedResponse ? { rawJson: result.parsedResponse, redacted: false } : undefined,
+      usage: result?.usage,
+      error: result?.error,
+    },
+    error: result?.error,
+  });
+}
+
+function mapExtentForAiEnrichments(extraction, sourceCallId) {
+  const bbox = extraction?.map_bbox_estimate || {};
+  return withoutUndefined({
+    west: Number(bbox.west || 0),
+    south: Number(bbox.south || 0),
+    east: Number(bbox.east || 0),
+    north: Number(bbox.north || 0),
+    confidence: typeof bbox.confidence === "number" ? Math.max(0, Math.min(1, bbox.confidence)) : 0,
+    method: bbox.method || "not_inferred",
+    reasoning: bbox.reasoning || "No geographic map extent was inferred.",
+    sourceCallIds: [sourceCallId].filter(Boolean),
+  });
+}
+
+function distributionsWithAiEnrichments(resource, aiEnrichmentsUrl) {
+  const distributions = distributionsFromResource(resource);
+  if (aiEnrichmentsUrl && !distributions.some((item) => item.relation_key === AI_ENRICHMENTS_RELATION && item.url === aiEnrichmentsUrl)) {
+    distributions.push({
+      resource_id: resource.id,
+      relation_key: AI_ENRICHMENTS_RELATION,
+      url: aiEnrichmentsUrl,
+      label: "OpenGeoMetadata AI Enrichments JSON",
+    });
+  }
+  return distributions.map((item) => withoutUndefined({
+    relationKey: item.relation_key,
+    url: item.url,
+    label: item.label,
+  }));
+}
+
+function buildAiEnrichmentsForImage(args) {
+  const {
+    resourceId,
+    fileName,
+    checksum,
+    fileSize,
+    contentType,
+    modifiedAt,
+    artifacts,
+    extractionResult,
+    metadataWriter,
+    resource,
+    archivalSupplement,
+    metadataSourceUrls = [],
+    derivativeSummaries = [],
+  } = args;
+  const createdAt = safeDateTime(archivalSupplement?.processingDate) || safeDateTime(resource?.gbl_mdModified_dt) || new Date().toISOString();
+  const extraction = extractionResult?.parsedResponse || {};
+  const extractionCallId = extractionResult?.provider === "openai" ? "call-openai-historical-map-extraction" : "call-google-vision-ocr";
+  const textSegments = extractionTextSegments(extraction, extractionCallId);
+  const textGroups = extractionTextGroups(extraction, textSegments, extractionCallId);
+  const metadataCall = metadataWriter ? {
+    ...metadataWriter,
+    id: "call-openai-aardvark-metadata-writer",
+    promptId: "prompt-openai-aardvark-metadata-writer",
+    completedAt: resource?.gbl_mdModified_dt || createdAt,
+    variables: {
+      resourceId,
+      fileName,
+      checksum,
+      artifactUrls: artifacts,
+      metadataSourceUrls,
+    },
+  } : null;
+  const extractionOpenAiCall = extractionResult?.provider === "openai" ? {
+    ...extractionResult,
+    id: "call-openai-historical-map-extraction",
+    promptId: "prompt-openai-historical-map-extraction",
+    completedAt: createdAt,
+    variables: { resourceId, fileName, checksum, artifactUrls: artifacts },
+  } : null;
+  const placenames = derivedPlacenamesForAiEnrichments(extraction, resource, textSegments, extractionCallId, "call-openai-aardvark-metadata-writer");
+  const apiCalls = [
+    extractionResult?.provider === "google_cloud_vision" ? ocrApiCallRecord({ result: extractionResult, completedAt: createdAt }) : null,
+    extractionOpenAiCall ? openAiApiCallRecord({
+      id: "call-openai-historical-map-extraction",
+      sequence: 1,
+      purpose: "map_text_extraction",
+      call: extractionOpenAiCall,
+      parsedResponse: extraction,
+      sourceAssetIds: ["source-original-image", ...derivativeSummaries.map((derivative) => derivative.id).filter(Boolean)],
+    }) : null,
+    metadataCall ? openAiApiCallRecord({
+      id: "call-openai-aardvark-metadata-writer",
+      sequence: 2,
+      purpose: "metadata_generation",
+      call: metadataCall,
+      parsedResponse: { resource: metadataWriter?.resource || resource, evidence: metadataWriter?.evidence || [] },
+      sourceAssetIds: ["source-original-image", "artifact-legacy-enrichment-response"],
+    }) : null,
+  ].filter(Boolean);
+  const prompts = [
+    extractionOpenAiCall ? openAiPromptRecord({
+      id: "prompt-openai-historical-map-extraction",
+      label: "Historical map text extraction",
+      purpose: "map_text_extraction",
+      call: extractionOpenAiCall,
+    }) : null,
+    metadataCall ? openAiPromptRecord({
+      id: "prompt-openai-aardvark-metadata-writer",
+      label: "Aardvark metadata writer for scanned historical maps",
+      purpose: "metadata_generation",
+      call: metadataCall,
+    }) : null,
+  ].filter(Boolean);
+  const mapTextValues = Array.from(new Set([
+    ...textSegments.map((item) => item.content),
+    ...textGroups.map((item) => item.content),
+  ].map(normalizedText).filter(Boolean)));
+  return withoutUndefined({
+    schemaVersion: AI_ENRICHMENTS_SCHEMA_VERSION,
+    standard: "OpenGeoMetadata AI Enrichments",
+    resourceId,
+    createdAt,
+    updatedAt: safeDateTime(resource?.gbl_mdModified_dt) || createdAt,
+    generatedBy: {
+      name: "Aardvark Metadata Studio enrichment proxy",
+      workflow: "image-upload-ocr-openai-aardvark-writer",
+      workflowVersion: AI_ENRICHMENTS_SCHEMA_VERSION,
+      notes: "Generated at processing time so exact rendered prompts, provider/model choices, and raw responses are preserved.",
+    },
+    sourceAssets: [
+      {
+        id: "source-original-image",
+        role: "original",
+        fileName,
+        path: artifacts.originalUrl ? new URL(artifacts.originalUrl).pathname.replace(/^\/[^/]+\//, "") : undefined,
+        url: artifacts.originalUrl,
+        mediaType: contentType || "application/octet-stream",
+        byteSize: Number(fileSize || 0),
+        modifiedAt: safeDateTime(modifiedAt),
+        checksums: checksum ? [{ algorithm: "SHA-256", value: checksum, purpose: "Submitted image fixity value computed before enrichment." }] : undefined,
+      },
+      ...derivativeSummaries.map((derivative) => withoutUndefined({
+        id: derivative.id,
+        role: "analysis_derivative",
+        mediaType: derivative.mimeType,
+        byteSize: derivative.bytes,
+        width: derivative.width,
+        height: derivative.height,
+        notes: `OpenAI analysis derivative: ${derivative.kind || "image"}.`,
+      })),
+      { id: "derivative-iiif-image-service", role: "iiif_image", url: artifacts.iiifInfoUrl, mediaType: "application/json" },
+      { id: "derivative-thumbnail", role: "thumbnail", url: artifacts.thumbnailUrl, mediaType: "image/jpeg" },
+      { id: "artifact-legacy-enrichment-response", role: "derived_metadata", url: artifacts.extractionUrl, mediaType: "application/json" },
+      { id: "artifact-aardvark-json", role: "derived_metadata", url: artifacts.aardvarkUrl, mediaType: "application/json" },
+      { id: "artifact-archival-supplement-json", role: "other", url: artifacts.archivalSupplementJsonUrl, mediaType: "application/json" },
+      ...metadataSourceUrls.map((url, index) => ({ id: `metadata-source-${index + 1}`, role: "companion_metadata", url, mediaType: contentTypeForMetadataKey(url) })),
+    ],
+    artifacts: {
+      aardvarkJson: aiEnrichmentLink(artifacts.aardvarkUrl, "Aardvark JSON", "application/json"),
+      aiEnrichmentsJson: aiEnrichmentLink(artifacts.aiEnrichmentsUrl, "OpenGeoMetadata AI Enrichments JSON", "application/json"),
+      legacyEnrichmentResponse: aiEnrichmentLink(artifacts.extractionUrl, "Legacy enrichment_response.json", "application/json"),
+      original: aiEnrichmentLink(artifacts.originalUrl, "Original submitted image", contentType || "application/octet-stream"),
+      thumbnail: aiEnrichmentLink(artifacts.thumbnailUrl, "Thumbnail", "image/jpeg"),
+      iiifImage: aiEnrichmentLink(artifacts.iiifInfoUrl, "IIIF Image API info.json", "application/json"),
+      cloudOptimizedGeoTiff: artifacts.cogUrl ? aiEnrichmentLink(artifacts.cogUrl, "Cloud Optimized GeoTIFF", "image/tiff") : undefined,
+      archivalSupplement: aiEnrichmentLink(artifacts.archivalSupplementUrl, "Archival accession processing supplement", "text/markdown"),
+      archivalSupplementJson: aiEnrichmentLink(artifacts.archivalSupplementJsonUrl, "Archival accession supplement JSON", "application/json"),
+      metadataSources: metadataSourceUrls.map((url) => aiEnrichmentLink(url, "Companion metadata", contentTypeForMetadataKey(url))),
+    },
+    apiCalls,
+    prompts,
+    extractedMapText: textSegments,
+    textGroups,
+    derivedPlacenames: placenames,
+    mapExtent: mapExtentForAiEnrichments(extraction, extractionCallId),
+    description: extraction?.description || asStringArray(resource?.dct_description_sm)[0] || "",
+    debug: {
+      ...(extraction?.debug || {}),
+      schema: AI_ENRICHMENTS_SCHEMA_URL,
+    },
+    derivedMetadata: {
+      standard: "Aardvark",
+      standardVersion: "Aardvark",
+      recordSchema: "https://opengeometadata.org/schema/geoblacklight-schema-aardvark.json",
+      record: resource,
+      distributions: distributionsWithAiEnrichments(resource, artifacts.aiEnrichmentsUrl),
+      fieldEvidence: [
+        { field: "dct_title_s", value: resource?.dct_title_s, sourceCallIds: ["call-openai-aardvark-metadata-writer"], confidence: 0.9, reasoning: "Generated by the Aardvark metadata writer from OCR and source evidence.", reviewStatus: "machine_generated" },
+        { field: "dct_spatial_sm", value: resource?.dct_spatial_sm || [], sourcePlacenameIds: placenames.map((place) => place.id), sourceCallIds: ["call-openai-aardvark-metadata-writer"], confidence: 0.8, reasoning: "Spatial coverage derived from OCR and metadata writer evidence.", reviewStatus: "machine_generated" },
+      ],
+      confidence: metadataWriter ? 0.9 : undefined,
+      createdFromCallIds: apiCalls.map((call) => call.id),
+      normalizationNotes: ["OpenGeoMetadata AI Enrichments preserves raw prompts and responses; Aardvark remains the reviewed discovery record."],
+    },
+    indexingHints: {
+      fields: [
+        {
+          field: "ogm_ai_map_text_tsim",
+          values: mapTextValues,
+          sourceIds: textSegments.map((item) => item.id),
+          confidence: textSegments.length > 0 ? textSegments.reduce((sum, item) => sum + Number(item.confidence || 0), 0) / textSegments.length : undefined,
+          boost: 2,
+          notes: "Indexable text extracted from the map image, including street labels and other fine-grained map text not suitable for Aardvark fields.",
+        },
+        {
+          field: "ogm_ai_placename_sm",
+          values: placenames.map((place) => place.name),
+          sourceIds: placenames.flatMap((place) => place.sourceTextIds || []),
+          confidence: placenames.length > 0 ? placenames.reduce((sum, place) => sum + Number(place.confidence || 0), 0) / placenames.length : undefined,
+          boost: 3,
+        },
+      ],
+    },
+    review: {
+      status: "machine_generated",
+      notes: "Review derived metadata, placenames, and OCR before treating candidate values as authoritative.",
+    },
+  });
 }
 
 async function loadJsZip() {
@@ -1831,6 +2872,8 @@ async function zipEntriesFromBuffer(buffer) {
       name,
       lowerName: name.toLowerCase(),
       size: entryBuffer.length,
+      modifiedAt: entry.date instanceof Date && Number.isFinite(entry.date.getTime()) ? entry.date.toISOString() : "",
+      sha256: sha256(entryBuffer),
       buffer: entryBuffer,
     });
   }
@@ -2187,6 +3230,15 @@ function rasterSourceFormat(name) {
   return "Raster";
 }
 
+function entryBytes(entry) {
+  return Number(entry?.size ?? entry?.buffer?.length ?? 0);
+}
+
+function entryChecksum(entry) {
+  if (entry?.sha256) return entry.sha256;
+  return entry?.buffer ? sha256(entry.buffer) : "";
+}
+
 function analyzeShapefilePackage(entries, shapefile, fileName) {
   const shpSummary = parseShpSummary(shapefile.shp.buffer);
   const dbf = shapefile.dbf ? parseDbf(shapefile.dbf.buffer) : null;
@@ -2199,7 +3251,12 @@ function analyzeShapefilePackage(entries, shapefile, fileName) {
       fileName,
       format: "ZIP",
       fileCount: entries.length,
-      files: entries.map((entry) => ({ path: entry.name, bytes: entry.buffer.length })),
+      files: entries.map((entry) => ({
+        path: entry.name,
+        bytes: entryBytes(entry),
+        modifiedAt: entry.modifiedAt || "",
+        sha256: entryChecksum(entry),
+      })),
     },
     dataset: {
       kind: "vector",
@@ -2240,7 +3297,12 @@ function analyzeRasterPackage(entries, raster, fileName) {
       fileName,
       format: "ZIP",
       fileCount: entries.length,
-      files: entries.map((entry) => ({ path: entry.name, bytes: entry.buffer.length })),
+      files: entries.map((entry) => ({
+        path: entry.name,
+        bytes: entryBytes(entry),
+        modifiedAt: entry.modifiedAt || "",
+        sha256: entryChecksum(entry),
+      })),
     },
     dataset: {
       kind: "raster",
@@ -2280,7 +3342,11 @@ async function writeEntriesToDirectory(entries, directory) {
     const target = path.join(directory, entry.name);
     const targetDir = path.dirname(target);
     await mkdir(targetDir, { recursive: true });
-    await writeFile(target, entry.buffer);
+    if (entry.filePath) {
+      await copyFile(entry.filePath, target);
+    } else {
+      await writeFile(target, entry.buffer);
+    }
   }
 }
 
@@ -2428,28 +3494,58 @@ function hasRasterGeoreference(manifest, info) {
   return Boolean(manifest.dataset.bbox || info?.geoTransform || info?.gcps?.gcpList?.length || info?.coordinateSystem?.wkt);
 }
 
-async function createCogDerivative({ profile, keys, sourcePath, manifest, statuses, uploaded, log }) {
+function rasterBandMetadataValue(band, domain, key) {
+  return band?.metadata?.[domain]?.[key] ?? band?.metadata?.[""]?.[key] ?? "";
+}
+
+function cogCreationOptionsForRaster(info) {
+  const bands = Array.isArray(info?.bands) ? info.bands : [];
+  const nonAlphaBands = bands.filter((band) => String(band?.colorInterpretation || "").toLowerCase() !== "alpha");
+  const hasPalette = nonAlphaBands.some((band) => String(band?.colorInterpretation || "").toLowerCase() === "palette" || band?.colorTable);
+  const hasSubByteSamples = nonAlphaBands.some((band) => {
+    const nbits = Number(rasterBandMetadataValue(band, "IMAGE_STRUCTURE", "NBITS"));
+    return Number.isFinite(nbits) && nbits > 0 && nbits < 8;
+  });
+  const options = [
+    "COMPRESS=DEFLATE",
+    "BLOCKSIZE=512",
+    "BIGTIFF=IF_SAFER",
+    "NUM_THREADS=ALL_CPUS",
+  ];
+  if (!hasPalette && !hasSubByteSamples) {
+    options.splice(1, 0, "PREDICTOR=YES");
+  }
+  return options;
+}
+
+function cogTranslateArgs(sourcePath, cogPath, creationOptions) {
+  return [
+    "-of", "COG",
+    ...creationOptions.flatMap((option) => ["-co", option]),
+    sourcePath,
+    cogPath,
+  ];
+}
+
+async function createCogDerivative({ profile, keys, sourcePath, manifest, info, statuses, uploaded, log }) {
   if (!await resolveCommandPath("gdal_translate")) {
     statuses.push({ kind: "cog", status: "missing_dependency", command: "gdal_translate", reason: "Install GDAL to create Cloud Optimized GeoTIFF derivatives." });
     return;
   }
   const cogPath = path.join(path.dirname(sourcePath), `${manifest.dataset.baseName}.cog.tif`);
-  const result = await tryExecFile("gdal_translate", [
-    "-of", "COG",
-    "-co", "COMPRESS=DEFLATE",
-    "-co", "PREDICTOR=YES",
-    "-co", "BLOCKSIZE=512",
-    "-co", "BIGTIFF=IF_SAFER",
-    "-co", "NUM_THREADS=ALL_CPUS",
-    sourcePath,
-    cogPath,
-  ], { timeoutMs: 300_000 });
+  let creationOptions = cogCreationOptionsForRaster(info);
+  let result = await tryExecFile("gdal_translate", cogTranslateArgs(sourcePath, cogPath, creationOptions), { timeoutMs: GEOSPATIAL_DERIVATIVE_TIMEOUT_MS });
+  if (!result.ok && creationOptions.includes("PREDICTOR=YES") && /PREDICTOR/i.test(String(result.error || ""))) {
+    await rm(cogPath, { force: true });
+    creationOptions = creationOptions.filter((option) => option !== "PREDICTOR=YES");
+    result = await tryExecFile("gdal_translate", cogTranslateArgs(sourcePath, cogPath, creationOptions), { timeoutMs: GEOSPATIAL_DERIVATIVE_TIMEOUT_MS });
+  }
   if (result.ok && existsSync(cogPath)) {
-    const cogBuffer = await readFile(cogPath);
-    await putObjectBuffer(profile, keys.cog, cogBuffer, "image/tiff");
+    const cogInfo = await stat(cogPath);
+    await putObjectFile(profile, keys.cog, cogPath, "image/tiff");
     uploaded.cogUrl = accessUrlFor(profile, keys.cog);
-    statuses.push({ kind: "cog", status: "created", key: keys.cog, bytes: cogBuffer.length });
-    log("COG derivative uploaded", { key: keys.cog, bytes: cogBuffer.length });
+    statuses.push({ kind: "cog", status: "created", key: keys.cog, bytes: cogInfo.size, creationOptions });
+    log("COG derivative uploaded", { key: keys.cog, bytes: cogInfo.size, creationOptions });
   } else {
     statuses.push({ kind: "cog", status: "failed", reason: result.error || "gdal_translate did not create a COG file." });
   }
@@ -2464,7 +3560,7 @@ async function createRasterGeospatialDerivatives({ profile, keys, entries, raste
     const rasterPath = path.join(tempRoot, raster.source.name);
     const info = await inspectRasterWithGdal(rasterPath, manifest, statuses, log);
     if (hasRasterGeoreference(manifest, info)) {
-      await createCogDerivative({ profile, keys, sourcePath: rasterPath, manifest, statuses, uploaded, log });
+      await createCogDerivative({ profile, keys, sourcePath: rasterPath, manifest, info, statuses, uploaded, log });
     } else {
       statuses.push({ kind: "cog", status: "skipped", reason: "GDAL did not find raster georeferencing; keeping this out of the COG path." });
     }
@@ -2594,11 +3690,14 @@ function buildAardvarkForGeospatialPackage({ resourceId, checksum, fileName, fil
       ...(artifacts.pmtilesUrl ? [{ url: artifacts.pmtilesUrl, label: "PMTiles vector tile derivative" }] : []),
       ...(artifacts.geojsonUrl ? [{ url: artifacts.geojsonUrl, label: "GeoJSON viewer derivative" }] : []),
       ...(artifacts.cogUrl ? [{ url: artifacts.cogUrl, label: "Cloud Optimized GeoTIFF derivative" }] : []),
+      ...(artifacts.archivalSupplementUrl ? [{ url: artifacts.archivalSupplementUrl, label: "Archival accession processing supplement" }] : []),
     ],
     ...(artifacts.geojsonUrl ? { geojson: { url: artifacts.geojsonUrl, label: "GeoJSON viewer derivative" } } : {}),
     ...(artifacts.pmtilesUrl ? { pmtiles: { url: artifacts.pmtilesUrl, label: "PMTiles vector tiles" } } : {}),
     ...(artifacts.cogUrl ? { "https://www.cogeo.org/": { url: artifacts.cogUrl, label: "Cloud Optimized GeoTIFF" } } : {}),
     "https://opengeometadata.org/reference/dataset-manifest": { url: artifacts.manifestUrl, label: "Dataset manifest" },
+    ...(artifacts.archivalSupplementUrl ? { [ARCHIVAL_ACCESSION_SUPPLEMENT_RELATION]: { url: artifacts.archivalSupplementUrl, label: "Archival accession processing supplement" } } : {}),
+    ...(artifacts.archivalSupplementJsonUrl ? { [ARCHIVAL_ACCESSION_SUPPLEMENT_JSON_RELATION]: { url: artifacts.archivalSupplementJsonUrl, label: "Archival accession supplement JSON" } } : {}),
     "https://opengeometadata.org/reference/aardvark-json": { url: artifacts.aardvarkUrl, label: "Aardvark JSON" },
   };
   return {
@@ -2653,6 +3752,532 @@ function buildAardvarkForGeospatialPackage({ resourceId, checksum, fileName, fil
     gbl_suppressed_b: false,
     gbl_mdModified_dt: new Date().toISOString(),
   };
+}
+
+const archivalInventoryItemSchema = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    path: { type: "string" },
+    sizeBytes: { type: "number" },
+    modifiedAt: { type: "string" },
+    mediaType: { type: "string" },
+    fileType: { type: "string" },
+    role: { type: "string" },
+    sha256: { type: "string" },
+    significance: { type: "string" },
+  },
+  required: ["path", "sizeBytes", "modifiedAt", "mediaType", "fileType", "role", "sha256", "significance"],
+};
+
+const archivalDerivativeSchema = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    type: { type: "string" },
+    url: { type: "string" },
+    status: { type: "string" },
+    significance: { type: "string" },
+  },
+  required: ["type", "url", "status", "significance"],
+};
+
+const archivalChecksumSchema = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    path: { type: "string" },
+    algorithm: { type: "string" },
+    value: { type: "string" },
+    purpose: { type: "string" },
+  },
+  required: ["path", "algorithm", "value", "purpose"],
+};
+
+const archivalProcessingEventSchema = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    date: { type: "string" },
+    eventType: { type: "string" },
+    outcome: { type: "string" },
+    agent: { type: "string" },
+    detail: { type: "string" },
+  },
+  required: ["date", "eventType", "outcome", "agent", "detail"],
+};
+
+const ARCHIVAL_ACCESSION_SUPPLEMENT_RESPONSE_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    supplement: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        schemaVersion: { type: "string" },
+        standardsUsed: { type: "array", items: { type: "string" } },
+        resourceId: { type: "string" },
+        accessionTitle: { type: "string" },
+        processingDate: { type: "string" },
+        processingAgent: { type: "string" },
+        sourcePackage: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            fileName: { type: "string" },
+            format: { type: "string" },
+            sizeBytes: { type: "number" },
+            sha256: { type: "string" },
+            fileCount: { type: "number" },
+          },
+          required: ["fileName", "format", "sizeBytes", "sha256", "fileCount"],
+        },
+        scopeAndContent: { type: "string" },
+        appraisalAndSignificance: { type: "string" },
+        arrangement: { type: "string" },
+        technicalDescription: { type: "string" },
+        accessAndUse: { type: "string" },
+        inventory: { type: "array", items: archivalInventoryItemSchema },
+        checksums: { type: "array", items: archivalChecksumSchema },
+        derivatives: { type: "array", items: archivalDerivativeSchema },
+        processingEvents: { type: "array", items: archivalProcessingEventSchema },
+        processingNotes: { type: "array", items: { type: "string" } },
+      },
+      required: [
+        "schemaVersion",
+        "standardsUsed",
+        "resourceId",
+        "accessionTitle",
+        "processingDate",
+        "processingAgent",
+        "sourcePackage",
+        "scopeAndContent",
+        "appraisalAndSignificance",
+        "arrangement",
+        "technicalDescription",
+        "accessAndUse",
+        "inventory",
+        "checksums",
+        "derivatives",
+        "processingEvents",
+        "processingNotes",
+      ],
+    },
+  },
+  required: ["supplement"],
+};
+
+function archivalFileTypeForName(name) {
+  const lower = String(name || "").toLowerCase();
+  if (lower.endsWith(".shp")) return "ESRI Shapefile geometry";
+  if (lower.endsWith(".shx")) return "ESRI Shapefile spatial index";
+  if (lower.endsWith(".dbf")) return "dBASE attribute table";
+  if (lower.endsWith(".prj")) return "Coordinate reference system definition";
+  if (lower.endsWith(".cpg")) return "Character encoding declaration";
+  if (lower.endsWith(".shp.xml")) return "FGDC or ArcGIS metadata XML";
+  if (lower.endsWith(".sbn") || lower.endsWith(".sbx") || lower.endsWith(".qix")) return "Spatial index sidecar";
+  if (/\.(tif|tiff)$/i.test(lower)) return "GeoTIFF raster";
+  if (lower.endsWith(".sid")) return "MrSID raster";
+  if (lower.endsWith(".img")) return "Erdas Imagine raster";
+  if (/\.(jp2|j2k)$/i.test(lower)) return "JPEG2000 raster";
+  if (/\.(tfw|tifw|jgw|j2w|sdw|wld)$/i.test(lower)) return "Raster world file";
+  if (lower.endsWith(".aux") || lower.endsWith(".aux.xml")) return "Raster auxiliary metadata";
+  if (lower.endsWith(".rrd") || lower.endsWith(".ovr")) return "Raster overview pyramid";
+  if (lower.endsWith(".xml")) return "Metadata XML";
+  if (lower.endsWith(".txt")) return "Text metadata or documentation";
+  if (lower.endsWith(".met")) return "Metadata sidecar";
+  return "File";
+}
+
+function archivalFileRoleForName(name) {
+  const lower = String(name || "").toLowerCase();
+  if (lower.endsWith(".shp")) return "Core vector geometry";
+  if (lower.endsWith(".dbf")) return "Feature attribute values";
+  if (lower.endsWith(".shx") || lower.endsWith(".sbn") || lower.endsWith(".sbx") || lower.endsWith(".qix")) return "Index supporting GIS access";
+  if (lower.endsWith(".prj")) return "Coordinate reference system evidence";
+  if (lower.endsWith(".cpg")) return "Text encoding evidence";
+  if (/\.(tif|tiff|sid|img|jp2|j2k)$/i.test(lower)) return "Core raster source";
+  if (/\.(tfw|tifw|jgw|j2w|sdw|wld)$/i.test(lower)) return "Raster georeferencing sidecar";
+  if (lower.endsWith(".aux") || lower.endsWith(".aux.xml") || lower.endsWith(".rrd") || lower.endsWith(".ovr")) return "Raster display and processing support";
+  if (lower.endsWith(".xml") || lower.endsWith(".txt") || lower.endsWith(".met")) return "Descriptive or technical metadata";
+  return "Package component";
+}
+
+function datasetSignificanceSentence(manifest) {
+  const title = humanTitleFromPackage(manifest.dataset.baseName, manifest);
+  if (manifest.dataset.kind === "raster") {
+    return `${title} preserves a georeferenced ${manifest.dataset.sourceFormat || "raster"} source that can support map display, reprojection, and comparison with other spatial evidence.`;
+  }
+  const geometryType = String(manifest.dataset.geometryType || "feature").toLowerCase();
+  if (geometryType.includes("polygon") && /ortho/i.test(String(manifest.dataset.baseName || ""))) {
+    return `${title} appears to be an orthophoto or imagery-footprint polygon dataset; polygon footprints are significant because they document coverage, tile boundaries, and the spatial organization of imagery products.`;
+  }
+  if (geometryType.includes("polygon")) {
+    return `${title} preserves polygon features, which are significant for boundaries, footprints, zones, and other areal evidence that can be overlaid with related GIS layers.`;
+  }
+  return `${title} preserves ${geometryType} geospatial features that can be reused for mapping, spatial analysis, and provenance review.`;
+}
+
+function archivalFileSignificance(name, manifest) {
+  const role = archivalFileRoleForName(name);
+  const datasetSentence = datasetSignificanceSentence(manifest);
+  const lower = String(name || "").toLowerCase();
+  if (lower.endsWith(".shp")) return `${role}. This is the primary geometry file for the source shapefile. ${datasetSentence}`;
+  if (lower.endsWith(".dbf")) return `${role}. This table supplies the descriptive fields that make the geometry intelligible and searchable.`;
+  if (lower.endsWith(".prj")) return `${role}. This file is important for preserving the coordinate system needed to place the dataset correctly.`;
+  if (/\.(tif|tiff|sid|img|jp2|j2k)$/i.test(lower)) return `${role}. This is the primary raster image data. ${datasetSentence}`;
+  if (/\.(tfw|tifw|jgw|j2w|sdw|wld)$/i.test(lower)) return `${role}. This sidecar helps place an image in map coordinates when embedded georeferencing is absent or incomplete.`;
+  if (lower.endsWith(".xml") || lower.endsWith(".txt") || lower.endsWith(".met")) return `${role}. This documentation may record provenance, lineage, coordinate systems, dates, or processing history.`;
+  return `${role}. This file supports faithful preservation and reuse of the source package.`;
+}
+
+function buildArchivalInventory(entries, manifest) {
+  return entries.map((entry) => ({
+    path: entry.name,
+    sizeBytes: entry.size,
+    modifiedAt: entry.modifiedAt || "",
+    mediaType: contentTypeForKey(entry.name),
+    fileType: archivalFileTypeForName(entry.name),
+    role: archivalFileRoleForName(entry.name),
+    sha256: entry.sha256 || sha256(entry.buffer),
+    significance: archivalFileSignificance(entry.name, manifest),
+  }));
+}
+
+function buildArchivalDerivatives(artifacts) {
+  return [
+    { type: "Original submitted package", url: artifacts.originalUrl || "", status: artifacts.originalUrl ? "preserved" : "missing", significance: "Original package retained as submitted for provenance and fixity review." },
+    { type: "Dataset manifest", url: artifacts.manifestUrl || "", status: artifacts.manifestUrl ? "created" : "missing", significance: "Machine-readable processing manifest summarizing detected GIS structure and derivative status." },
+    { type: "Aardvark JSON", url: artifacts.aardvarkUrl || "", status: artifacts.aardvarkUrl ? "created" : "missing", significance: "Catalog metadata record used by OpenGeoMetadata-style discovery." },
+    { type: "GeoJSON", url: artifacts.geojsonUrl || "", status: artifacts.geojsonUrl ? "created" : "not applicable or not created", significance: "Viewer-friendly vector derivative for preview and inspection." },
+    { type: "GeoParquet", url: artifacts.geoParquetUrl || "", status: artifacts.geoParquetUrl ? "created" : "not applicable or not created", significance: "Columnar preservation and analysis derivative for modern geospatial workflows." },
+    { type: "PMTiles", url: artifacts.pmtilesUrl || "", status: artifacts.pmtilesUrl ? "created" : "not applicable or not created", significance: "Single-file vector tile derivative for fast web map preview." },
+    { type: "Cloud Optimized GeoTIFF", url: artifacts.cogUrl || "", status: artifacts.cogUrl ? "created" : "not applicable or not created", significance: "Cloud-native raster derivative suitable for ranged reads and map preview." },
+    { type: "Thumbnail", url: artifacts.thumbnailUrl || "", status: artifacts.thumbnailUrl ? "created" : "not applicable or not created", significance: "Small preview image for discovery interfaces." },
+    { type: "Archival supplement JSON", url: artifacts.archivalSupplementJsonUrl || "", status: artifacts.archivalSupplementJsonUrl ? "created" : "missing", significance: "Structured accession supplement used to render this processing note." },
+  ];
+}
+
+function buildArchivalSupplementFallback({ resourceId, checksum, fileName, fileSize, manifest, artifacts, entries }) {
+  const now = new Date().toISOString();
+  const inventory = buildArchivalInventory(entries, manifest);
+  const title = `${humanTitleFromPackage(manifest.dataset.baseName, manifest)} archival accession supplement`;
+  const checksums = [
+    { path: fileName, algorithm: "SHA-256", value: checksum, purpose: "Submitted ZIP package fixity value computed in the browser before upload." },
+    ...inventory.map((item) => ({
+      path: item.path,
+      algorithm: "SHA-256",
+      value: item.sha256,
+      purpose: "Package component fixity value computed after unpacking for electronic processing documentation.",
+    })),
+  ];
+  const derivativeTypes = (manifest.derivatives || [])
+    .map((item) => `${item.kind}: ${item.status}${item.reason ? ` (${item.reason})` : ""}`)
+    .join("; ");
+  return {
+    schemaVersion: "OGM Archival Accession Supplement 1.0",
+    standardsUsed: [
+      "DACS-inspired scope, content, arrangement, and access notes",
+      "PREMIS-inspired preservation events and fixity",
+      "BagIt-inspired file inventory and checksums",
+      "OpenGeoMetadata Aardvark companion record",
+    ],
+    resourceId,
+    accessionTitle: title,
+    processingDate: now,
+    processingAgent: "Aardvark Metadata Studio enrichment proxy",
+    sourcePackage: {
+      fileName,
+      format: manifest.package?.format || "ZIP",
+      sizeBytes: Number(fileSize || 0),
+      sha256: checksum,
+      fileCount: Number(manifest.package?.fileCount || inventory.length),
+    },
+    scopeAndContent: `${datasetSignificanceSentence(manifest)} The accession package contains ${inventory.length} file(s) arranged by their source paths inside the submitted ZIP package.`,
+    appraisalAndSignificance: `Retained because the package includes geospatial source data plus sidecars needed to preserve context, coordinate reference information, attributes, and derivative reproducibility. ${datasetSignificanceSentence(manifest)}`,
+    arrangement: "Original internal package paths were retained. Browser-expanded directories are re-packaged into a single ZIP payload for processing while preserving relative paths and source file dates when available.",
+    technicalDescription: `Detected ${manifest.dataset.kind} dataset; source format ${manifest.dataset.sourceFormat || "unknown"}; geometry/type ${manifest.dataset.geometryType || "unknown"}; feature count ${manifest.dataset.featureCount || 0}; CRS ${manifest.crs?.normalized || (manifest.crs?.wkt ? "WKT supplied" : "not detected")}. Derivative outcomes: ${derivativeTypes || "none recorded"}.`,
+    accessAndUse: "Access rights default to the accompanying Aardvark record. Review local rights statements before public distribution or derivative reuse.",
+    inventory,
+    checksums,
+    derivatives: buildArchivalDerivatives(artifacts),
+    processingEvents: [
+      { date: now, eventType: "ingest", outcome: "success", agent: "Aardvark Metadata Studio", detail: `Received ${fileName} and computed source SHA-256 ${checksum}.` },
+      { date: now, eventType: "analysis", outcome: "success", agent: "enrichment-proxy geospatial analyzer", detail: `Identified ${manifest.dataset.kind} dataset ${manifest.dataset.baseName}.` },
+      { date: now, eventType: "fixity", outcome: "success", agent: "enrichment-proxy SHA-256 inventory", detail: `Computed SHA-256 checksums for ${inventory.length} package component(s).` },
+      { date: now, eventType: "derivative_generation", outcome: "recorded", agent: "GDAL/ogr2ogr/tippecanoe where available", detail: derivativeTypes || "No derivative statuses were recorded." },
+    ],
+    processingNotes: [
+      "This supplement is generated in addition to the OpenGeoMetadata Aardvark record.",
+      "Narrative description may be enhanced by OpenAI, while file paths, sizes, dates, and checksums are preserved from deterministic processing.",
+    ],
+  };
+}
+
+function normalizeArchivalSupplement(candidate, fallback) {
+  const next = { ...fallback, ...(candidate && typeof candidate === "object" ? candidate : {}) };
+  const candidateInventory = Array.isArray(candidate?.inventory) ? candidate.inventory : [];
+  const candidateByPath = new Map(candidateInventory.map((item) => [String(item?.path || ""), item]));
+  next.schemaVersion = fallback.schemaVersion;
+  next.resourceId = fallback.resourceId;
+  next.processingDate = fallback.processingDate;
+  next.processingAgent = fallback.processingAgent;
+  next.sourcePackage = fallback.sourcePackage;
+  next.inventory = fallback.inventory.map((item) => {
+    const candidateItem = candidateByPath.get(item.path);
+    return {
+      ...item,
+      significance: String(candidateItem?.significance || item.significance),
+    };
+  });
+  next.checksums = fallback.checksums;
+  next.derivatives = fallback.derivatives;
+  next.processingEvents = fallback.processingEvents;
+  next.standardsUsed = asStringArray(next.standardsUsed).length > 0 ? asStringArray(next.standardsUsed) : fallback.standardsUsed;
+  next.processingNotes = asStringArray(next.processingNotes).length > 0 ? asStringArray(next.processingNotes) : fallback.processingNotes;
+  for (const key of ["accessionTitle", "scopeAndContent", "appraisalAndSignificance", "arrangement", "technicalDescription", "accessAndUse"]) {
+    next[key] = String(next[key] || fallback[key] || "");
+  }
+  return next;
+}
+
+function archivalSupplementWriterMessages({ fallbackSupplement, manifest, artifacts }) {
+  return {
+    systemPrompt: [
+      "You are an archivist and digital preservation specialist.",
+      "Create a concise archival accession processing supplement for a geospatial data package.",
+      "Use DACS-style descriptive notes and PREMIS-style preservation event language.",
+      "Do not alter file paths, sizes, dates, checksums, derivative URLs, resource identifiers, or processing events.",
+      "Improve the narrative significance of the dataset and individual files when the manifest supports it.",
+      "Return JSON matching the provided schema only.",
+    ].join(" "),
+    userPrompt: [
+      "Prepare an archival accession supplement for this processed geospatial package.",
+      "",
+      "Explain what the found resource is, why it is significant, and how its components support preservation and reuse.",
+      "For file-level significance, explain specialized GIS components such as .shp, .dbf, .prj, world files, COGs, PMTiles, and imagery footprint polygons when present.",
+      "",
+      "Deterministic supplement draft:",
+      safeJsonStringify(fallbackSupplement, 2),
+      "",
+      "Geospatial manifest:",
+      safeJsonStringify(manifest, 2),
+      "",
+      "Artifact URLs:",
+      safeJsonStringify(artifacts, 2),
+    ].join("\n"),
+  };
+}
+
+async function callArchivalSupplementWriter(modelProfile, request, context) {
+  if (process.env.ENRICHMENT_PROXY_MOCK_OPENAI === "1") {
+    return { supplement: context.fallbackSupplement };
+  }
+  const apiKey = resolveEnv(modelProfile.apiKeyEnv, "OpenAI API key");
+  const model = request.model || modelProfile.defaultModel;
+  const { systemPrompt, userPrompt } = archivalSupplementWriterMessages(context);
+  const body = {
+    model,
+    input: [
+      { role: "system", content: [{ type: "input_text", text: systemPrompt }] },
+      { role: "user", content: [{ type: "input_text", text: userPrompt }] },
+    ],
+    text: {
+      format: {
+        type: "json_schema",
+        name: "archival_accession_supplement_writer",
+        schema: ARCHIVAL_ACCESSION_SUPPLEMENT_RESPONSE_SCHEMA,
+        strict: true,
+      },
+    },
+    ...normalizeOpenAIModelParams(model, request.modelParams || modelProfile.modelParams || {}),
+  };
+  const { rawResponse, requestBody } = await postOpenAIResponse(apiKey, body);
+  const text = extractResponseText(rawResponse);
+  const parsed = text ? JSON.parse(text) : rawResponse;
+  return { ...parsed, rawResponse, requestBody, systemPrompt, userPrompt, model, usage: rawResponse.usage };
+}
+
+function markdownCell(value) {
+  return String(value || "").replace(/\|/g, "\\|").replace(/\s+/g, " ").trim();
+}
+
+function renderArchivalSupplementMarkdown(supplement) {
+  const lines = [
+    `# ${supplement.accessionTitle}`,
+    "",
+    `Resource ID: ${supplement.resourceId}`,
+    `Processing date: ${supplement.processingDate}`,
+    `Processing agent: ${supplement.processingAgent}`,
+    `Standards used: ${(supplement.standardsUsed || []).join("; ")}`,
+    "",
+    "## Source Package",
+    "",
+    `- File name: ${supplement.sourcePackage.fileName}`,
+    `- Format: ${supplement.sourcePackage.format}`,
+    `- Size: ${formatBytes(supplement.sourcePackage.sizeBytes)} (${supplement.sourcePackage.sizeBytes} bytes)`,
+    `- File count: ${supplement.sourcePackage.fileCount}`,
+    `- SHA-256: ${supplement.sourcePackage.sha256}`,
+    "",
+    "## Scope and Content",
+    "",
+    supplement.scopeAndContent,
+    "",
+    "## Appraisal and Significance",
+    "",
+    supplement.appraisalAndSignificance,
+    "",
+    "## Arrangement",
+    "",
+    supplement.arrangement,
+    "",
+    "## Technical Description",
+    "",
+    supplement.technicalDescription,
+    "",
+    "## Inventory",
+    "",
+    "| Path | File type | Role | Size | Modified | SHA-256 | Significance |",
+    "| --- | --- | --- | ---: | --- | --- | --- |",
+    ...(supplement.inventory || []).map((item) => [
+      markdownCell(item.path),
+      markdownCell(item.fileType),
+      markdownCell(item.role),
+      markdownCell(formatBytes(item.sizeBytes)),
+      markdownCell(item.modifiedAt || "unknown"),
+      markdownCell(item.sha256),
+      markdownCell(item.significance),
+    ].join(" | ")).map((row) => `| ${row} |`),
+    "",
+    "## Generated Derivatives",
+    "",
+    "| Type | Status | URL | Significance |",
+    "| --- | --- | --- | --- |",
+    ...(supplement.derivatives || []).map((item) => [
+      markdownCell(item.type),
+      markdownCell(item.status),
+      markdownCell(item.url),
+      markdownCell(item.significance),
+    ].join(" | ")).map((row) => `| ${row} |`),
+    "",
+    "## Preservation Events",
+    "",
+    ...(supplement.processingEvents || []).map((event) => `- ${event.date} - ${event.eventType} - ${event.outcome} - ${event.agent}: ${event.detail}`),
+    "",
+    "## Access and Use",
+    "",
+    supplement.accessAndUse,
+    "",
+    "## Processing Notes",
+    "",
+    ...(supplement.processingNotes || []).map((note) => `- ${note}`),
+    "",
+  ];
+  return `${lines.join("\n").replace(/\n{3,}/g, "\n\n").trim()}\n`;
+}
+
+function imageInventorySignificance(fileName, contentType) {
+  if (/\.(tiff?|jp2|j2k)$/i.test(fileName)) {
+    return "Primary high-resolution source image retained for preservation, IIIF tiling, OCR, derivative generation, and future reprocessing.";
+  }
+  if (/\.(jpe?g|png|webp)$/i.test(fileName)) {
+    return "Submitted access image retained as the source supplied to this processing run; compare against higher-fidelity TIFF/JPEG2000 siblings when present.";
+  }
+  return `Submitted ${contentType || "image"} source retained for preservation and processing provenance.`;
+}
+
+function buildImageArchivalSupplement({ resourceId, checksum, fileName, fileSize, contentType, modifiedAt, extraction, artifacts, metadataDocuments = [] }) {
+  const now = new Date().toISOString();
+  const inventory = [
+    {
+      path: fileName,
+      sizeBytes: Number(fileSize || 0),
+      modifiedAt: modifiedAt || "",
+      mediaType: contentType || contentTypeForKey(fileName),
+      fileType: archivalFileTypeForName(fileName) === "File" ? "Image source" : archivalFileTypeForName(fileName),
+      role: "Primary submitted image",
+      sha256: checksum,
+      significance: imageInventorySignificance(fileName, contentType),
+    },
+    ...metadataDocuments.map((document, index) => {
+      const text = String(document.text || "");
+      return {
+        path: `metadata_sources/${String(index + 1).padStart(2, "0")}-${document.name}`,
+        sizeBytes: Number(document.size || Buffer.byteLength(text, "utf8")),
+        modifiedAt: "",
+        mediaType: document.type || contentTypeForMetadataKey(document.name),
+        fileType: archivalFileTypeForName(document.name),
+        role: "Companion descriptive metadata",
+        sha256: sha256(Buffer.from(text, "utf8")),
+        significance: "Companion documentation that may record title, creator, date, place names, rights, or scanning context used to improve the catalog record.",
+      };
+    }),
+  ];
+  const checksums = inventory.map((item) => ({
+    path: item.path,
+    algorithm: "SHA-256",
+    value: item.sha256,
+    purpose: item.path === fileName
+      ? "Submitted image fixity value computed in the browser before upload and verified by the proxy."
+      : "Companion metadata fixity value computed during electronic processing.",
+  }));
+  const textCount = Array.isArray(extraction?.text) ? extraction.text.length : 0;
+  const textGroupCount = Array.isArray(extraction?.text_groups) ? extraction.text_groups.length : 0;
+  const placeCount = Array.isArray(extraction?.placenames) ? extraction.placenames.length : 0;
+  const description = String(extraction?.description || "").trim();
+  return {
+    schemaVersion: "OGM Archival Accession Supplement 1.0",
+    standardsUsed: [
+      "DACS-inspired scope, content, arrangement, and access notes",
+      "PREMIS-inspired preservation events and fixity",
+      "BagIt-inspired file inventory and checksums",
+      "OpenGeoMetadata Aardvark companion record",
+    ],
+    resourceId,
+    accessionTitle: `${fileName.replace(/\.[^.]+$/, "") || resourceId} archival accession supplement`,
+    processingDate: now,
+    processingAgent: "Aardvark Metadata Studio enrichment proxy",
+    sourcePackage: {
+      fileName,
+      format: contentType || contentTypeForKey(fileName),
+      sizeBytes: Number(fileSize || 0),
+      sha256: checksum,
+      fileCount: inventory.length,
+    },
+    scopeAndContent: description || `Digitized map or image source ${fileName} processed for discovery, IIIF access, text extraction, and preservation metadata.`,
+    appraisalAndSignificance: "Retained because the image is a source or source-like representation used to create access derivatives, OCR/enrichment evidence, and the companion Aardvark record.",
+    arrangement: "The submitted image is preserved as the original_file object. Generated derivatives and metadata outputs are arranged under derivative, IIIF, thumbnail, enrichment, and accession supplement paths.",
+    technicalDescription: `Detected content type ${contentType || contentTypeForKey(fileName)}. Processing produced IIIF Level 0 access files, a thumbnail, extraction evidence with ${textCount} text segment(s), ${textGroupCount} consolidated text group(s), and ${placeCount} placename candidate(s), and optional COG output when the source was a suitable raster.`,
+    accessAndUse: "Access rights default to the accompanying Aardvark record. Review local rights statements before public distribution or derivative reuse.",
+    inventory,
+    checksums,
+    derivatives: [
+      { type: "Original submitted image", url: artifacts.originalUrl || "", status: artifacts.originalUrl ? "preserved" : "missing", significance: "Original uploaded image retained for provenance and reprocessing." },
+      { type: "IIIF Level 0", url: artifacts.iiifInfoUrl || "", status: artifacts.iiifInfoUrl ? "created" : "missing", significance: "Tile pyramid and info.json used for deep zoom access and text review overlays." },
+      { type: "Thumbnail", url: artifacts.thumbnailUrl || "", status: artifacts.thumbnailUrl ? "created" : "missing", significance: "Small preview image for discovery interfaces." },
+      { type: "Cloud Optimized GeoTIFF", url: artifacts.cogUrl || "", status: artifacts.cogUrl ? "created" : "not applicable or not created", significance: "Cloud-native raster derivative produced when the image has suitable raster/georeference characteristics." },
+      { type: "Enrichment response", url: artifacts.extractionUrl || "", status: artifacts.extractionUrl ? "created" : "missing", significance: "Machine-readable OCR, placename, bounding-box, and descriptive extraction evidence." },
+      { type: "AI Enrichments JSON", url: artifacts.aiEnrichmentsUrl || "", status: artifacts.aiEnrichmentsUrl ? "created" : "missing", significance: "Research provenance record preserving provider calls, exact prompts, raw responses, extracted text, and derived metadata evidence." },
+      { type: "Aardvark JSON", url: artifacts.aardvarkUrl || "", status: artifacts.aardvarkUrl ? "created" : "missing", significance: "Catalog metadata record used by OpenGeoMetadata-style discovery." },
+      { type: "Archival supplement JSON", url: artifacts.archivalSupplementJsonUrl || "", status: artifacts.archivalSupplementJsonUrl ? "created" : "missing", significance: "Structured accession supplement used to render this processing note." },
+    ],
+    processingEvents: [
+      { date: now, eventType: "ingest", outcome: "success", agent: "Aardvark Metadata Studio", detail: `Received ${fileName} and verified SHA-256 ${checksum}.` },
+      { date: now, eventType: "derivative_generation", outcome: "recorded", agent: "enrichment-proxy image pipeline", detail: "Generated IIIF/thumbnail outputs and optional COG derivative when appropriate." },
+      { date: now, eventType: "metadata_enrichment", outcome: "recorded", agent: "configured OCR/OpenAI enrichment providers", detail: `Recorded ${textCount} text segment(s) and ${placeCount} placename candidate(s).` },
+      { date: now, eventType: "fixity", outcome: "success", agent: "enrichment-proxy SHA-256 inventory", detail: `Recorded checksums for ${inventory.length} file/inventory item(s).` },
+    ],
+    processingNotes: [
+      "This supplement is generated in addition to the OpenGeoMetadata Aardvark record.",
+      "JPEG access derivatives may be skipped at folder intake when matching TIFF or JPEG2000 source files are present.",
+    ],
+  };
+}
+
+async function writeArchivalSupplementArtifacts(profile, keys, supplement) {
+  await putObjectBuffer(profile, keys.archivalSupplementJson, Buffer.from(safeJsonStringify(supplement, 2), "utf8"), "application/json");
+  await putObjectBuffer(profile, keys.archivalSupplement, Buffer.from(renderArchivalSupplementMarkdown(supplement), "utf8"), "text/markdown; charset=utf-8");
 }
 
 const OGM_AARDVARK_CONTROLLED_VALUE_GUIDANCE = [
@@ -2734,10 +4359,10 @@ async function callAardvarkMetadataWriter(modelProfile, request, context) {
     },
     ...normalizeOpenAIModelParams(model, request.modelParams || modelProfile.modelParams || {}),
   };
-  const rawResponse = await postOpenAIResponse(apiKey, body);
+  const { rawResponse, requestBody } = await postOpenAIResponse(apiKey, body);
   const text = extractResponseText(rawResponse);
   const parsed = text ? JSON.parse(text) : rawResponse;
-  return { ...parsed, rawResponse, usage: rawResponse.usage };
+  return { ...parsed, rawResponse, requestBody, systemPrompt, userPrompt, model, usage: rawResponse.usage };
 }
 
 function geospatialAardvarkWriterMessages({ manifest, baseResource, batchDefaults, artifacts, fileName, checksum, resourceId }) {
@@ -2799,34 +4424,53 @@ async function callGeospatialAardvarkMetadataWriter(modelProfile, request, conte
     },
     ...normalizeOpenAIModelParams(model, request.modelParams || modelProfile.modelParams || {}),
   };
-  const rawResponse = await postOpenAIResponse(apiKey, body);
+  const { rawResponse, requestBody } = await postOpenAIResponse(apiKey, body);
   const text = extractResponseText(rawResponse);
   const parsed = text ? JSON.parse(text) : rawResponse;
-  return { ...parsed, rawResponse, usage: rawResponse.usage };
+  return { ...parsed, rawResponse, requestBody, systemPrompt, userPrompt, model, usage: rawResponse.usage };
 }
 
-async function processGeospatialPackage(config, body) {
-  const jobId = body.jobId || crypto.randomUUID();
-  const fileName = sanitizeFileName(body.file?.name || "geospatial_package.zip");
-  const { log, milestones } = createUploadLogger(jobId, fileName);
-  const storageProfile = findProfile(config, "storage", body.storageProfileId);
-  const modelProfile = findProfile(config, "model", body.modelProfileId);
-  const checksum = String(body.checksum || body.file?.checksum || "");
-  if (!checksum) throw new Error("Geospatial package request is missing a checksum.");
-  const buffer = Buffer.from(String(body.file?.base64 || ""), "base64");
-  if (buffer.length === 0) throw new Error("Geospatial package request did not include file bytes.");
-  if (!/\.zip$/i.test(fileName)) throw new Error("Geospatial packages must be submitted as .zip files. Drop loose shapefile or raster sidecars in the browser so they can be grouped into a ZIP before processing.");
-
+async function completeGeospatialProcessing({ storageProfile, modelProfile, body, fileName, checksum, fileSize, analysis, uploadOriginal, log, milestones }) {
   const resourceId = `geodata-${checksum.slice(0, 16)}`;
   const keys = geospatialUploadKeys(storageProfile, resourceId, fileName);
   const artifacts = {
     originalUrl: accessUrlFor(storageProfile, keys.original),
     manifestUrl: accessUrlFor(storageProfile, keys.manifest),
+    archivalSupplementUrl: accessUrlFor(storageProfile, keys.archivalSupplement),
+    archivalSupplementJsonUrl: accessUrlFor(storageProfile, keys.archivalSupplementJson),
     aardvarkUrl: accessUrlFor(storageProfile, keys.aardvark),
   };
 
-  log("Geospatial package analysis started", { bytes: buffer.length });
-  const analysis = await analyzeGeospatialPackage(buffer, fileName);
+  if (body.forceReprocess !== true
+    && await objectExists(storageProfile, keys.archivalSupplement)
+    && await objectExists(storageProfile, keys.aardvark)) {
+    log("Geospatial package already has archival accession supplement; returning existing resource", { resourceId });
+    const resource = ensureArchivalSupplementReferences(await fetchJsonObject(storageProfile, keys.aardvark), artifacts);
+    const existingArtifacts = geospatialArtifactUrlsForResource(storageProfile, keys, resource, artifacts);
+    await putObjectBuffer(storageProfile, keys.aardvark, Buffer.from(safeJsonStringify(resource, 2), "utf8"), "application/json");
+    const manifest = await objectExists(storageProfile, keys.manifest)
+      ? await fetchJsonObject(storageProfile, keys.manifest)
+      : {};
+    const archivalSupplement = await objectExists(storageProfile, keys.archivalSupplementJson)
+      ? await fetchJsonObject(storageProfile, keys.archivalSupplementJson)
+      : null;
+    return {
+      cached: true,
+      checksum,
+      resourceId,
+      fileName,
+      artifacts: existingArtifacts,
+      manifest,
+      rawResponse: null,
+      usage: null,
+      aardvarkJson: resource,
+      distributions: distributionsFromResource(resource),
+      aardvarkEvidence: [],
+      archivalSupplement,
+      proxyMilestones: milestones,
+    };
+  }
+
   log("Geospatial package manifest created", {
     kind: analysis.manifest.dataset.kind,
     features: analysis.manifest.dataset.featureCount,
@@ -2834,8 +4478,8 @@ async function processGeospatialPackage(config, body) {
     fields: analysis.manifest.attributes?.fieldCount || 0,
   });
 
-  log("Original geospatial package upload started", { key: keys.original });
-  await putObjectBuffer(storageProfile, keys.original, buffer, "application/zip");
+  log("Original geospatial package upload started", { key: keys.original, bytes: fileSize });
+  await uploadOriginal(keys);
   log("Original geospatial package upload complete", { key: keys.original });
 
   const derivativeResult = await createGeospatialDerivatives({
@@ -2854,11 +4498,40 @@ async function processGeospatialPackage(config, body) {
   log("Uploading geospatial package manifest", { key: keys.manifest });
   await putObjectBuffer(storageProfile, keys.manifest, Buffer.from(safeJsonStringify(analysis.manifest, 2), "utf8"), "application/json");
 
+  const fallbackSupplement = buildArchivalSupplementFallback({
+    resourceId,
+    checksum,
+    fileName,
+    fileSize,
+    manifest: analysis.manifest,
+    artifacts: finalArtifacts,
+    entries: analysis.entries,
+  });
+  let archivalSupplement = fallbackSupplement;
+  let supplementWriter = null;
+  try {
+    log("Archival accession supplement writer started", { model: body.model || modelProfile.defaultModel });
+    supplementWriter = await callArchivalSupplementWriter(modelProfile, body, {
+      fallbackSupplement,
+      manifest: analysis.manifest,
+      artifacts: finalArtifacts,
+    });
+    archivalSupplement = normalizeArchivalSupplement(supplementWriter.supplement, fallbackSupplement);
+    log("Archival accession supplement writer complete", { inventoryFiles: archivalSupplement.inventory.length });
+  } catch (error) {
+    log("Archival accession supplement writer failed; using deterministic fallback", { error: error.message || String(error) });
+    archivalSupplement = fallbackSupplement;
+  }
+
+  log("Uploading archival accession supplement", { key: keys.archivalSupplement });
+  await putObjectBuffer(storageProfile, keys.archivalSupplementJson, Buffer.from(safeJsonStringify(archivalSupplement, 2), "utf8"), "application/json");
+  await putObjectBuffer(storageProfile, keys.archivalSupplement, Buffer.from(renderArchivalSupplementMarkdown(archivalSupplement), "utf8"), "text/markdown; charset=utf-8");
+
   const baseResource = buildAardvarkForGeospatialPackage({
     resourceId,
     checksum,
     fileName,
-    fileSize: buffer.length,
+    fileSize,
     manifest: analysis.manifest,
     batchDefaults: body.batchDefaults || {},
     artifacts: finalArtifacts,
@@ -2909,12 +4582,186 @@ async function processGeospatialPackage(config, body) {
     artifacts: finalArtifacts,
     manifest: analysis.manifest,
     rawResponse: writer?.rawResponse,
-    usage: writer?.usage,
+    usage: { aardvark: writer?.usage, archivalSupplement: supplementWriter?.usage },
     aardvarkJson: resource,
     distributions,
     aardvarkEvidence: writer?.evidence || [],
+    archivalSupplement,
     proxyMilestones: milestones,
   };
+}
+
+async function processGeospatialPackage(config, body) {
+  const jobId = body.jobId || crypto.randomUUID();
+  const fileName = sanitizeFileName(body.file?.name || "geospatial_package.zip");
+  const { log, milestones } = createUploadLogger(jobId, fileName);
+  const storageProfile = findProfile(config, "storage", body.storageProfileId);
+  const modelProfile = findProfile(config, "model", body.modelProfileId);
+  const checksum = String(body.checksum || body.file?.checksum || "");
+  if (!checksum) throw new Error("Geospatial package request is missing a checksum.");
+  const buffer = Buffer.from(String(body.file?.base64 || ""), "base64");
+  if (buffer.length === 0) throw new Error("Geospatial package request did not include file bytes.");
+  if (!/\.zip$/i.test(fileName)) throw new Error("Geospatial packages must be submitted as .zip files. Drop loose shapefile or raster sidecars in the browser so they can be grouped into a ZIP before processing.");
+
+  log("Geospatial package analysis started", { bytes: buffer.length });
+  const analysis = await analyzeGeospatialPackage(buffer, fileName);
+  return completeGeospatialProcessing({
+    storageProfile,
+    modelProfile,
+    body,
+    fileName,
+    checksum,
+    fileSize: buffer.length,
+    analysis,
+    uploadOriginal: (keys) => putObjectBuffer(storageProfile, keys.original, buffer, "application/zip"),
+    log,
+    milestones,
+  });
+
+}
+
+function safeUploadRelativePath(value) {
+  const normalized = normalizeZipPath(value || "").replace(/^\/+/g, "");
+  const parts = normalized.split("/").filter(Boolean);
+  if (parts.length === 0 || parts.some((part) => part === "." || part === "..")) {
+    throw new Error(`Unsafe upload file path: ${value}`);
+  }
+  return parts.join("/");
+}
+
+async function createZipFromDirectory(sourceDirectory, zipPath) {
+  const zipCommand = await resolveCommandPath("zip");
+  if (!zipCommand) throw new Error("Large expanded geospatial packages require the local zip command so the proxy can package files without browser memory pressure.");
+  await execFileAsync(zipCommand, ["-r", "-q", zipPath, "."], {
+    cwd: sourceDirectory,
+    timeout: 60 * 60 * 1000,
+    maxBuffer: 1024 * 1024 * 16,
+  });
+}
+
+async function createEntriesFromSessionFiles(files) {
+  const entries = [];
+  for (const file of files) {
+    const shouldBuffer = !isRasterSourceEntry(file.relativePath) || file.size <= 64 * 1024 * 1024;
+    entries.push({
+      name: file.relativePath,
+      lowerName: file.relativePath.toLowerCase(),
+      size: file.size,
+      modifiedAt: file.modifiedAt || "",
+      sha256: file.sha256,
+      filePath: file.filePath,
+      ...(shouldBuffer ? { buffer: await readFile(file.filePath) } : {}),
+    });
+  }
+  entries.sort((a, b) => a.name.localeCompare(b.name));
+  return entries;
+}
+
+function cleanupExpiredGeospatialUploadSessions() {
+  const now = Date.now();
+  for (const [sessionId, session] of geospatialUploadSessions.entries()) {
+    if (now - Number(session.createdAt || 0) <= GEOSPATIAL_UPLOAD_SESSION_TTL_MS) continue;
+    geospatialUploadSessions.delete(sessionId);
+    rm(session.tempRoot, { recursive: true, force: true }).catch((error) => {
+      console.warn(`[upload:${sessionId}] Failed to remove expired upload session`, error?.message || String(error));
+    });
+  }
+}
+
+async function createGeospatialUploadSession(_config, body) {
+  cleanupExpiredGeospatialUploadSessions();
+  const sessionId = `geo-session-${crypto.randomUUID()}`;
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "ogm-geospatial-upload-"));
+  const session = {
+    id: sessionId,
+    tempRoot,
+    filesRoot: path.join(tempRoot, "files"),
+    createdAt: Date.now(),
+    request: body || {},
+    files: [],
+  };
+  await mkdir(session.filesRoot, { recursive: true });
+  geospatialUploadSessions.set(sessionId, session);
+  return { sessionId };
+}
+
+async function uploadGeospatialSessionFile(req, url) {
+  cleanupExpiredGeospatialUploadSessions();
+  const parts = url.pathname.split("/").filter(Boolean);
+  const sessionId = parts[parts.length - 2];
+  const session = geospatialUploadSessions.get(sessionId);
+  if (!session) throw new Error(`Geospatial upload session not found: ${sessionId}`);
+  const relativePath = safeUploadRelativePath(url.searchParams.get("path") || "");
+  const modifiedAt = url.searchParams.get("modifiedAt") || "";
+  const target = path.join(session.filesRoot, relativePath);
+  if (!target.startsWith(`${session.filesRoot}${path.sep}`)) throw new Error(`Unsafe upload target path: ${relativePath}`);
+  await mkdir(path.dirname(target), { recursive: true });
+  const hash = crypto.createHash("sha256");
+  let size = 0;
+  const writer = createWriteStream(target);
+  await pipeline(req, async function* (source) {
+    for await (const chunk of source) {
+      size += chunk.length;
+      hash.update(chunk);
+      yield chunk;
+    }
+  }, writer);
+  const item = {
+    relativePath,
+    filePath: target,
+    size,
+    modifiedAt,
+    sha256: hash.digest("hex"),
+  };
+  session.files = session.files.filter((file) => file.relativePath !== relativePath);
+  session.files.push(item);
+  return { sessionId, path: relativePath, size, checksum: item.sha256 };
+}
+
+async function completeGeospatialUploadSession(config, body) {
+  cleanupExpiredGeospatialUploadSessions();
+  const sessionId = body.sessionId;
+  const session = geospatialUploadSessions.get(sessionId);
+  if (!session) throw new Error(`Geospatial upload session not found: ${sessionId}`);
+  const request = { ...(session.request || {}), ...(body.request || {}), ...(body || {}) };
+  const fileName = sanitizeFileName(request.fileName || request.file?.name || "geospatial_package.zip");
+  const { log, milestones } = createUploadLogger(request.jobId || crypto.randomUUID(), fileName);
+  const storageProfile = findProfile(config, "storage", request.storageProfileId);
+  const modelProfile = findProfile(config, "model", request.modelProfileId);
+  if (session.files.length === 0) throw new Error("Geospatial upload session has no files.");
+  const zipPath = path.join(session.tempRoot, fileName.endsWith(".zip") ? fileName : `${fileName}.zip`);
+  try {
+    log("Proxy-side ZIP packaging started", { files: session.files.length });
+    await createZipFromDirectory(session.filesRoot, zipPath);
+    const zipInfo = await stat(zipPath);
+    const checksum = await sha256File(zipPath);
+    const entries = await createEntriesFromSessionFiles(session.files);
+    const shapefile = findShapefileSet(entries);
+    const raster = shapefile ? null : findRasterSet(entries);
+    const analysis = shapefile
+      ? analyzeShapefilePackage(entries, shapefile, fileName)
+      : raster
+        ? analyzeRasterPackage(entries, raster, fileName)
+        : null;
+    if (!analysis) {
+      throw new Error("Geospatial package must contain a shapefile or geospatial raster source. Submit shapefile sidecars or a raster with georeferencing sidecars.");
+    }
+    return await completeGeospatialProcessing({
+      storageProfile,
+      modelProfile,
+      body: request,
+      fileName,
+      checksum,
+      fileSize: zipInfo.size,
+      analysis,
+      uploadOriginal: (keys) => putObjectFile(storageProfile, keys.original, zipPath, "application/zip"),
+      log,
+      milestones,
+    });
+  } finally {
+    geospatialUploadSessions.delete(sessionId);
+    await rm(session.tempRoot, { recursive: true, force: true });
+  }
 }
 
 function buildAardvarkForUpload({ resourceId, checksum, fileName, fileSize, contentType, extraction, batchDefaults = {}, artifacts }) {
@@ -2937,7 +4784,16 @@ function buildAardvarkForUpload({ resourceId, checksum, fileName, fileSize, cont
       "http://schema.org/downloadUrl": [{ url: artifacts.cogUrl, label: "Cloud Optimized GeoTIFF derivative" }],
       "https://www.cogeo.org/": { url: artifacts.cogUrl, label: "Cloud Optimized GeoTIFF" },
     } : {}),
+    ...(artifacts.archivalSupplementUrl ? {
+      "http://schema.org/downloadUrl": [
+        ...(artifacts.cogUrl ? [{ url: artifacts.cogUrl, label: "Cloud Optimized GeoTIFF derivative" }] : []),
+        { url: artifacts.archivalSupplementUrl, label: "Archival accession processing supplement" },
+      ],
+      [ARCHIVAL_ACCESSION_SUPPLEMENT_RELATION]: { url: artifacts.archivalSupplementUrl, label: "Archival accession processing supplement" },
+    } : {}),
+    ...(artifacts.archivalSupplementJsonUrl ? { [ARCHIVAL_ACCESSION_SUPPLEMENT_JSON_RELATION]: { url: artifacts.archivalSupplementJsonUrl, label: "Archival accession supplement JSON" } } : {}),
     "https://opengeometadata.org/reference/enrichment-response": artifacts.extractionUrl,
+    ...(artifacts.aiEnrichmentsUrl ? { [AI_ENRICHMENTS_RELATION]: { url: artifacts.aiEnrichmentsUrl, label: "OpenGeoMetadata AI Enrichments JSON" } } : {}),
     "https://opengeometadata.org/reference/aardvark-json": artifacts.aardvarkUrl,
   };
   const resource = {
@@ -3042,103 +4898,90 @@ async function processUploadedImage(config, body) {
   }
   const metadataDocuments = normalizeMetadataDocuments(body.metadataDocuments);
   const indexKey = checksumIndexKey(storageProfile, checksum);
+  const forceReprocess = body.forceReprocess === true;
   log("Checking checksum index", { indexKey });
+  let indexedUpload = null;
   if (await objectExists(storageProfile, indexKey)) {
-    log("Checksum index hit");
     const index = await fetchJsonObject(storageProfile, indexKey);
     const resourceId = String(index.resourceId || index.resource_id || `uploaded-${checksum.slice(0, 16)}`);
-    const keys = index.keys || uploadKeys(storageProfile, resourceId, fileName);
-    keys.root = keys.root || `${uploadBasePrefix(storageProfile)}/${resourceId}`;
-    keys.metadataSources = keys.metadataSources || `${keys.root}/metadata_sources`;
-    const artifacts = index.artifacts || {
+    const keys = hydrateUploadKeys(storageProfile, index.keys, resourceId, fileName);
+    const artifacts = {
       originalUrl: accessUrlFor(storageProfile, keys.original),
       thumbnailUrl: accessUrlFor(storageProfile, keys.thumbnail),
       iiifInfoUrl: `${accessUrlFor(storageProfile, keys.iiif)}/info.json`,
       extractionUrl: accessUrlFor(storageProfile, keys.extraction),
+      archivalSupplementUrl: accessUrlFor(storageProfile, keys.archivalSupplement),
+      archivalSupplementJsonUrl: accessUrlFor(storageProfile, keys.archivalSupplementJson),
+      aiEnrichmentsUrl: accessUrlFor(storageProfile, keys.aiEnrichments),
       aardvarkUrl: accessUrlFor(storageProfile, keys.aardvark),
+      ...(index.artifacts?.cogUrl ? { cogUrl: index.artifacts.cogUrl } : {}),
     };
-    const aardvarkJson = await fetchJsonObject(storageProfile, keys.aardvark);
-    let extraction = await objectExists(storageProfile, keys.extraction)
-      ? await fetchJsonObject(storageProfile, keys.extraction)
-      : null;
-    let freshExtractionResult = null;
-    if (visionProfile && !isGoogleVisionExtraction(extraction)) {
-      log("Google Cloud Vision OCR refresh started for cached upload", { profile: visionProfile.name || visionProfile.id });
-      const visionImage = await createVisionImageBuffer(buffer, contentType);
-      log("Google Cloud Vision OCR image normalized", { width: visionImage.width, height: visionImage.height, originalBytes: visionImage.originalBytes, normalizedBytes: visionImage.normalizedBytes, quality: visionImage.quality ?? null, maxDimension: visionImage.maxDimension ?? null });
-      freshExtractionResult = await callGoogleVisionOcr(visionProfile, visionImage);
-      extraction = freshExtractionResult.parsedResponse;
-      log("Google Cloud Vision OCR refresh complete for cached upload", { textSegments: extraction?.text?.length || 0, confidence: freshExtractionResult.confidence ?? null });
-      await putObjectBuffer(storageProfile, keys.extraction, Buffer.from(safeJsonStringify(extraction, 2), "utf8"), "application/json");
-    }
-    let finalAardvarkJson = aardvarkJson;
-    let metadataSourceUrls = [];
-    let aardvarkWriter = null;
-    if (extraction) {
-      metadataSourceUrls = await uploadMetadataDocuments(storageProfile, keys, metadataDocuments, log);
-      try {
-        log("Aardvark metadata writer started for cached extraction", { metadataDocuments: metadataDocuments.length });
-        aardvarkWriter = await callAardvarkMetadataWriter(modelProfile, body, {
+    indexedUpload = { resourceId, keys, artifacts, index };
+
+    if (!forceReprocess && await objectExists(storageProfile, keys.aardvark)) {
+      log("Checksum index hit; returning existing upload without reprocessing", { resourceId });
+      let extraction = await objectExists(storageProfile, keys.extraction)
+        ? await fetchJsonObject(storageProfile, keys.extraction)
+        : null;
+      if (!await objectExists(storageProfile, keys.aiEnrichments).catch(() => false)) {
+        delete artifacts.aiEnrichmentsUrl;
+      }
+      let finalAardvarkJson = ensureReferenceJson({ ...await fetchJsonObject(storageProfile, keys.aardvark), id: resourceId }, artifacts);
+      if (!await objectExists(storageProfile, keys.archivalSupplement)) {
+        log("Cached upload is missing archival supplement; creating lightweight accession record", { key: keys.archivalSupplement });
+        const supplement = buildImageArchivalSupplement({
           resourceId,
           checksum,
           fileName,
-          extraction,
-          baseResource: aardvarkJson,
-          batchDefaults: body.batchDefaults || {},
-          artifacts,
-          metadataDocuments,
-          metadataSourceUrls,
-        });
-        finalAardvarkJson = normalizeAardvarkResource(aardvarkWriter.resource, aardvarkJson, {
-          resourceId,
-          checksum,
-          fileName,
+          fileSize: buffer.length,
+          contentType,
+          modifiedAt: file.modifiedAt || "",
           extraction,
           artifacts,
-          metadataSourceUrls,
+          metadataDocuments: [],
         });
-        log("Aardvark metadata writer complete for cached extraction", { title: finalAardvarkJson.dct_title_s });
-      } catch (error) {
-        log("Aardvark metadata writer failed for cached extraction; using deterministic fallback", { error: error.message || String(error) });
-        finalAardvarkJson = normalizeAardvarkResource({}, aardvarkJson, {
-          resourceId,
-          checksum,
-          fileName,
-          extraction,
-          artifacts,
-          metadataSourceUrls,
-        });
+        await writeArchivalSupplementArtifacts(storageProfile, keys, supplement);
+        finalAardvarkJson = ensureReferenceJson(finalAardvarkJson, artifacts);
       }
       await putObjectBuffer(storageProfile, keys.aardvark, Buffer.from(safeJsonStringify(finalAardvarkJson, 2), "utf8"), "application/json");
+      const distributions = distributionsFromResource(finalAardvarkJson);
+      return {
+        cached: true,
+        checksum,
+        resourceId,
+        fileName,
+        artifacts,
+        extraction,
+        rawResponse: null,
+        usage: null,
+        confidence: null,
+        aardvarkJson: finalAardvarkJson,
+        distributions,
+        aardvarkEvidence: [],
+        proxyMilestones: milestones,
+      };
     }
-    const distributions = distributionsFromResource(finalAardvarkJson);
-    log("Cached upload payload assembled", { resourceId });
-    return {
-      cached: true,
-      checksum,
-      resourceId,
-      fileName,
-      artifacts,
-      extraction,
-      rawResponse: freshExtractionResult?.rawResponse,
-      usage: freshExtractionResult?.usage,
-      confidence: freshExtractionResult?.confidence,
-      aardvarkJson: finalAardvarkJson,
-      distributions,
-      aardvarkEvidence: aardvarkWriter?.evidence || [],
-      proxyMilestones: milestones,
-    };
+
+    if (forceReprocess) {
+      log("Checksum index hit; force reprocess requested", { resourceId });
+    } else {
+      log("Checksum index hit but Aardvark JSON is missing; reprocessing broken upload", { resourceId });
+    }
   }
 
-  const resourceId = body.resourceId || crypto.randomUUID();
-  const keys = uploadKeys(storageProfile, resourceId, fileName);
-  log("New resource directory assigned", { resourceId, root: keys.root });
+  const resourceId = indexedUpload?.resourceId || body.resourceId || crypto.randomUUID();
+  const keys = hydrateUploadKeys(storageProfile, indexedUpload?.keys, resourceId, fileName);
+  log("Resource directory assigned", { resourceId, root: keys.root, forceReprocess });
   const artifacts = {
     originalUrl: accessUrlFor(storageProfile, keys.original),
     thumbnailUrl: accessUrlFor(storageProfile, keys.thumbnail),
     iiifInfoUrl: `${accessUrlFor(storageProfile, keys.iiif)}/info.json`,
     extractionUrl: accessUrlFor(storageProfile, keys.extraction),
+    archivalSupplementUrl: accessUrlFor(storageProfile, keys.archivalSupplement),
+    archivalSupplementJsonUrl: accessUrlFor(storageProfile, keys.archivalSupplementJson),
+    aiEnrichmentsUrl: accessUrlFor(storageProfile, keys.aiEnrichments),
     aardvarkUrl: accessUrlFor(storageProfile, keys.aardvark),
+    ...(indexedUpload?.artifacts?.cogUrl ? { cogUrl: indexedUpload.artifacts.cogUrl } : {}),
   };
 
   log("Original upload started", { key: keys.original });
@@ -3155,7 +4998,7 @@ async function processUploadedImage(config, body) {
     log("Google Cloud Vision OCR request started", { featureType: visionProfile.featureType || "DOCUMENT_TEXT_DETECTION", width: visionImage.width, height: visionImage.height, originalBytes: visionImage.originalBytes, normalizedBytes: visionImage.normalizedBytes, quality: visionImage.quality ?? null, maxDimension: visionImage.maxDimension ?? null });
     extractionPromise = callGoogleVisionOcr(visionProfile, visionImage)
       .then((result) => {
-        log("Google Cloud Vision OCR response received", { textSegments: result.parsedResponse?.text?.length || 0, confidence: result.confidence ?? null });
+        log("Google Cloud Vision OCR response received", { textSegments: result.parsedResponse?.text?.length || 0, textGroups: result.parsedResponse?.text_groups?.length || 0, confidence: result.confidence ?? null });
         return result;
       });
   } else {
@@ -3182,6 +5025,19 @@ async function processUploadedImage(config, body) {
   const metadataSourceUrls = await uploadMetadataDocuments(storageProfile, keys, metadataDocuments, log);
   log("Uploading enrichment response JSON", { key: keys.extraction });
   await putObjectBuffer(storageProfile, keys.extraction, Buffer.from(safeJsonStringify(extractionResult.parsedResponse, 2), "utf8"), "application/json");
+  const archivalSupplement = buildImageArchivalSupplement({
+    resourceId,
+    checksum,
+    fileName,
+    fileSize: buffer.length,
+    contentType,
+    modifiedAt: file.modifiedAt || "",
+    extraction: extractionResult.parsedResponse,
+    artifacts: finalArtifacts,
+    metadataDocuments,
+  });
+  log("Uploading image archival accession supplement", { key: keys.archivalSupplement });
+  await writeArchivalSupplementArtifacts(storageProfile, keys, archivalSupplement);
   const baseAardvark = buildAardvarkForUpload({
     resourceId,
     checksum,
@@ -3228,6 +5084,23 @@ async function processUploadedImage(config, body) {
     });
   }
   const distributions = distributionsFromResource(resource);
+  const aiEnrichments = buildAiEnrichmentsForImage({
+    resourceId,
+    fileName,
+    checksum,
+    fileSize: buffer.length,
+    contentType,
+    modifiedAt: file.modifiedAt || "",
+    artifacts: finalArtifacts,
+    extractionResult,
+    metadataWriter: aardvarkWriter,
+    resource,
+    archivalSupplement,
+    metadataSourceUrls,
+    derivativeSummaries,
+  });
+  log("Uploading AI Enrichments JSON", { key: keys.aiEnrichments, prompts: aiEnrichments.prompts.length, apiCalls: aiEnrichments.apiCalls.length });
+  await putObjectBuffer(storageProfile, keys.aiEnrichments, Buffer.from(safeJsonStringify(aiEnrichments, 2), "utf8"), "application/json");
   log("Uploading Aardvark JSON", { key: keys.aardvark });
   await putObjectBuffer(storageProfile, keys.aardvark, Buffer.from(safeJsonStringify(resource, 2), "utf8"), "application/json");
   log("Writing checksum index", { indexKey });
@@ -3249,6 +5122,7 @@ async function processUploadedImage(config, body) {
     resourceId,
     fileName,
     artifacts: finalArtifacts,
+    aiEnrichmentsUrl: finalArtifacts.aiEnrichmentsUrl,
     iiif,
     extraction: extractionResult.parsedResponse,
     rawResponse: extractionResult.rawResponse,
@@ -3257,6 +5131,7 @@ async function processUploadedImage(config, body) {
     aardvarkJson: resource,
     distributions,
     aardvarkEvidence: aardvarkWriter?.evidence || [],
+    archivalSupplement,
     derivatives: derivativeSummaries,
     proxyMilestones: milestones,
   };
@@ -3335,6 +5210,36 @@ async function regenerateAardvarkForS3Resource(config, body) {
     });
   }
 
+  const archivalSupplement = await objectExists(storageProfile, keys.archivalSupplementJson).catch(() => false)
+    ? await fetchJsonObject(storageProfile, keys.archivalSupplementJson)
+    : null;
+  const extractionProvider = String(extraction?.debug?.ocr_strategy || "").startsWith("google_cloud_vision")
+    ? "google_cloud_vision"
+    : "openai";
+  const aiEnrichments = buildAiEnrichmentsForImage({
+    resourceId,
+    fileName,
+    checksum,
+    fileSize: Number(resource.gbl_fileSize_s || existingAardvark.gbl_fileSize_s || 0),
+    contentType: contentTypeForKey(fileName),
+    artifacts,
+    extractionResult: {
+      provider: extractionProvider,
+      parsedResponse: extraction,
+      rawResponse: null,
+      usage: extractionProvider === "google_cloud_vision"
+        ? { provider: "google_cloud_vision", rawResponseNotAvailable: true }
+        : { provider: "openai", rawResponseNotAvailable: true },
+    },
+    metadataWriter: aardvarkWriter,
+    resource,
+    archivalSupplement,
+    metadataSourceUrls,
+    derivativeSummaries: [],
+  });
+  log("Uploading regenerated AI Enrichments JSON", { key: keys.aiEnrichments, prompts: aiEnrichments.prompts.length, apiCalls: aiEnrichments.apiCalls.length });
+  await putObjectBuffer(storageProfile, keys.aiEnrichments, Buffer.from(safeJsonStringify(aiEnrichments, 2), "utf8"), "application/json");
+
   log("Uploading regenerated Aardvark JSON", { key: keys.aardvark });
   await putObjectBuffer(storageProfile, keys.aardvark, Buffer.from(safeJsonStringify(resource, 2), "utf8"), "application/json");
   log("Aardvark regeneration complete", { resourceId });
@@ -3344,6 +5249,7 @@ async function regenerateAardvarkForS3Resource(config, body) {
     fileName,
     root,
     artifacts,
+    aiEnrichmentsUrl: artifacts.aiEnrichmentsUrl,
     extraction,
     aardvarkJson: resource,
     distributions: distributionsFromResource(resource),
@@ -3369,6 +5275,9 @@ async function fetchAardvarkForS3Resource(config, body) {
   const aardvarkJson = await fetchJsonObject(storageProfile, keys.aardvark);
   const resourceId = String(aardvarkJson.id || requested.resourceId || root.split("/").pop() || "");
   const artifacts = artifactUrlsForResource(storageProfile, keys, aardvarkJson);
+  if (!await objectExists(storageProfile, keys.aiEnrichments).catch(() => false)) {
+    delete artifacts.aiEnrichmentsUrl;
+  }
   const resource = ensureReferenceJson({ ...aardvarkJson, id: resourceId }, artifacts);
 
   return {
@@ -3441,7 +5350,7 @@ async function postOpenAIResponse(apiKey, body) {
       body: safeJsonStringify(currentBody),
     });
     const rawResponse = await response.json().catch(() => ({}));
-    if (response.ok) return rawResponse;
+    if (response.ok) return { rawResponse, requestBody: currentBody };
 
     const message = rawResponse?.error?.message || `OpenAI request failed: ${response.status}`;
     const unsupported = unsupportedParameterName(message);
@@ -3459,7 +5368,7 @@ async function postOpenAIResponse(apiKey, body) {
 async function callOpenAI(modelProfile, request, derivatives) {
   if (process.env.ENRICHMENT_PROXY_MOCK_OPENAI === "1") {
     const parsedResponse = mockExtraction();
-    return { parsedResponse, rawResponse: parsedResponse, usage: { mock: true }, confidence: 0 };
+    return { parsedResponse, rawResponse: parsedResponse, requestBody: { mock: true }, provider: "openai", usage: { mock: true }, confidence: 0 };
   }
   const apiKey = resolveEnv(modelProfile.apiKeyEnv, "OpenAI API key");
   const model = request.model || modelProfile.defaultModel;
@@ -3490,12 +5399,17 @@ async function callOpenAI(modelProfile, request, derivatives) {
     },
     ...normalizeOpenAIModelParams(model, request.modelParams || modelProfile.modelParams || {}),
   };
-  const rawResponse = await postOpenAIResponse(apiKey, body);
+  const { rawResponse, requestBody } = await postOpenAIResponse(apiKey, body);
   const text = extractResponseText(rawResponse);
   const parsedResponse = text ? JSON.parse(text) : rawResponse;
   return {
     parsedResponse,
     rawResponse,
+    requestBody,
+    provider: "openai",
+    systemPrompt: request.systemPrompt,
+    userPrompt: request.userPrompt,
+    model,
     usage: rawResponse.usage,
     confidence: parsedResponse?.map_bbox_estimate?.confidence ?? null,
   };
@@ -3605,6 +5519,20 @@ async function route(req, res) {
   if (req.method === "POST" && url.pathname === "/api/uploads/process-geospatial-package") {
     const body = await readJson(req);
     const result = await processGeospatialPackage(config, body);
+    return send(res, 200, result);
+  }
+  if (req.method === "POST" && url.pathname === "/api/uploads/geospatial-sessions") {
+    const body = await readJson(req);
+    const result = await createGeospatialUploadSession(config, body);
+    return send(res, 200, result);
+  }
+  if (req.method === "PUT" && /^\/api\/uploads\/geospatial-sessions\/[^/]+\/files$/.test(url.pathname)) {
+    const result = await uploadGeospatialSessionFile(req, url);
+    return send(res, 200, result);
+  }
+  if (req.method === "POST" && url.pathname === "/api/uploads/geospatial-sessions/complete") {
+    const body = await readJson(req);
+    const result = await completeGeospatialUploadSession(config, body);
     return send(res, 200, result);
   }
 
