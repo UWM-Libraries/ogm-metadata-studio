@@ -17,6 +17,7 @@ const RELATION_LABELS: Record<string, string> = {
     "http://iiif.io/api/presentation#manifest": "IIIF Manifest",
     "https://iiif.io/api/presentation#manifest": "IIIF Manifest",
     "https://opengeometadata.org/reference/enrichment-response": "Enrichment response",
+    "https://opengeometadata.org/reference/ai-enrichments": "AI Enrichments JSON",
     "https://opengeometadata.org/reference/dataset-manifest": "Dataset manifest",
     "https://opengeometadata.org/reference/archival-accession-supplement": "Archival accession supplement",
     "https://opengeometadata.org/reference/archival-accession-supplement-json": "Archival accession supplement JSON",
@@ -39,6 +40,7 @@ function relationLabel(distribution: Distribution): string {
     if (lower.includes("pmtiles")) return "PMTiles";
     if (lower.includes("cogeo")) return "Cloud Optimized GeoTIFF";
     if (lower.includes("dataset-manifest")) return "Dataset manifest";
+    if (lower.includes("ai-enrichments")) return "AI Enrichments JSON";
     if (lower.includes("archival-accession")) return "Archival accession supplement";
     if (lower.includes("enrichment")) return "Enrichment response";
     if (lower.includes("aardvark")) return "Aardvark JSON";

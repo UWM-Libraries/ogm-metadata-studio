@@ -187,6 +187,8 @@ export const REFERENCE_URI_MAPPING: Record<string, string> = {
   "documentation": "http://schema.org/url",
   "url": "http://schema.org/url", // generic
   "metadata": "http://www.isotc211.org/schemas/2005/gmd/",
+  "ai_enrichments": "https://opengeometadata.org/reference/ai-enrichments",
+  "ai-enrichments": "https://opengeometadata.org/reference/ai-enrichments",
   "fgdc": "http://www.opengis.net/cat/csw/csdgm",
   "mods": "http://www.loc.gov/mods/v3",
   "html": "http://www.w3.org/1999/xhtml",

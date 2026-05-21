@@ -98,6 +98,7 @@ export interface ProcessUploadedImageResponse {
         thumbnailUrl: string;
         iiifInfoUrl: string;
         extractionUrl: string;
+        aiEnrichmentsUrl?: string;
         aardvarkUrl: string;
         cogUrl?: string;
         archivalSupplementUrl?: string;
@@ -161,6 +162,7 @@ export interface ProcessGeospatialPackageResponse {
         originalUrl: string;
         manifestUrl: string;
         aardvarkUrl: string;
+        aiEnrichmentsUrl?: string;
         geojsonUrl?: string;
         geoParquetUrl?: string;
         pmtilesUrl?: string;
@@ -191,6 +193,7 @@ export interface ProcessedS3Resource {
     originalKey?: string;
     hasAardvark: boolean;
     hasExtraction: boolean;
+    hasAiEnrichments?: boolean;
     hasThumbnail: boolean;
     hasIiif: boolean;
     hasArchivalSupplement?: boolean;
@@ -204,6 +207,7 @@ export interface ProcessedS3Resource {
         thumbnail: string;
         metadataSources: string;
         extraction: string;
+        aiEnrichments?: string;
         archivalSupplement?: string;
         archivalSupplementJson?: string;
         aardvark: string;
@@ -213,6 +217,7 @@ export interface ProcessedS3Resource {
         thumbnailUrl: string;
         iiifInfoUrl: string;
         extractionUrl: string;
+        aiEnrichmentsUrl?: string;
         archivalSupplementUrl?: string;
         archivalSupplementJsonUrl?: string;
         aardvarkUrl: string;

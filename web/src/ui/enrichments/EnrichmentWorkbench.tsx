@@ -84,6 +84,7 @@ interface UploadItem {
         thumbnailUrl?: string;
         iiifInfoUrl?: string;
         extractionUrl?: string;
+        aiEnrichmentsUrl?: string;
         manifestUrl?: string;
         aardvarkUrl: string;
         geojsonUrl?: string;
@@ -2117,6 +2118,7 @@ export const EnrichmentWorkbench: React.FC = () => {
                                                         {item.artifacts.thumbnailUrl && <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.thumbnailUrl} target="_blank" rel="noreferrer">Thumbnail</a>}
                                                         {item.artifacts.iiifInfoUrl && <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.iiifInfoUrl} target="_blank" rel="noreferrer">IIIF</a>}
                                                         {item.artifacts.extractionUrl && <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.extractionUrl} target="_blank" rel="noreferrer">Extraction</a>}
+                                                        {item.artifacts.aiEnrichmentsUrl && <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.aiEnrichmentsUrl} target="_blank" rel="noreferrer">AI Enrichments</a>}
                                                         {item.artifacts.manifestUrl && <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.manifestUrl} target="_blank" rel="noreferrer">Manifest</a>}
                                                         {item.artifacts.geojsonUrl && <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.geojsonUrl} target="_blank" rel="noreferrer">GeoJSON</a>}
                                                         {item.artifacts.geoParquetUrl && <a className="rounded border border-gray-200 px-2 py-1 text-indigo-700 hover:bg-gray-50 dark:border-slate-700 dark:text-indigo-300 dark:hover:bg-slate-800" href={item.artifacts.geoParquetUrl} target="_blank" rel="noreferrer">GeoParquet</a>}
@@ -2330,6 +2332,7 @@ export const EnrichmentWorkbench: React.FC = () => {
                                         { key: "thumbnail", ok: resource.hasThumbnail, href: resource.artifacts.thumbnailUrl },
                                         { key: "iiif", ok: resource.hasIiif, href: resource.artifacts.iiifInfoUrl },
                                         { key: "extraction", ok: resource.hasExtraction, href: resource.artifacts.extractionUrl },
+                                        { key: "ai", ok: Boolean(resource.hasAiEnrichments), href: resource.artifacts.aiEnrichmentsUrl || "" },
                                         { key: "accession", ok: Boolean(resource.hasArchivalSupplement), href: resource.artifacts.archivalSupplementUrl || "" },
                                         { key: "aardvark", ok: resource.hasAardvark, href: resource.artifacts.aardvarkUrl },
                                     ];

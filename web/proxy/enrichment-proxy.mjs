@@ -50,6 +50,9 @@ const CONFIG_PATH = process.env.ENRICHMENT_PROXY_CONFIG || path.resolve(__dirnam
 const DEFAULT_REGION = "us-east-1";
 const ARCHIVAL_ACCESSION_SUPPLEMENT_RELATION = "https://opengeometadata.org/reference/archival-accession-supplement";
 const ARCHIVAL_ACCESSION_SUPPLEMENT_JSON_RELATION = "https://opengeometadata.org/reference/archival-accession-supplement-json";
+const AI_ENRICHMENTS_SCHEMA_VERSION = "0.1.0";
+const AI_ENRICHMENTS_SCHEMA_URL = "https://opengeometadata.org/schema/ai-enrichments/schema.json";
+const AI_ENRICHMENTS_RELATION = "https://opengeometadata.org/reference/ai-enrichments";
 const S3_LIST_TIMEOUT_MS = Number(process.env.ENRICHMENT_PROXY_S3_LIST_TIMEOUT_MS || 30_000);
 const S3_OBJECT_TIMEOUT_MS = Number(process.env.ENRICHMENT_PROXY_S3_OBJECT_TIMEOUT_MS || 120_000);
 const S3_RETRY_ATTEMPTS = Math.max(1, Number(process.env.ENRICHMENT_PROXY_S3_RETRY_ATTEMPTS || 3));
@@ -73,6 +76,10 @@ function safeJsonStringify(value, space) {
     const asNumber = Number(item);
     return Number.isSafeInteger(asNumber) ? asNumber : item.toString();
   }, space);
+}
+
+function sha256Text(value) {
+  return crypto.createHash("sha256").update(String(value || "")).digest("hex");
 }
 
 function createUploadLogger(jobId, fileName) {
@@ -744,6 +751,7 @@ function uploadKeys(profile, resourceId, fileName) {
     extraction: `${root}/enrichment_response.json`,
     archivalSupplement: `${root}/archival_accession_supplement.md`,
     archivalSupplementJson: `${root}/archival_accession_supplement.json`,
+    aiEnrichments: `${root}/ai-enrichments.json`,
     aardvark: `${root}/aardvark.json`,
   };
 }
@@ -754,6 +762,7 @@ function hydrateUploadKeys(profile, keys, resourceId, fileName) {
   next.metadataSources = next.metadataSources || `${next.root}/metadata_sources`;
   next.archivalSupplement = next.archivalSupplement || `${next.root}/archival_accession_supplement.md`;
   next.archivalSupplementJson = next.archivalSupplementJson || `${next.root}/archival_accession_supplement.json`;
+  next.aiEnrichments = next.aiEnrichments || `${next.root}/ai-enrichments.json`;
   return next;
 }
 
@@ -1670,6 +1679,22 @@ async function callGoogleVisionOcr(visionProfile, source) {
       },
     },
     rawResponse: body,
+    provider: "google_cloud_vision",
+    requestBody: {
+      endpoint,
+      requests: [{
+        image: {
+          content: "[redacted base64 image bytes]",
+          width: source.width,
+          height: source.height,
+          mimeType: source.mimeType || "image/jpeg",
+          originalBytes: source.originalBytes || null,
+          normalizedBytes: source.normalizedBytes || source.buffer?.length || null,
+        },
+        features: [{ type: featureType }],
+        ...(languageHints.length > 0 ? { imageContext: { languageHints } } : {}),
+      }],
+    },
     usage: { provider: "google_cloud_vision", featureType },
     confidence: entries.length > 0
       ? entries.reduce((sum, entry) => sum + Number(entry.confidence || 0), 0) / entries.length
@@ -2150,6 +2175,7 @@ function uploadKeysFromRoot(root, fileName = "original", originalKey = "") {
     extraction: `${cleanRoot}/enrichment_response.json`,
     archivalSupplement: `${cleanRoot}/archival_accession_supplement.md`,
     archivalSupplementJson: `${cleanRoot}/archival_accession_supplement.json`,
+    aiEnrichments: `${cleanRoot}/ai-enrichments.json`,
     aardvark: `${cleanRoot}/aardvark.json`,
   };
 }
@@ -2168,6 +2194,7 @@ function artifactUrlsForResource(profile, keys, resource) {
     thumbnailUrl: refs["http://schema.org/thumbnailUrl"] || accessUrlFor(profile, keys.thumbnail),
     iiifInfoUrl: iiifReference ? (iiifReference.endsWith("/info.json") ? iiifReference : `${iiifReference.replace(/\/+$/, "")}/info.json`) : `${accessUrlFor(profile, keys.iiif)}/info.json`,
     extractionUrl: refs["https://opengeometadata.org/reference/enrichment-response"] || accessUrlFor(profile, keys.extraction),
+    aiEnrichmentsUrl: firstReferenceUrl(refs[AI_ENRICHMENTS_RELATION]) || refs[AI_ENRICHMENTS_RELATION] || accessUrlFor(profile, keys.aiEnrichments),
     aardvarkUrl: refs["https://opengeometadata.org/reference/aardvark-json"] || accessUrlFor(profile, keys.aardvark),
     archivalSupplementUrl: refs[ARCHIVAL_ACCESSION_SUPPLEMENT_RELATION]?.url || refs[ARCHIVAL_ACCESSION_SUPPLEMENT_RELATION] || accessUrlFor(profile, keys.archivalSupplement),
     archivalSupplementJsonUrl: refs[ARCHIVAL_ACCESSION_SUPPLEMENT_JSON_RELATION]?.url || refs[ARCHIVAL_ACCESSION_SUPPLEMENT_JSON_RELATION] || accessUrlFor(profile, keys.archivalSupplementJson),
@@ -2199,6 +2226,9 @@ function ensureReferenceJson(resource, artifacts) {
       [ARCHIVAL_ACCESSION_SUPPLEMENT_JSON_RELATION]: { url: artifacts.archivalSupplementJsonUrl, label: "Archival accession supplement JSON" },
     } : {}),
     "https://opengeometadata.org/reference/enrichment-response": artifacts.extractionUrl,
+    ...(artifacts.aiEnrichmentsUrl ? {
+      [AI_ENRICHMENTS_RELATION]: { url: artifacts.aiEnrichmentsUrl, label: "OpenGeoMetadata AI Enrichments JSON" },
+    } : {}),
     "https://opengeometadata.org/reference/aardvark-json": artifacts.aardvarkUrl,
   };
   return {
@@ -2249,6 +2279,7 @@ async function listProcessedUploadResources(profile, { includeIncomplete = false
         originalKey: "",
         hasAardvark: false,
         hasExtraction: false,
+        hasAiEnrichments: false,
         hasThumbnail: false,
         hasIiif: false,
         hasArchivalSupplement: false,
@@ -2277,6 +2308,9 @@ async function listProcessedUploadResources(profile, { includeIncomplete = false
 
     match = key.match(/^(.*)\/enrichment_response\.json$/);
     if (match) touch(match[1]).hasExtraction = true;
+
+    match = key.match(/^(.*)\/ai-enrichments\.json$/);
+    if (match) touch(match[1]).hasAiEnrichments = true;
 
     match = key.match(/^(.*)\/thumbnail\/thumbnail\.jpg$/);
     if (match) touch(match[1]).hasThumbnail = true;
@@ -2310,6 +2344,7 @@ async function listProcessedUploadResources(profile, { includeIncomplete = false
           thumbnailUrl: accessUrlFor(profile, keys.thumbnail),
           iiifInfoUrl: `${accessUrlFor(profile, keys.iiif)}/info.json`,
           extractionUrl: accessUrlFor(profile, keys.extraction),
+          aiEnrichmentsUrl: accessUrlFor(profile, keys.aiEnrichments),
           archivalSupplementUrl: accessUrlFor(profile, keys.archivalSupplement),
           archivalSupplementJsonUrl: accessUrlFor(profile, keys.archivalSupplementJson),
           aardvarkUrl: accessUrlFor(profile, keys.aardvark),
@@ -2335,6 +2370,458 @@ async function readMetadataDocumentsFromS3(profile, keys, log = () => undefined)
     });
   }
   return documents;
+}
+
+function normalizedText(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function safeDateTime(value) {
+  const date = value ? new Date(value) : null;
+  return date && Number.isFinite(date.getTime()) ? date.toISOString() : undefined;
+}
+
+function withoutUndefined(value) {
+  if (Array.isArray(value)) {
+    return value.map(withoutUndefined).filter((item) => item !== undefined);
+  }
+  if (!value || typeof value !== "object") return value === undefined ? undefined : value;
+  const entries = Object.entries(value)
+    .map(([key, item]) => [key, withoutUndefined(item)])
+    .filter(([, item]) => item !== undefined);
+  return Object.fromEntries(entries);
+}
+
+function redactOpenAIRequestForPersistence(value) {
+  if (Array.isArray(value)) return value.map(redactOpenAIRequestForPersistence);
+  if (!value || typeof value !== "object") return value;
+  const next = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (key === "image_url" && typeof item === "string" && item.startsWith("data:")) {
+      const mediaType = item.match(/^data:([^;]+);base64,/)?.[1] || "image";
+      next[key] = `data:${mediaType};base64,[redacted image bytes]`;
+      continue;
+    }
+    next[key] = redactOpenAIRequestForPersistence(item);
+  }
+  return next;
+}
+
+function textRoleForAiEnrichments(entry) {
+  const content = normalizedText(entry?.content);
+  const role = String(entry?.role || "other");
+  if (/\b(?:st|street|ave|avenue|blvd|boulevard|way|road|rd|place|pl)\b\.?$/i.test(content)) return "street";
+  if (/\b(?:1[5-9]\d{2}|20\d{2})\b/.test(content)) return "date";
+  return ["title", "coordinate", "label", "scale", "legend", "other"].includes(role) ? role : "other";
+}
+
+function textSegmentId(index) {
+  return `text-${String(index + 1).padStart(4, "0")}`;
+}
+
+function extractionTextSegments(extraction, sourceCallId) {
+  return (Array.isArray(extraction?.text) ? extraction.text : [])
+    .map((entry, index) => withoutUndefined({
+      id: textSegmentId(index),
+      content: String(entry?.content || ""),
+      normalizedContent: normalizedText(entry?.content),
+      role: textRoleForAiEnrichments(entry),
+      approxBbox: entry?.approx_bbox,
+      confidence: typeof entry?.confidence === "number" ? Math.max(0, Math.min(1, entry.confidence)) : undefined,
+      sourceCallId,
+      sourceResponsePath: `/text/${index}`,
+      sourceAssetIds: ["source-original-image"],
+      legacyIndex: index,
+      readingOrder: index,
+      reasoning: entry?.reasoning,
+      raw: entry,
+    }))
+    .filter((entry) => entry.content.trim());
+}
+
+function extractionTextGroups(extraction, textSegments, sourceCallId) {
+  return (Array.isArray(extraction?.text_groups) ? extraction.text_groups : [])
+    .map((entry, index) => withoutUndefined({
+      id: `text-group-${String(index + 1).padStart(4, "0")}`,
+      content: String(entry?.content || ""),
+      normalizedContent: normalizedText(entry?.content),
+      role: textRoleForAiEnrichments(entry),
+      approxBbox: entry?.approx_bbox,
+      confidence: typeof entry?.confidence === "number" ? Math.max(0, Math.min(1, entry.confidence)) : undefined,
+      sourceTextIds: (Array.isArray(entry?.source_text_indices) ? entry.source_text_indices : [])
+        .map((sourceIndex) => textSegments[sourceIndex]?.id)
+        .filter(Boolean),
+      sourceTextIndices: Array.isArray(entry?.source_text_indices) ? entry.source_text_indices : undefined,
+      sourceCallId,
+      reasoning: entry?.reasoning || "Deterministically consolidated from adjacent OCR text segments.",
+    }))
+    .filter((entry) => entry.content.trim());
+}
+
+function sourceTextIdsForIndex(indices, textSegments) {
+  return (Array.isArray(indices) ? indices : [indices])
+    .map((index) => Number(index))
+    .filter((index) => Number.isInteger(index) && index >= 0)
+    .map((index) => textSegments[index]?.id)
+    .filter(Boolean);
+}
+
+function derivedPlacenamesForAiEnrichments(extraction, resource, textSegments, extractionCallId, metadataCallId) {
+  const places = [];
+  for (const [index, place] of (Array.isArray(extraction?.placenames) ? extraction.placenames : []).entries()) {
+    const name = normalizedText(place?.name);
+    if (!name) continue;
+    places.push(withoutUndefined({
+      id: `place-${String(index + 1).padStart(4, "0")}`,
+      name,
+      normalizedName: name,
+      type: place?.type || "other",
+      sourceTextIds: sourceTextIdsForIndex(place?.source_text_index, textSegments),
+      sourceTextIndices: Number.isInteger(Number(place?.source_text_index)) ? [Number(place.source_text_index)] : undefined,
+      confidence: typeof place?.confidence === "number" ? Math.max(0, Math.min(1, place.confidence)) : undefined,
+      status: "candidate",
+      sourceCallId: extractionCallId,
+      reasoning: place?.reasoning,
+    }));
+  }
+
+  const existing = new Set(places.map((place) => place.normalizedName.toLowerCase()));
+  for (const name of asStringArray(resource?.dct_spatial_sm)) {
+    if (existing.has(name.toLowerCase())) continue;
+    existing.add(name.toLowerCase());
+    places.push(withoutUndefined({
+      id: `place-${String(places.length + 1).padStart(4, "0")}`,
+      name,
+      normalizedName: name,
+      type: "other",
+      sourceTextIds: [],
+      confidence: 0.75,
+      status: "confirmed",
+      sourceCallId: metadataCallId,
+      reasoning: "Derived from the Aardvark metadata writer's spatial coverage output.",
+    }));
+  }
+  return places;
+}
+
+function aiEnrichmentLink(url, label, mediaType) {
+  return withoutUndefined({ url, label, mediaType });
+}
+
+function promptChecksum(systemPrompt, userPrompt) {
+  return sha256Text([systemPrompt || "", userPrompt || ""].join("\n"));
+}
+
+function openAiPromptRecord({ id, label, purpose, call }) {
+  if (!call?.systemPrompt && !call?.userPrompt) return null;
+  return withoutUndefined({
+    id,
+    label,
+    purpose,
+    provider: "openai",
+    model: call.model,
+    renderedAt: safeDateTime(call.completedAt) || new Date().toISOString(),
+    systemPrompt: call.systemPrompt,
+    userPrompt: call.userPrompt,
+    messages: [
+      call.systemPrompt ? { role: "system", content: call.systemPrompt } : null,
+      call.userPrompt ? { role: "user", content: call.userPrompt } : null,
+    ].filter(Boolean),
+    outputSchema: call.requestBody?.text?.format?.schema,
+    variables: call.variables,
+    sourceCallId: call.id,
+    checksum: {
+      algorithm: "SHA-256",
+      value: promptChecksum(call.systemPrompt, call.userPrompt),
+      purpose: "Checksum of the exact rendered prompt text persisted in this AI Enrichments record.",
+    },
+  });
+}
+
+function openAiApiCallRecord({ id, sequence, purpose, call, parsedResponse, sourceAssetIds = [] }) {
+  if (!call?.requestBody && !call?.rawResponse) return null;
+  return withoutUndefined({
+    id,
+    sequence,
+    provider: "openai",
+    service: "responses",
+    endpoint: "https://api.openai.com/v1/responses",
+    method: "POST",
+    purpose,
+    model: call.model || call.requestBody?.model,
+    modelParams: call.requestBody ? Object.fromEntries(Object.entries(call.requestBody)
+      .filter(([key]) => !["model", "input", "text"].includes(key))) : undefined,
+    promptIds: call.promptId ? [call.promptId] : undefined,
+    sourceAssetIds,
+    completedAt: safeDateTime(call.completedAt) || new Date().toISOString(),
+    status: call.error ? "failed" : "completed",
+    request: {
+      promptIds: call.promptId ? [call.promptId] : undefined,
+      systemPrompt: call.systemPrompt,
+      userPrompt: call.userPrompt,
+      messages: [
+        call.systemPrompt ? { role: "system", content: call.systemPrompt } : null,
+        call.userPrompt ? { role: "user", content: call.userPrompt } : null,
+      ].filter(Boolean),
+      outputSchema: call.requestBody?.text?.format?.schema,
+      payload: {
+        rawJson: redactOpenAIRequestForPersistence(call.requestBody),
+        redacted: true,
+        redactionNotes: "Image bytes and credentials are not persisted; rendered text prompts are preserved exactly.",
+      },
+      redactions: ["api_key", "input_image_bytes"],
+    },
+    response: {
+      raw: call.rawResponse ? { rawJson: call.rawResponse, redacted: false } : undefined,
+      parsed: parsedResponse ? { rawJson: parsedResponse, redacted: false } : undefined,
+      usage: call.usage,
+      error: call.error,
+    },
+    error: call.error,
+  });
+}
+
+function ocrApiCallRecord({ result, completedAt }) {
+  return withoutUndefined({
+    id: "call-google-vision-ocr",
+    sequence: 1,
+    provider: "google_cloud_vision",
+    service: "images:annotate",
+    endpoint: "https://vision.googleapis.com/v1/images:annotate",
+    method: "POST",
+    purpose: "ocr",
+    sourceAssetIds: ["source-original-image"],
+    completedAt: safeDateTime(completedAt) || new Date().toISOString(),
+    status: result?.error ? "failed" : "completed",
+    request: {
+      payload: {
+        rawJson: result?.requestBody || { note: "Request body was not persisted by this provider call." },
+        redacted: true,
+        redactionNotes: "Inline image bytes and API key are not persisted.",
+      },
+      redactions: ["api_key", "inline_image_bytes"],
+    },
+    response: {
+      raw: result?.rawResponse ? { rawJson: result.rawResponse, redacted: false } : undefined,
+      parsed: result?.parsedResponse ? { rawJson: result.parsedResponse, redacted: false } : undefined,
+      usage: result?.usage,
+      error: result?.error,
+    },
+    error: result?.error,
+  });
+}
+
+function mapExtentForAiEnrichments(extraction, sourceCallId) {
+  const bbox = extraction?.map_bbox_estimate || {};
+  return withoutUndefined({
+    west: Number(bbox.west || 0),
+    south: Number(bbox.south || 0),
+    east: Number(bbox.east || 0),
+    north: Number(bbox.north || 0),
+    confidence: typeof bbox.confidence === "number" ? Math.max(0, Math.min(1, bbox.confidence)) : 0,
+    method: bbox.method || "not_inferred",
+    reasoning: bbox.reasoning || "No geographic map extent was inferred.",
+    sourceCallIds: [sourceCallId].filter(Boolean),
+  });
+}
+
+function distributionsWithAiEnrichments(resource, aiEnrichmentsUrl) {
+  const distributions = distributionsFromResource(resource);
+  if (aiEnrichmentsUrl && !distributions.some((item) => item.relation_key === AI_ENRICHMENTS_RELATION && item.url === aiEnrichmentsUrl)) {
+    distributions.push({
+      resource_id: resource.id,
+      relation_key: AI_ENRICHMENTS_RELATION,
+      url: aiEnrichmentsUrl,
+      label: "OpenGeoMetadata AI Enrichments JSON",
+    });
+  }
+  return distributions.map((item) => withoutUndefined({
+    relationKey: item.relation_key,
+    url: item.url,
+    label: item.label,
+  }));
+}
+
+function buildAiEnrichmentsForImage(args) {
+  const {
+    resourceId,
+    fileName,
+    checksum,
+    fileSize,
+    contentType,
+    modifiedAt,
+    artifacts,
+    extractionResult,
+    metadataWriter,
+    resource,
+    archivalSupplement,
+    metadataSourceUrls = [],
+    derivativeSummaries = [],
+  } = args;
+  const createdAt = safeDateTime(archivalSupplement?.processingDate) || safeDateTime(resource?.gbl_mdModified_dt) || new Date().toISOString();
+  const extraction = extractionResult?.parsedResponse || {};
+  const extractionCallId = extractionResult?.provider === "openai" ? "call-openai-historical-map-extraction" : "call-google-vision-ocr";
+  const textSegments = extractionTextSegments(extraction, extractionCallId);
+  const textGroups = extractionTextGroups(extraction, textSegments, extractionCallId);
+  const metadataCall = metadataWriter ? {
+    ...metadataWriter,
+    id: "call-openai-aardvark-metadata-writer",
+    promptId: "prompt-openai-aardvark-metadata-writer",
+    completedAt: resource?.gbl_mdModified_dt || createdAt,
+    variables: {
+      resourceId,
+      fileName,
+      checksum,
+      artifactUrls: artifacts,
+      metadataSourceUrls,
+    },
+  } : null;
+  const extractionOpenAiCall = extractionResult?.provider === "openai" ? {
+    ...extractionResult,
+    id: "call-openai-historical-map-extraction",
+    promptId: "prompt-openai-historical-map-extraction",
+    completedAt: createdAt,
+    variables: { resourceId, fileName, checksum, artifactUrls: artifacts },
+  } : null;
+  const placenames = derivedPlacenamesForAiEnrichments(extraction, resource, textSegments, extractionCallId, "call-openai-aardvark-metadata-writer");
+  const apiCalls = [
+    extractionResult?.provider === "google_cloud_vision" ? ocrApiCallRecord({ result: extractionResult, completedAt: createdAt }) : null,
+    extractionOpenAiCall ? openAiApiCallRecord({
+      id: "call-openai-historical-map-extraction",
+      sequence: 1,
+      purpose: "map_text_extraction",
+      call: extractionOpenAiCall,
+      parsedResponse: extraction,
+      sourceAssetIds: ["source-original-image", ...derivativeSummaries.map((derivative) => derivative.id).filter(Boolean)],
+    }) : null,
+    metadataCall ? openAiApiCallRecord({
+      id: "call-openai-aardvark-metadata-writer",
+      sequence: 2,
+      purpose: "metadata_generation",
+      call: metadataCall,
+      parsedResponse: { resource: metadataWriter?.resource || resource, evidence: metadataWriter?.evidence || [] },
+      sourceAssetIds: ["source-original-image", "artifact-legacy-enrichment-response"],
+    }) : null,
+  ].filter(Boolean);
+  const prompts = [
+    extractionOpenAiCall ? openAiPromptRecord({
+      id: "prompt-openai-historical-map-extraction",
+      label: "Historical map text extraction",
+      purpose: "map_text_extraction",
+      call: extractionOpenAiCall,
+    }) : null,
+    metadataCall ? openAiPromptRecord({
+      id: "prompt-openai-aardvark-metadata-writer",
+      label: "Aardvark metadata writer for scanned historical maps",
+      purpose: "metadata_generation",
+      call: metadataCall,
+    }) : null,
+  ].filter(Boolean);
+  const mapTextValues = Array.from(new Set([
+    ...textSegments.map((item) => item.content),
+    ...textGroups.map((item) => item.content),
+  ].map(normalizedText).filter(Boolean)));
+  return withoutUndefined({
+    schemaVersion: AI_ENRICHMENTS_SCHEMA_VERSION,
+    standard: "OpenGeoMetadata AI Enrichments",
+    resourceId,
+    createdAt,
+    updatedAt: safeDateTime(resource?.gbl_mdModified_dt) || createdAt,
+    generatedBy: {
+      name: "Aardvark Metadata Studio enrichment proxy",
+      workflow: "image-upload-ocr-openai-aardvark-writer",
+      workflowVersion: AI_ENRICHMENTS_SCHEMA_VERSION,
+      notes: "Generated at processing time so exact rendered prompts, provider/model choices, and raw responses are preserved.",
+    },
+    sourceAssets: [
+      {
+        id: "source-original-image",
+        role: "original",
+        fileName,
+        path: artifacts.originalUrl ? new URL(artifacts.originalUrl).pathname.replace(/^\/[^/]+\//, "") : undefined,
+        url: artifacts.originalUrl,
+        mediaType: contentType || "application/octet-stream",
+        byteSize: Number(fileSize || 0),
+        modifiedAt: safeDateTime(modifiedAt),
+        checksums: checksum ? [{ algorithm: "SHA-256", value: checksum, purpose: "Submitted image fixity value computed before enrichment." }] : undefined,
+      },
+      ...derivativeSummaries.map((derivative) => withoutUndefined({
+        id: derivative.id,
+        role: "analysis_derivative",
+        mediaType: derivative.mimeType,
+        byteSize: derivative.bytes,
+        width: derivative.width,
+        height: derivative.height,
+        notes: `OpenAI analysis derivative: ${derivative.kind || "image"}.`,
+      })),
+      { id: "derivative-iiif-image-service", role: "iiif_image", url: artifacts.iiifInfoUrl, mediaType: "application/json" },
+      { id: "derivative-thumbnail", role: "thumbnail", url: artifacts.thumbnailUrl, mediaType: "image/jpeg" },
+      { id: "artifact-legacy-enrichment-response", role: "derived_metadata", url: artifacts.extractionUrl, mediaType: "application/json" },
+      { id: "artifact-aardvark-json", role: "derived_metadata", url: artifacts.aardvarkUrl, mediaType: "application/json" },
+      { id: "artifact-archival-supplement-json", role: "other", url: artifacts.archivalSupplementJsonUrl, mediaType: "application/json" },
+      ...metadataSourceUrls.map((url, index) => ({ id: `metadata-source-${index + 1}`, role: "companion_metadata", url, mediaType: contentTypeForMetadataKey(url) })),
+    ],
+    artifacts: {
+      aardvarkJson: aiEnrichmentLink(artifacts.aardvarkUrl, "Aardvark JSON", "application/json"),
+      aiEnrichmentsJson: aiEnrichmentLink(artifacts.aiEnrichmentsUrl, "OpenGeoMetadata AI Enrichments JSON", "application/json"),
+      legacyEnrichmentResponse: aiEnrichmentLink(artifacts.extractionUrl, "Legacy enrichment_response.json", "application/json"),
+      original: aiEnrichmentLink(artifacts.originalUrl, "Original submitted image", contentType || "application/octet-stream"),
+      thumbnail: aiEnrichmentLink(artifacts.thumbnailUrl, "Thumbnail", "image/jpeg"),
+      iiifImage: aiEnrichmentLink(artifacts.iiifInfoUrl, "IIIF Image API info.json", "application/json"),
+      cloudOptimizedGeoTiff: artifacts.cogUrl ? aiEnrichmentLink(artifacts.cogUrl, "Cloud Optimized GeoTIFF", "image/tiff") : undefined,
+      archivalSupplement: aiEnrichmentLink(artifacts.archivalSupplementUrl, "Archival accession processing supplement", "text/markdown"),
+      archivalSupplementJson: aiEnrichmentLink(artifacts.archivalSupplementJsonUrl, "Archival accession supplement JSON", "application/json"),
+      metadataSources: metadataSourceUrls.map((url) => aiEnrichmentLink(url, "Companion metadata", contentTypeForMetadataKey(url))),
+    },
+    apiCalls,
+    prompts,
+    extractedMapText: textSegments,
+    textGroups,
+    derivedPlacenames: placenames,
+    mapExtent: mapExtentForAiEnrichments(extraction, extractionCallId),
+    description: extraction?.description || asStringArray(resource?.dct_description_sm)[0] || "",
+    debug: {
+      ...(extraction?.debug || {}),
+      schema: AI_ENRICHMENTS_SCHEMA_URL,
+    },
+    derivedMetadata: {
+      standard: "Aardvark",
+      standardVersion: "Aardvark",
+      recordSchema: "https://opengeometadata.org/schema/geoblacklight-schema-aardvark.json",
+      record: resource,
+      distributions: distributionsWithAiEnrichments(resource, artifacts.aiEnrichmentsUrl),
+      fieldEvidence: [
+        { field: "dct_title_s", value: resource?.dct_title_s, sourceCallIds: ["call-openai-aardvark-metadata-writer"], confidence: 0.9, reasoning: "Generated by the Aardvark metadata writer from OCR and source evidence.", reviewStatus: "machine_generated" },
+        { field: "dct_spatial_sm", value: resource?.dct_spatial_sm || [], sourcePlacenameIds: placenames.map((place) => place.id), sourceCallIds: ["call-openai-aardvark-metadata-writer"], confidence: 0.8, reasoning: "Spatial coverage derived from OCR and metadata writer evidence.", reviewStatus: "machine_generated" },
+      ],
+      confidence: metadataWriter ? 0.9 : undefined,
+      createdFromCallIds: apiCalls.map((call) => call.id),
+      normalizationNotes: ["OpenGeoMetadata AI Enrichments preserves raw prompts and responses; Aardvark remains the reviewed discovery record."],
+    },
+    indexingHints: {
+      fields: [
+        {
+          field: "ogm_ai_map_text_tsim",
+          values: mapTextValues,
+          sourceIds: textSegments.map((item) => item.id),
+          confidence: textSegments.length > 0 ? textSegments.reduce((sum, item) => sum + Number(item.confidence || 0), 0) / textSegments.length : undefined,
+          boost: 2,
+          notes: "Indexable text extracted from the map image, including street labels and other fine-grained map text not suitable for Aardvark fields.",
+        },
+        {
+          field: "ogm_ai_placename_sm",
+          values: placenames.map((place) => place.name),
+          sourceIds: placenames.flatMap((place) => place.sourceTextIds || []),
+          confidence: placenames.length > 0 ? placenames.reduce((sum, place) => sum + Number(place.confidence || 0), 0) / placenames.length : undefined,
+          boost: 3,
+        },
+      ],
+    },
+    review: {
+      status: "machine_generated",
+      notes: "Review derived metadata, placenames, and OCR before treating candidate values as authoritative.",
+    },
+  });
 }
 
 async function loadJsZip() {
@@ -3606,10 +4093,10 @@ async function callArchivalSupplementWriter(modelProfile, request, context) {
     },
     ...normalizeOpenAIModelParams(model, request.modelParams || modelProfile.modelParams || {}),
   };
-  const rawResponse = await postOpenAIResponse(apiKey, body);
+  const { rawResponse, requestBody } = await postOpenAIResponse(apiKey, body);
   const text = extractResponseText(rawResponse);
   const parsed = text ? JSON.parse(text) : rawResponse;
-  return { ...parsed, rawResponse, usage: rawResponse.usage };
+  return { ...parsed, rawResponse, requestBody, systemPrompt, userPrompt, model, usage: rawResponse.usage };
 }
 
 function markdownCell(value) {
@@ -3771,6 +4258,7 @@ function buildImageArchivalSupplement({ resourceId, checksum, fileName, fileSize
       { type: "Thumbnail", url: artifacts.thumbnailUrl || "", status: artifacts.thumbnailUrl ? "created" : "missing", significance: "Small preview image for discovery interfaces." },
       { type: "Cloud Optimized GeoTIFF", url: artifacts.cogUrl || "", status: artifacts.cogUrl ? "created" : "not applicable or not created", significance: "Cloud-native raster derivative produced when the image has suitable raster/georeference characteristics." },
       { type: "Enrichment response", url: artifacts.extractionUrl || "", status: artifacts.extractionUrl ? "created" : "missing", significance: "Machine-readable OCR, placename, bounding-box, and descriptive extraction evidence." },
+      { type: "AI Enrichments JSON", url: artifacts.aiEnrichmentsUrl || "", status: artifacts.aiEnrichmentsUrl ? "created" : "missing", significance: "Research provenance record preserving provider calls, exact prompts, raw responses, extracted text, and derived metadata evidence." },
       { type: "Aardvark JSON", url: artifacts.aardvarkUrl || "", status: artifacts.aardvarkUrl ? "created" : "missing", significance: "Catalog metadata record used by OpenGeoMetadata-style discovery." },
       { type: "Archival supplement JSON", url: artifacts.archivalSupplementJsonUrl || "", status: artifacts.archivalSupplementJsonUrl ? "created" : "missing", significance: "Structured accession supplement used to render this processing note." },
     ],
@@ -3871,10 +4359,10 @@ async function callAardvarkMetadataWriter(modelProfile, request, context) {
     },
     ...normalizeOpenAIModelParams(model, request.modelParams || modelProfile.modelParams || {}),
   };
-  const rawResponse = await postOpenAIResponse(apiKey, body);
+  const { rawResponse, requestBody } = await postOpenAIResponse(apiKey, body);
   const text = extractResponseText(rawResponse);
   const parsed = text ? JSON.parse(text) : rawResponse;
-  return { ...parsed, rawResponse, usage: rawResponse.usage };
+  return { ...parsed, rawResponse, requestBody, systemPrompt, userPrompt, model, usage: rawResponse.usage };
 }
 
 function geospatialAardvarkWriterMessages({ manifest, baseResource, batchDefaults, artifacts, fileName, checksum, resourceId }) {
@@ -3936,10 +4424,10 @@ async function callGeospatialAardvarkMetadataWriter(modelProfile, request, conte
     },
     ...normalizeOpenAIModelParams(model, request.modelParams || modelProfile.modelParams || {}),
   };
-  const rawResponse = await postOpenAIResponse(apiKey, body);
+  const { rawResponse, requestBody } = await postOpenAIResponse(apiKey, body);
   const text = extractResponseText(rawResponse);
   const parsed = text ? JSON.parse(text) : rawResponse;
-  return { ...parsed, rawResponse, usage: rawResponse.usage };
+  return { ...parsed, rawResponse, requestBody, systemPrompt, userPrompt, model, usage: rawResponse.usage };
 }
 
 async function completeGeospatialProcessing({ storageProfile, modelProfile, body, fileName, checksum, fileSize, analysis, uploadOriginal, log, milestones }) {
@@ -4305,6 +4793,7 @@ function buildAardvarkForUpload({ resourceId, checksum, fileName, fileSize, cont
     } : {}),
     ...(artifacts.archivalSupplementJsonUrl ? { [ARCHIVAL_ACCESSION_SUPPLEMENT_JSON_RELATION]: { url: artifacts.archivalSupplementJsonUrl, label: "Archival accession supplement JSON" } } : {}),
     "https://opengeometadata.org/reference/enrichment-response": artifacts.extractionUrl,
+    ...(artifacts.aiEnrichmentsUrl ? { [AI_ENRICHMENTS_RELATION]: { url: artifacts.aiEnrichmentsUrl, label: "OpenGeoMetadata AI Enrichments JSON" } } : {}),
     "https://opengeometadata.org/reference/aardvark-json": artifacts.aardvarkUrl,
   };
   const resource = {
@@ -4423,6 +4912,7 @@ async function processUploadedImage(config, body) {
       extractionUrl: accessUrlFor(storageProfile, keys.extraction),
       archivalSupplementUrl: accessUrlFor(storageProfile, keys.archivalSupplement),
       archivalSupplementJsonUrl: accessUrlFor(storageProfile, keys.archivalSupplementJson),
+      aiEnrichmentsUrl: accessUrlFor(storageProfile, keys.aiEnrichments),
       aardvarkUrl: accessUrlFor(storageProfile, keys.aardvark),
       ...(index.artifacts?.cogUrl ? { cogUrl: index.artifacts.cogUrl } : {}),
     };
@@ -4433,6 +4923,9 @@ async function processUploadedImage(config, body) {
       let extraction = await objectExists(storageProfile, keys.extraction)
         ? await fetchJsonObject(storageProfile, keys.extraction)
         : null;
+      if (!await objectExists(storageProfile, keys.aiEnrichments).catch(() => false)) {
+        delete artifacts.aiEnrichmentsUrl;
+      }
       let finalAardvarkJson = ensureReferenceJson({ ...await fetchJsonObject(storageProfile, keys.aardvark), id: resourceId }, artifacts);
       if (!await objectExists(storageProfile, keys.archivalSupplement)) {
         log("Cached upload is missing archival supplement; creating lightweight accession record", { key: keys.archivalSupplement });
@@ -4486,6 +4979,7 @@ async function processUploadedImage(config, body) {
     extractionUrl: accessUrlFor(storageProfile, keys.extraction),
     archivalSupplementUrl: accessUrlFor(storageProfile, keys.archivalSupplement),
     archivalSupplementJsonUrl: accessUrlFor(storageProfile, keys.archivalSupplementJson),
+    aiEnrichmentsUrl: accessUrlFor(storageProfile, keys.aiEnrichments),
     aardvarkUrl: accessUrlFor(storageProfile, keys.aardvark),
     ...(indexedUpload?.artifacts?.cogUrl ? { cogUrl: indexedUpload.artifacts.cogUrl } : {}),
   };
@@ -4590,6 +5084,23 @@ async function processUploadedImage(config, body) {
     });
   }
   const distributions = distributionsFromResource(resource);
+  const aiEnrichments = buildAiEnrichmentsForImage({
+    resourceId,
+    fileName,
+    checksum,
+    fileSize: buffer.length,
+    contentType,
+    modifiedAt: file.modifiedAt || "",
+    artifacts: finalArtifacts,
+    extractionResult,
+    metadataWriter: aardvarkWriter,
+    resource,
+    archivalSupplement,
+    metadataSourceUrls,
+    derivativeSummaries,
+  });
+  log("Uploading AI Enrichments JSON", { key: keys.aiEnrichments, prompts: aiEnrichments.prompts.length, apiCalls: aiEnrichments.apiCalls.length });
+  await putObjectBuffer(storageProfile, keys.aiEnrichments, Buffer.from(safeJsonStringify(aiEnrichments, 2), "utf8"), "application/json");
   log("Uploading Aardvark JSON", { key: keys.aardvark });
   await putObjectBuffer(storageProfile, keys.aardvark, Buffer.from(safeJsonStringify(resource, 2), "utf8"), "application/json");
   log("Writing checksum index", { indexKey });
@@ -4611,6 +5122,7 @@ async function processUploadedImage(config, body) {
     resourceId,
     fileName,
     artifacts: finalArtifacts,
+    aiEnrichmentsUrl: finalArtifacts.aiEnrichmentsUrl,
     iiif,
     extraction: extractionResult.parsedResponse,
     rawResponse: extractionResult.rawResponse,
@@ -4698,6 +5210,36 @@ async function regenerateAardvarkForS3Resource(config, body) {
     });
   }
 
+  const archivalSupplement = await objectExists(storageProfile, keys.archivalSupplementJson).catch(() => false)
+    ? await fetchJsonObject(storageProfile, keys.archivalSupplementJson)
+    : null;
+  const extractionProvider = String(extraction?.debug?.ocr_strategy || "").startsWith("google_cloud_vision")
+    ? "google_cloud_vision"
+    : "openai";
+  const aiEnrichments = buildAiEnrichmentsForImage({
+    resourceId,
+    fileName,
+    checksum,
+    fileSize: Number(resource.gbl_fileSize_s || existingAardvark.gbl_fileSize_s || 0),
+    contentType: contentTypeForKey(fileName),
+    artifacts,
+    extractionResult: {
+      provider: extractionProvider,
+      parsedResponse: extraction,
+      rawResponse: null,
+      usage: extractionProvider === "google_cloud_vision"
+        ? { provider: "google_cloud_vision", rawResponseNotAvailable: true }
+        : { provider: "openai", rawResponseNotAvailable: true },
+    },
+    metadataWriter: aardvarkWriter,
+    resource,
+    archivalSupplement,
+    metadataSourceUrls,
+    derivativeSummaries: [],
+  });
+  log("Uploading regenerated AI Enrichments JSON", { key: keys.aiEnrichments, prompts: aiEnrichments.prompts.length, apiCalls: aiEnrichments.apiCalls.length });
+  await putObjectBuffer(storageProfile, keys.aiEnrichments, Buffer.from(safeJsonStringify(aiEnrichments, 2), "utf8"), "application/json");
+
   log("Uploading regenerated Aardvark JSON", { key: keys.aardvark });
   await putObjectBuffer(storageProfile, keys.aardvark, Buffer.from(safeJsonStringify(resource, 2), "utf8"), "application/json");
   log("Aardvark regeneration complete", { resourceId });
@@ -4707,6 +5249,7 @@ async function regenerateAardvarkForS3Resource(config, body) {
     fileName,
     root,
     artifacts,
+    aiEnrichmentsUrl: artifacts.aiEnrichmentsUrl,
     extraction,
     aardvarkJson: resource,
     distributions: distributionsFromResource(resource),
@@ -4732,6 +5275,9 @@ async function fetchAardvarkForS3Resource(config, body) {
   const aardvarkJson = await fetchJsonObject(storageProfile, keys.aardvark);
   const resourceId = String(aardvarkJson.id || requested.resourceId || root.split("/").pop() || "");
   const artifacts = artifactUrlsForResource(storageProfile, keys, aardvarkJson);
+  if (!await objectExists(storageProfile, keys.aiEnrichments).catch(() => false)) {
+    delete artifacts.aiEnrichmentsUrl;
+  }
   const resource = ensureReferenceJson({ ...aardvarkJson, id: resourceId }, artifacts);
 
   return {
@@ -4804,7 +5350,7 @@ async function postOpenAIResponse(apiKey, body) {
       body: safeJsonStringify(currentBody),
     });
     const rawResponse = await response.json().catch(() => ({}));
-    if (response.ok) return rawResponse;
+    if (response.ok) return { rawResponse, requestBody: currentBody };
 
     const message = rawResponse?.error?.message || `OpenAI request failed: ${response.status}`;
     const unsupported = unsupportedParameterName(message);
@@ -4822,7 +5368,7 @@ async function postOpenAIResponse(apiKey, body) {
 async function callOpenAI(modelProfile, request, derivatives) {
   if (process.env.ENRICHMENT_PROXY_MOCK_OPENAI === "1") {
     const parsedResponse = mockExtraction();
-    return { parsedResponse, rawResponse: parsedResponse, usage: { mock: true }, confidence: 0 };
+    return { parsedResponse, rawResponse: parsedResponse, requestBody: { mock: true }, provider: "openai", usage: { mock: true }, confidence: 0 };
   }
   const apiKey = resolveEnv(modelProfile.apiKeyEnv, "OpenAI API key");
   const model = request.model || modelProfile.defaultModel;
@@ -4853,12 +5399,17 @@ async function callOpenAI(modelProfile, request, derivatives) {
     },
     ...normalizeOpenAIModelParams(model, request.modelParams || modelProfile.modelParams || {}),
   };
-  const rawResponse = await postOpenAIResponse(apiKey, body);
+  const { rawResponse, requestBody } = await postOpenAIResponse(apiKey, body);
   const text = extractResponseText(rawResponse);
   const parsedResponse = text ? JSON.parse(text) : rawResponse;
   return {
     parsedResponse,
     rawResponse,
+    requestBody,
+    provider: "openai",
+    systemPrompt: request.systemPrompt,
+    userPrompt: request.userPrompt,
+    model,
     usage: rawResponse.usage,
     confidence: parsedResponse?.map_bbox_estimate?.confidence ?? null,
   };

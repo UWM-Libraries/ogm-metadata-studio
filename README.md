@@ -13,7 +13,7 @@ Built with **React**, **Vite**, **DuckDB-WASM**, **Google Auth**, and **GitHub R
 *   **Faceted Search & Discovery**: Powerful faceted search UI (similar to GeoBlacklight) for exploring your metadata collection, powered by SQL `GROUP BY` and `ILIKE` logic.
 *   **Interactive Mapping**: Integrated Leaflet maps to visual bounding boxes (`dcat_bbox`) and spatial footprints.
 *   **Data Ingestion**: Import data from CSV or JSON sources, with automatic validation against the Aardvark schema constants.
-*   **AI Enrichment Workbench**: Configure local S3-compatible storage and OpenAI profiles, inventory source imagery, run stored prompts, review responses, and publish Aardvark drafts.
+*   **AI Enrichment Workbench**: Configure local S3-compatible storage and OpenAI profiles, inventory source imagery, run stored prompts, review responses, and publish Aardvark drafts with companion AI Enrichments provenance.
 
 ## 🛠️ Architecture
 
@@ -75,6 +75,8 @@ npm run coverage
 ## 🧠 Enrichment Workflow
 
 The administrator enrichment workbench uses a local proxy for private S3-compatible storage access and OpenAI calls. See [docs/enrichment-workbench.md](docs/enrichment-workbench.md) for setup and workflow details.
+
+For shareable AI/OCR provenance beside Aardvark records, see the draft [OpenGeoMetadata AI Enrichments](docs/ai-enrichments.md) companion standard and its [JSON Schema](schemas/ai-enrichments/schema.json).
 
 ## 🤝 Contributing
 
