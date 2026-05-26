@@ -69,6 +69,15 @@ const GOOGLE_VISION_JSON_LIMIT_BYTES = Number(process.env.GOOGLE_VISION_JSON_LIM
 const GOOGLE_VISION_INLINE_IMAGE_MAX_BYTES = Number(process.env.GOOGLE_VISION_INLINE_IMAGE_MAX_BYTES || 6_500_000);
 const GOOGLE_VISION_MAX_DIMENSION = Number(process.env.GOOGLE_VISION_MAX_DIMENSION || 9000);
 const GOOGLE_VISION_MIN_DIMENSION = Number(process.env.GOOGLE_VISION_MIN_DIMENSION || 2400);
+const GOOGLE_VISION_TILE_OCR_ENABLED = process.env.GOOGLE_VISION_TILE_OCR_ENABLED !== "false";
+const GOOGLE_VISION_TILE_MIN_DIMENSION = Number(process.env.GOOGLE_VISION_TILE_MIN_DIMENSION || 5000);
+const GOOGLE_VISION_TILE_SIZE = Number(process.env.GOOGLE_VISION_TILE_SIZE || 3000);
+const GOOGLE_VISION_TILE_OVERLAP = Number(process.env.GOOGLE_VISION_TILE_OVERLAP || 320);
+const GOOGLE_VISION_TILE_MAX_COUNT = Number(process.env.GOOGLE_VISION_TILE_MAX_COUNT || 12);
+const GOOGLE_VISION_TILE_JPEG_QUALITY = Number(process.env.GOOGLE_VISION_TILE_JPEG_QUALITY || 88);
+const METADATA_WRITER_TEXT_LIMIT = Math.max(0, Number(process.env.ENRICHMENT_PROXY_METADATA_WRITER_TEXT_LIMIT || 320));
+const METADATA_WRITER_TEXT_GROUP_LIMIT = Math.max(0, Number(process.env.ENRICHMENT_PROXY_METADATA_WRITER_TEXT_GROUP_LIMIT || 180));
+const METADATA_WRITER_PLACENAME_LIMIT = Math.max(0, Number(process.env.ENRICHMENT_PROXY_METADATA_WRITER_PLACENAME_LIMIT || 160));
 
 function safeJsonStringify(value, space) {
   return JSON.stringify(value, (_key, item) => {
@@ -1057,6 +1066,40 @@ async function loadSharp() {
   }
 }
 
+function imageExtensionForContentType(contentType) {
+  if (/png/i.test(String(contentType))) return ".png";
+  if (/webp/i.test(String(contentType))) return ".webp";
+  if (/tiff?/i.test(String(contentType))) return ".tif";
+  return ".jpg";
+}
+
+async function withTempImageFiles(buffer, contentType, callback) {
+  const dir = await mkdtemp(path.join(tmpdir(), "ogm-vision-"));
+  try {
+    const inputPath = path.join(dir, `input${imageExtensionForContentType(contentType)}`);
+    const outputPath = path.join(dir, "output.jpg");
+    await writeFile(inputPath, buffer);
+    return await callback({ inputPath, outputPath, dir });
+  } finally {
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+function parseSipsDimension(output, key) {
+  const match = String(output || "").match(new RegExp(`${key}:\\s*(\\d+)`));
+  return match ? Number(match[1]) : 0;
+}
+
+async function sipsImageDimensionsFromBuffer(buffer, contentType) {
+  return withTempImageFiles(buffer, contentType, async ({ inputPath }) => {
+    const { stdout } = await execFileAsync("sips", ["-g", "pixelWidth", "-g", "pixelHeight", inputPath]);
+    return {
+      width: parseSipsDimension(stdout, "pixelWidth"),
+      height: parseSipsDimension(stdout, "pixelHeight"),
+    };
+  });
+}
+
 async function createAnalysisDerivativesFromBuffer(buffer, contentType, assetId) {
   const sharp = await loadSharp();
   if (!sharp) {
@@ -1148,13 +1191,155 @@ async function renderVisionJpeg(buffer, maxDimension, quality) {
   return image;
 }
 
+async function renderVisionJpegWithSips(buffer, contentType, maxDimension, quality) {
+  return withTempImageFiles(buffer, contentType, async ({ inputPath, outputPath }) => {
+    await execFileAsync("sips", [
+      "-Z", String(maxDimension),
+      "-s", "format", "jpeg",
+      "-s", "formatOptions", String(Math.max(0, Math.min(100, quality))),
+      "-o", outputPath,
+      inputPath,
+    ]);
+    const data = await readFile(outputPath);
+    const dimensions = await sipsImageDimensionsFromBuffer(data, "image/jpeg");
+    return { data, info: { width: dimensions.width, height: dimensions.height } };
+  });
+}
+
+function buildVisionTiles(width, height) {
+  if (!GOOGLE_VISION_TILE_OCR_ENABLED || width <= 0 || height <= 0) return [];
+  if (Math.max(width, height) < GOOGLE_VISION_TILE_MIN_DIMENSION) return [];
+  const overlap = Math.max(0, Math.min(GOOGLE_VISION_TILE_OVERLAP, GOOGLE_VISION_TILE_SIZE - 1));
+  let tileSize = Math.max(1000, GOOGLE_VISION_TILE_SIZE);
+  let tiles = [];
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const step = Math.max(1, tileSize - overlap);
+    tiles = [];
+    for (let top = 0; top < height;) {
+      const bottom = Math.min(height, top + tileSize);
+      const actualTop = Math.max(0, bottom - tileSize);
+      for (let left = 0; left < width;) {
+        const right = Math.min(width, left + tileSize);
+        const actualLeft = Math.max(0, right - tileSize);
+        const tile = {
+          left: Math.round(actualLeft),
+          top: Math.round(actualTop),
+          width: Math.round(right - actualLeft),
+          height: Math.round(bottom - actualTop),
+        };
+        if (!tiles.some((existing) => existing.left === tile.left && existing.top === tile.top)) tiles.push(tile);
+        if (right >= width) break;
+        left += step;
+      }
+      if (bottom >= height) break;
+      top += step;
+    }
+    if (tiles.length <= GOOGLE_VISION_TILE_MAX_COUNT) break;
+    tileSize = Math.ceil(tileSize * 1.2);
+  }
+  return tiles.slice(0, Math.max(0, GOOGLE_VISION_TILE_MAX_COUNT));
+}
+
+async function renderVisionTileJpeg(buffer, tile) {
+  const sharp = await loadSharp();
+  let quality = Math.max(50, Math.min(95, GOOGLE_VISION_TILE_JPEG_QUALITY));
+  let best = null;
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const rendered = await sharp(buffer, { limitInputPixels: false })
+      .rotate()
+      .extract(tile)
+      .toColorspace("srgb")
+      .jpeg({ quality, mozjpeg: true })
+      .toBuffer({ resolveWithObject: true });
+    if (!best || rendered.data.length < best.data.length) best = rendered;
+    if (rendered.data.length <= GOOGLE_VISION_INLINE_IMAGE_MAX_BYTES) return rendered;
+    quality -= 8;
+  }
+  if (!best || best.data.length > GOOGLE_VISION_INLINE_IMAGE_MAX_BYTES) {
+    throw new Error(`Google Cloud Vision tile remains too large after normalization (${formatBytes(best?.data?.length || 0)} at ${tile.width}x${tile.height}).`);
+  }
+  return best;
+}
+
+async function renderVisionTileJpegWithSips(buffer, contentType, tile) {
+  let quality = Math.max(50, Math.min(100, GOOGLE_VISION_TILE_JPEG_QUALITY));
+  let best = null;
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const rendered = await withTempImageFiles(buffer, contentType, async ({ inputPath, outputPath }) => {
+      await execFileAsync("sips", [
+        "-c", String(tile.height), String(tile.width),
+        "--cropOffset", String(tile.top), String(tile.left),
+        "-s", "format", "jpeg",
+        "-s", "formatOptions", String(quality),
+        "-o", outputPath,
+        inputPath,
+      ]);
+      const data = await readFile(outputPath);
+      const dimensions = await sipsImageDimensionsFromBuffer(data, "image/jpeg");
+      return { data, info: { width: dimensions.width, height: dimensions.height } };
+    });
+    if (!best || rendered.data.length < best.data.length) best = rendered;
+    if (rendered.data.length <= GOOGLE_VISION_INLINE_IMAGE_MAX_BYTES) return rendered;
+    quality -= 8;
+  }
+  if (!best || best.data.length > GOOGLE_VISION_INLINE_IMAGE_MAX_BYTES) {
+    throw new Error(`Google Cloud Vision sips tile remains too large after normalization (${formatBytes(best?.data?.length || 0)} at ${tile.width}x${tile.height}).`);
+  }
+  return best;
+}
+
+function sipsTileCropOffset(value) {
+  const offset = Math.round(Number(value) || 0);
+  // sips treats a 0,0 crop offset as an unspecified/default centered crop, so
+  // edge tiles need a one-pixel nudge to remain anchored near the image origin.
+  return Math.max(1, offset);
+}
+
 async function createVisionImageBuffer(buffer, contentType) {
   const sharp = await loadSharp();
   if (!sharp) {
-    if (buffer.length > GOOGLE_VISION_INLINE_IMAGE_MAX_BYTES) {
-      throw new Error(`Google Cloud Vision inline image is ${formatBytes(buffer.length)}. Install sharp or reduce the source image so the JSON OCR request stays under ${formatBytes(GOOGLE_VISION_JSON_LIMIT_BYTES)}.`);
+    let maxDimension = GOOGLE_VISION_MAX_DIMENSION;
+    let quality = 90;
+    let best = null;
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      const rendered = await renderVisionJpegWithSips(buffer, contentType, maxDimension, quality);
+      if (!best || rendered.data.length < best.data.length) best = rendered;
+      if (rendered.data.length <= GOOGLE_VISION_INLINE_IMAGE_MAX_BYTES) {
+        return {
+          buffer: rendered.data,
+          mimeType: "image/jpeg",
+          width: rendered.info.width || 0,
+          height: rendered.info.height || 0,
+          originalBytes: buffer.length,
+          normalizedBytes: rendered.data.length,
+          maxDimension,
+          quality,
+          renderer: "sips",
+        };
+      }
+      if (quality > 70) {
+        quality -= 10;
+      } else if (maxDimension > GOOGLE_VISION_MIN_DIMENSION) {
+        maxDimension = Math.max(GOOGLE_VISION_MIN_DIMENSION, Math.floor(maxDimension * 0.75));
+        quality = 82;
+      } else {
+        quality = Math.max(50, quality - 10);
+      }
     }
-    return { buffer, mimeType: contentType, width: 0, height: 0, originalBytes: buffer.length, normalizedBytes: buffer.length };
+    if (!best || best.data.length > GOOGLE_VISION_INLINE_IMAGE_MAX_BYTES) {
+      throw new Error(`Google Cloud Vision inline image remains too large after sips normalization (${formatBytes(best?.data?.length || buffer.length)}). Install sharp or reduce the source image so the JSON OCR request stays under ${formatBytes(GOOGLE_VISION_JSON_LIMIT_BYTES)}.`);
+    }
+    return {
+      buffer: best.data,
+      mimeType: "image/jpeg",
+      width: best.info.width || 0,
+      height: best.info.height || 0,
+      originalBytes: buffer.length,
+      normalizedBytes: best.data.length,
+      maxDimension,
+      quality,
+      renderer: "sips",
+    };
   }
 
   let maxDimension = GOOGLE_VISION_MAX_DIMENSION;
@@ -1173,6 +1358,7 @@ async function createVisionImageBuffer(buffer, contentType) {
         normalizedBytes: rendered.data.length,
         maxDimension,
         quality,
+        renderer: "sharp",
       };
     }
     if (quality > 70) {
@@ -1198,6 +1384,89 @@ async function createVisionImageBuffer(buffer, contentType) {
     normalizedBytes: best.data.length,
     maxDimension,
     quality,
+    renderer: "sharp",
+  };
+}
+
+async function createVisionOcrSources(buffer, contentType) {
+  const primary = await createVisionImageBuffer(buffer, contentType);
+  const sharp = await loadSharp();
+  if (!GOOGLE_VISION_TILE_OCR_ENABLED) {
+    return {
+      primary,
+      sources: [{
+        ...primary,
+        sourceId: "ocr-source-full",
+        sourceKind: "full",
+        coordinateWidth: primary.width,
+        coordinateHeight: primary.height,
+        region: { left: 0, top: 0, width: primary.width, height: primary.height },
+      }],
+      summary: {
+        strategy: "single_normalized_image",
+        tileCount: 0,
+        coordinateWidth: primary.width,
+        coordinateHeight: primary.height,
+      },
+    };
+  }
+
+  const metadata = sharp
+    ? await sharp(buffer, { limitInputPixels: false }).metadata()
+    : await sipsImageDimensionsFromBuffer(buffer, contentType);
+  const coordinateWidth = Number(metadata.width || primary.width || 0);
+  const coordinateHeight = Number(metadata.height || primary.height || 0);
+  const tiles = buildVisionTiles(coordinateWidth, coordinateHeight);
+  const sources = [{
+    ...primary,
+    sourceId: "ocr-source-full",
+    sourceKind: "full",
+    coordinateWidth,
+    coordinateHeight,
+    region: { left: 0, top: 0, width: coordinateWidth, height: coordinateHeight },
+  }];
+
+  for (const [index, tile] of tiles.entries()) {
+    const renderTile = sharp
+      ? tile
+      : {
+        ...tile,
+        left: sipsTileCropOffset(tile.left),
+        top: sipsTileCropOffset(tile.top),
+      };
+    const rendered = sharp
+      ? await renderVisionTileJpeg(buffer, renderTile)
+      : await renderVisionTileJpegWithSips(buffer, contentType, renderTile);
+    sources.push({
+      buffer: rendered.data,
+      mimeType: "image/jpeg",
+      width: rendered.info.width || renderTile.width,
+      height: rendered.info.height || renderTile.height,
+      originalBytes: buffer.length,
+      normalizedBytes: rendered.data.length,
+      sourceId: `ocr-source-tile-${String(index + 1).padStart(2, "0")}`,
+      sourceKind: "tile",
+      coordinateWidth,
+      coordinateHeight,
+      region: renderTile,
+      quality: GOOGLE_VISION_TILE_JPEG_QUALITY,
+      renderer: sharp ? "sharp" : "sips",
+    });
+  }
+
+  return {
+    primary,
+    sources,
+    summary: {
+      strategy: tiles.length > 0 ? "full_image_plus_overlapping_tiles" : "single_normalized_image",
+      tileCount: tiles.length,
+      tileSize: GOOGLE_VISION_TILE_SIZE,
+      tileOverlap: GOOGLE_VISION_TILE_OVERLAP,
+      tileMaxCount: GOOGLE_VISION_TILE_MAX_COUNT,
+      coordinateWidth,
+      coordinateHeight,
+      renderer: sharp ? "sharp" : "sips",
+    },
   };
 }
 
@@ -1209,6 +1478,58 @@ function bboxFromBoundingPoly(poly, width, height) {
   const x2 = Math.max(0, Math.min(1, box.x2 / width));
   const y2 = Math.max(0, Math.min(1, box.y2 / height));
   return x2 > x1 && y2 > y1 ? [x1, y1, x2, y2] : null;
+}
+
+function normalizedPolygonFromBoundingPoly(poly, width, height) {
+  const vertices = Array.isArray(poly?.vertices) ? poly.vertices : [];
+  if (vertices.length === 0 || width <= 0 || height <= 0) return null;
+  const points = vertices.map((vertex) => {
+    const x = Number(vertex?.x ?? 0);
+    const y = Number(vertex?.y ?? 0);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+    return [
+      Math.max(0, Math.min(1, x / width)),
+      Math.max(0, Math.min(1, y / height)),
+    ];
+  }).filter(Boolean);
+  return points.length >= 3 ? points : null;
+}
+
+function reprojectSourceX(source, value) {
+  const region = source?.region;
+  const coordinateWidth = Number(source?.coordinateWidth || 0);
+  if (!region || coordinateWidth <= 0) return value;
+  return Math.max(0, Math.min(1, (region.left + value * region.width) / coordinateWidth));
+}
+
+function reprojectSourceY(source, value) {
+  const region = source?.region;
+  const coordinateHeight = Number(source?.coordinateHeight || 0);
+  if (!region || coordinateHeight <= 0) return value;
+  return Math.max(0, Math.min(1, (region.top + value * region.height) / coordinateHeight));
+}
+
+function reprojectTextEntryToFullImage(entry, source) {
+  const region = source?.region;
+  if (!region || source?.sourceKind === "full") return entry;
+  const bbox = Array.isArray(entry?.approx_bbox) && entry.approx_bbox.length === 4
+    ? [
+      reprojectSourceX(source, Number(entry.approx_bbox[0])),
+      reprojectSourceY(source, Number(entry.approx_bbox[1])),
+      reprojectSourceX(source, Number(entry.approx_bbox[2])),
+      reprojectSourceY(source, Number(entry.approx_bbox[3])),
+    ]
+    : entry?.approx_bbox;
+  const polygon = Array.isArray(entry?.approx_polygon)
+    ? entry.approx_polygon.map((point) => Array.isArray(point) && point.length >= 2
+      ? [reprojectSourceX(source, Number(point[0])), reprojectSourceY(source, Number(point[1]))]
+      : point)
+    : entry?.approx_polygon;
+  return {
+    ...entry,
+    approx_bbox: bbox,
+    approx_polygon: polygon,
+  };
 }
 
 function pixelBoxFromBoundingPoly(poly, width, height) {
@@ -1279,6 +1600,181 @@ function isGroupableOcrText(entry) {
   if (alphaCount / compact.length < 0.5) return false;
   if (/^[ivxlcdm]+$/i.test(compact) && compact.length <= 4) return false;
   return true;
+}
+
+function mapLabelTokens(content) {
+  return String(content || "")
+    .replace(/[^\p{L}\p{N}'&.-]+/gu, " ")
+    .split(/\s+/)
+    .map((token) => token.replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, ""))
+    .filter(Boolean);
+}
+
+function normalizeMapLabel(content) {
+  const tokens = mapLabelTokens(content)
+    .map((token) => token.replace(/[“”]/g, "\"").replace(/[‘’]/g, "'"))
+    .filter((token) => /[A-Za-z]/.test(token));
+  if (tokens.length === 0) return "";
+  return tokens.join(" ").replace(/\s+/g, " ").trim();
+}
+
+function titleizeMapLabel(label) {
+  return String(label || "")
+    .split(/\s+/)
+    .map((token) => {
+      if (/^(?:[A-Z]{1,2}|[A-Z]&[A-Z])$/.test(token)) return token;
+      if (/^[A-Z][a-z]+$/.test(token)) return token;
+      if (/^[A-Za-z][A-Za-z'.-]*$/.test(token)) return token.charAt(0).toUpperCase() + token.slice(1).toLowerCase();
+      return token;
+    })
+    .join(" ");
+}
+
+const MAP_LABEL_STOPWORDS = new Set([
+  "and",
+  "ave",
+  "avenue",
+  "blvd",
+  "boulevard",
+  "bus",
+  "by",
+  "car",
+  "copyright",
+  "country",
+  "dr",
+  "drive",
+  "feet",
+  "ferry",
+  "golf",
+  "guide",
+  "house",
+  "legend",
+  "line",
+  "lines",
+  "main",
+  "map",
+  "mile",
+  "miles",
+  "no",
+  "note",
+  "numbers",
+  "of",
+  "park",
+  "parks",
+  "published",
+  "railroad",
+  "railroads",
+  "rd",
+  "road",
+  "scale",
+  "st",
+  "street",
+  "thoroughfares",
+  "to",
+  "way",
+]);
+
+const MAP_LABEL_FEATURE_SUFFIXES = {
+  waterbody: new Set(["bay", "canal", "channel", "creek", "harbor", "lake", "river", "sound", "waterway"]),
+  landmark: new Set(["airport", "cem", "cemetery", "club", "college", "dock", "field", "fort", "hospital", "island", "park", "point", "university"]),
+  region: new Set(["addition", "district", "heights", "hill", "hills", "junction", "valley"]),
+};
+
+const MAP_LABEL_FEATURE_WORDS = new Set(Object.values(MAP_LABEL_FEATURE_SUFFIXES).flatMap((values) => [...values]));
+
+function mapLabelFeatureType(label) {
+  const tokens = mapLabelTokens(label).map((token) => token.toLowerCase().replace(/\.$/, ""));
+  if (tokens.length === 0) return "other";
+  if (tokens.includes("county")) return "county";
+  if (tokens.includes("state")) return "state_province";
+  const suffix = tokens[tokens.length - 1];
+  for (const [type, suffixes] of Object.entries(MAP_LABEL_FEATURE_SUFFIXES)) {
+    if (suffixes.has(suffix)) return type;
+  }
+  if (tokens.some((token) => MAP_LABEL_FEATURE_SUFFIXES.waterbody.has(token))) return "waterbody";
+  if (tokens.some((token) => MAP_LABEL_FEATURE_SUFFIXES.landmark.has(token))) return "landmark";
+  if (tokens.some((token) => MAP_LABEL_FEATURE_SUFFIXES.region.has(token))) return "region";
+  return "other";
+}
+
+function looksLikeStreetGridLabel(label) {
+  const normalized = normalizeMapLabel(label).toLowerCase();
+  if (!normalized) return true;
+  const tokens = mapLabelTokens(normalized);
+  if (tokens.length === 0) return true;
+  const digitCount = (normalized.match(/\d/g) || []).length;
+  const alphaCount = (normalized.match(/[a-z]/g) || []).length;
+  if (digitCount > 0 && digitCount >= alphaCount) return true;
+  if (/^\d+(?:st|nd|rd|th)?$/.test(tokens[0])) return true;
+  if (/\b(?:st|street|ave|avenue|rd|road|blvd|boulevard|way|pl|place|dr|drive|ct|court|ter|terrace)\b\.?$/i.test(normalized)) return true;
+  if (/^[nswe]\s+\d+(?:st|nd|rd|th)?\s+(?:st|street|ave|avenue)\b/i.test(normalized)) return true;
+  return false;
+}
+
+function looksLikeMapPlacename(label) {
+  const normalized = normalizeMapLabel(label);
+  if (!normalized || normalized.length < 4 || normalized.length > 64) return false;
+  if (/\b(?:co|company|copyright|legend|lighting|map\s+co|mills?|miles?|published|president|scale|shipbuilding|warehouse|worl)\b/i.test(normalized)) return false;
+  if (looksLikeStreetGridLabel(normalized)) return false;
+  const tokens = mapLabelTokens(normalized);
+  const lowerTokens = tokens.map((token) => token.toLowerCase().replace(/\.$/, ""));
+  if (lowerTokens.every((token) => MAP_LABEL_STOPWORDS.has(token))) return false;
+  if (tokens.length > 6) return false;
+  const compact = normalized.replace(/[^A-Za-z]/g, "");
+  if (compact.length < 4) return false;
+  const featureType = mapLabelFeatureType(normalized);
+  const stopwordRatio = lowerTokens.filter((token) => MAP_LABEL_STOPWORDS.has(token)).length / lowerTokens.length;
+  if (stopwordRatio > 0.5 && featureType === "other") return false;
+  if (featureType !== "other" && lowerTokens.some((token) => !MAP_LABEL_STOPWORDS.has(token))) return true;
+  if (tokens.length >= 2 && lowerTokens.some((token) => !MAP_LABEL_STOPWORDS.has(token) && token.length >= 3)) return true;
+  return tokens.length === 1 && compact.length >= 5 && !MAP_LABEL_STOPWORDS.has(lowerTokens[0]);
+}
+
+function placenameConfidence(baseConfidence, label, sourceKind) {
+  const tokens = mapLabelTokens(label);
+  const featureType = mapLabelFeatureType(label);
+  let confidence = Math.max(0, Math.min(1, Number(baseConfidence) || 0.6));
+  if (sourceKind === "text_group") confidence += 0.08;
+  if (tokens.length >= 2) confidence += 0.06;
+  if (featureType !== "other") confidence += 0.08;
+  if (looksLikeStreetGridLabel(label)) confidence -= 0.35;
+  return Math.max(0.35, Math.min(0.98, confidence));
+}
+
+function hasSpecificMapNameToken(label) {
+  return mapLabelTokens(label)
+    .map((token) => token.toLowerCase().replace(/\.$/, ""))
+    .some((token) => token.length >= 3 && !MAP_LABEL_STOPWORDS.has(token) && !MAP_LABEL_FEATURE_WORDS.has(token));
+}
+
+function featurePhraseForMapLabel(label) {
+  const tokens = mapLabelTokens(label);
+  const lowerTokens = tokens.map((token) => token.toLowerCase().replace(/\.$/, ""));
+  const featureIndices = lowerTokens
+    .map((token, index) => MAP_LABEL_FEATURE_WORDS.has(token) ? index : -1)
+    .filter((index) => index >= 0);
+  if (featureIndices.length === 0) return normalizeMapLabel(label);
+  const lastIndex = tokens.length - 1;
+  const featureIndex = featureIndices.includes(lastIndex) ? lastIndex : featureIndices[0];
+  const start = featureIndex === lastIndex
+    ? Math.max(0, featureIndex - 4)
+    : Math.max(0, featureIndex - 1);
+  const end = featureIndex === lastIndex
+    ? featureIndex + 1
+    : Math.min(tokens.length, featureIndex === 0 ? featureIndex + 2 : featureIndex + 1);
+  return normalizeMapLabel(tokens.slice(start, end).join(" "));
+}
+
+function shouldEmitPlacenameCandidate(label) {
+  const normalized = normalizeMapLabel(label);
+  if (!looksLikeMapPlacename(normalized)) return false;
+  const tokens = mapLabelTokens(normalized);
+  const lowerTokens = tokens.map((token) => token.toLowerCase().replace(/\.$/, ""));
+  if (lowerTokens.some((token) => /^(?:aves?|sts?|rds?)$/.test(token))) return false;
+  if (/^(?:ave|avenue|blvd|boulevard|dr|drive|rd|road|st|street)$/.test(lowerTokens[0])) return false;
+  const featureType = mapLabelFeatureType(normalized);
+  if (featureType !== "other") return tokens.length >= 2 && hasSpecificMapNameToken(normalized);
+  return false;
 }
 
 function pixelItemFromTextEntry(entry, index, pageWidth, pageHeight) {
@@ -1424,6 +1920,7 @@ function textGroupLooksUseful(content) {
     .split(/\s+/)
     .map((token) => token.replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, ""))
     .filter(Boolean);
+  if (tokens.length === 2 && looksLikeMapPlacename(content)) return true;
   if (tokens.length < 3) return false;
   const shortTokenRatio = tokens.filter((token) => token.length <= 2).length / tokens.length;
   if (shortTokenRatio > 0.5) return false;
@@ -1473,7 +1970,7 @@ function consolidateOcrTextEntries(entries, pageWidth, pageHeight) {
     if (!textGroupLooksUseful(content)) continue;
     const sourceIndices = ordered.map((item) => item.index);
     const sourceSpan = Math.max(...sourceIndices) - Math.min(...sourceIndices) + 1;
-    if (sourceSpan > sourceIndices.length) continue;
+    if (sourceSpan > sourceIndices.length && !looksLikeMapPlacename(content)) continue;
     for (const item of ordered) used.add(item.index);
     const first = ordered[0].box;
     const last = ordered[ordered.length - 1].box;
@@ -1503,6 +2000,139 @@ function consolidateOcrTextEntries(entries, pageWidth, pageHeight) {
   };
 }
 
+function deriveMapLabelPlacenames(entries, groups) {
+  const candidatesByKey = new Map();
+  const addCandidate = ({ content, confidence, sourceKind, sourceIndices, bbox }) => {
+    const normalized = featurePhraseForMapLabel(content);
+    if (!shouldEmitPlacenameCandidate(normalized)) return;
+    const name = titleizeMapLabel(normalized);
+    const sourceTextIndices = Array.from(new Set((sourceIndices || [])
+      .map((index) => Number(index))
+      .filter((index) => Number.isInteger(index) && index >= 0)))
+      .sort((a, b) => a - b);
+    if (sourceTextIndices.length === 0) return;
+    const candidateConfidence = placenameConfidence(confidence, name, sourceKind);
+    const key = name.toLowerCase();
+    const candidate = withoutUndefined({
+      name,
+      type: mapLabelFeatureType(name),
+      source_text_index: sourceTextIndices[0],
+      source_text_indices: sourceTextIndices,
+      approx_bbox: bbox,
+      confidence: candidateConfidence,
+      reasoning: sourceKind === "text_group"
+        ? "MapKurator-inspired lexical cleanup selected this consolidated OCR label as a likely map placename."
+        : "MapKurator-inspired lexical cleanup selected this OCR label as a likely map placename.",
+    });
+    const existing = candidatesByKey.get(key);
+    if (!existing || candidateConfidence > existing.confidence || (sourceKind === "text_group" && existing.sourceKind !== "text_group")) {
+      candidatesByKey.set(key, { ...candidate, sourceKind });
+    }
+  };
+
+  for (const group of Array.isArray(groups) ? groups : []) {
+    addCandidate({
+      content: group?.content,
+      confidence: group?.confidence,
+      sourceKind: "text_group",
+      sourceIndices: Array.isArray(group?.source_text_indices) ? group.source_text_indices : [],
+      bbox: group?.approx_bbox,
+    });
+  }
+
+  for (const [index, entry] of (Array.isArray(entries) ? entries : []).entries()) {
+    const confidence = Number(entry?.confidence);
+    if (Number.isFinite(confidence) && confidence < 0.72) continue;
+    addCandidate({
+      content: entry?.content,
+      confidence: entry?.confidence,
+      sourceKind: "text",
+      sourceIndices: [index],
+      bbox: entry?.approx_bbox,
+    });
+  }
+
+  return Array.from(candidatesByKey.values())
+    .sort((a, b) => b.confidence - a.confidence || a.name.localeCompare(b.name))
+    .slice(0, 80)
+    .map(({ sourceKind, ...candidate }) => candidate);
+}
+
+function normalizedContentKey(content) {
+  return String(content || "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function normalizedBoxArea(box) {
+  if (!Array.isArray(box) || box.length !== 4) return 0;
+  const width = Math.max(0, Number(box[2]) - Number(box[0]));
+  const height = Math.max(0, Number(box[3]) - Number(box[1]));
+  return width * height;
+}
+
+function normalizedBoxIou(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== 4 || b.length !== 4) return 0;
+  const x1 = Math.max(Number(a[0]), Number(b[0]));
+  const y1 = Math.max(Number(a[1]), Number(b[1]));
+  const x2 = Math.min(Number(a[2]), Number(b[2]));
+  const y2 = Math.min(Number(a[3]), Number(b[3]));
+  const intersection = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+  const union = normalizedBoxArea(a) + normalizedBoxArea(b) - intersection;
+  return union > 0 ? intersection / union : 0;
+}
+
+function normalizedBoxCenterDistance(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== 4 || b.length !== 4) return Infinity;
+  const ax = (Number(a[0]) + Number(a[2])) / 2;
+  const ay = (Number(a[1]) + Number(a[3])) / 2;
+  const bx = (Number(b[0]) + Number(b[2])) / 2;
+  const by = (Number(b[1]) + Number(b[3])) / 2;
+  return Math.hypot(ax - bx, ay - by);
+}
+
+function textEntryRank(entry) {
+  const confidence = Math.max(0, Math.min(1, Number(entry?.confidence) || 0));
+  const sourceBonus = entry?.source_image_kind === "tile" ? 0.08 : 0;
+  const contentBonus = Math.min(0.08, String(entry?.content || "").length / 400);
+  return confidence + sourceBonus + contentBonus;
+}
+
+function dedupeOcrEntries(entries) {
+  const kept = [];
+  const duplicates = [];
+  for (const entry of [...entries].sort((a, b) => textEntryRank(b) - textEntryRank(a))) {
+    const key = normalizedContentKey(entry?.content);
+    if (!key) continue;
+    const duplicateIndex = kept.findIndex((existing) => {
+      if (normalizedContentKey(existing?.content) !== key) return false;
+      const iou = normalizedBoxIou(existing?.approx_bbox, entry?.approx_bbox);
+      if (iou >= 0.35) return true;
+      const distance = normalizedBoxCenterDistance(existing?.approx_bbox, entry?.approx_bbox);
+      const scale = Math.max(
+        Math.sqrt(normalizedBoxArea(existing?.approx_bbox)),
+        Math.sqrt(normalizedBoxArea(entry?.approx_bbox)),
+        0.004,
+      );
+      return distance <= scale * 0.75;
+    });
+    if (duplicateIndex >= 0) {
+      duplicates.push({ kept: duplicateIndex, duplicate: entry?.source_image_id || "unknown", content: entry?.content });
+      continue;
+    }
+    kept.push(entry);
+  }
+  kept.sort((a, b) => {
+    const boxA = Array.isArray(a?.approx_bbox) ? a.approx_bbox : [0, 0, 0, 0];
+    const boxB = Array.isArray(b?.approx_bbox) ? b.approx_bbox : [0, 0, 0, 0];
+    return Number(boxA[1]) - Number(boxB[1]) || Number(boxA[0]) - Number(boxB[0]);
+  });
+  return { entries: kept, duplicatesRemoved: duplicates.length };
+}
+
 function lineEntriesFromVisionWords(words, pageWidth, pageHeight) {
   const items = words.map((word) => {
     const content = textFromVisionWord(word).trim();
@@ -1511,6 +2141,7 @@ function lineEntriesFromVisionWords(words, pageWidth, pageHeight) {
     return {
       content,
       box,
+      polygon: normalizedPolygonFromBoundingPoly(word?.boundingBox, pageWidth, pageHeight),
       confidence: Number.isFinite(Number(word?.confidence)) ? Number(word.confidence) : 0.8,
     };
   }).filter(Boolean);
@@ -1537,9 +2168,15 @@ function lineEntriesFromVisionWords(words, pageWidth, pageHeight) {
   return lines.map((line) => {
     const ordered = [...line].sort((a, b) => a.box.x1 - b.box.x1);
     const content = ordered.map((item) => item.content).join(" ").trim();
+    const first = ordered[0]?.box;
+    const last = ordered[ordered.length - 1]?.box;
+    const orientation = first && last ? Math.atan2(last.cy - first.cy, last.cx - first.cx) * 180 / Math.PI : 0;
     return {
       content,
       approx_bbox: normalizedMergedBox(ordered, pageWidth, pageHeight),
+      ...(ordered.length === 1 && ordered[0].polygon ? { approx_polygon: ordered[0].polygon } : {}),
+      source_word_count: ordered.length,
+      orientation_degrees: Math.round(orientation * 10) / 10,
       confidence: ordered.reduce((sum, item) => sum + Math.max(0, Math.min(1, item.confidence)), 0) / ordered.length,
       role: textRoleForOcrText(content),
       reasoning: "Google Cloud Vision OCR line bounding polygon grouped from word boxes.",
@@ -1592,6 +2229,7 @@ function textEntriesFromTextAnnotations(annotations, width, height) {
     return {
       content,
       approx_bbox: bbox,
+      approx_polygon: normalizedPolygonFromBoundingPoly(annotation?.boundingPoly, width, height),
       confidence: 0.8,
       role: textRoleForOcrText(content),
       reasoning: "Google Cloud Vision OCR text annotation bounding polygon.",
@@ -1615,22 +2253,61 @@ function googleVisionErrorMessage(message, source, requestBytes) {
   return `Google Cloud Vision OCR failed: ${message || "unknown error"} (${detail}).`;
 }
 
-async function callGoogleVisionOcr(visionProfile, source) {
-  const apiKey = resolveEnv(visionProfile.apiKeyEnv, "Google Cloud Vision API key");
-  const endpoint = visionProfile.endpoint || "https://vision.googleapis.com/v1/images:annotate";
-  const url = new URL(endpoint);
-  url.searchParams.set("key", apiKey);
-  const featureType = visionProfile.featureType || "DOCUMENT_TEXT_DETECTION";
-  const languageHints = Array.isArray(visionProfile.languageHints)
-    ? visionProfile.languageHints.map(String).filter(Boolean)
-    : [];
-  const requestBody = safeJsonStringify({
+function googleVisionSourceRequestSummary(source, endpoint, featureType, languageHints) {
+  return {
+    sourceId: source.sourceId || "ocr-source-full",
+    sourceKind: source.sourceKind || "full",
+    endpoint,
+    image: {
+      content: "[redacted base64 image bytes]",
+      width: source.width,
+      height: source.height,
+      mimeType: source.mimeType || "image/jpeg",
+      originalBytes: source.originalBytes || null,
+      normalizedBytes: source.normalizedBytes || source.buffer?.length || null,
+      coordinateWidth: source.coordinateWidth || source.width || null,
+      coordinateHeight: source.coordinateHeight || source.height || null,
+      region: source.region || null,
+      renderer: source.renderer || null,
+    },
+    features: [{ type: featureType }],
+    ...(languageHints.length > 0 ? { imageContext: { languageHints } } : {}),
+  };
+}
+
+function googleVisionRequestBodyForSource(source, featureType, languageHints) {
+  return safeJsonStringify({
     requests: [{
       image: { content: source.buffer.toString("base64") },
       features: [{ type: featureType }],
       ...(languageHints.length > 0 ? { imageContext: { languageHints } } : {}),
     }],
   });
+}
+
+function parseGoogleVisionOcrSource({ body, source }) {
+  const result = body?.responses?.[0] || {};
+  if (result.error) throw new Error(googleVisionErrorMessage(result.error.message || "provider returned an OCR error", source, 0));
+  const fullText = result.fullTextAnnotation?.text || result.textAnnotations?.[0]?.description || "";
+  const entriesFromFullText = textEntriesFromFullTextAnnotation(result.fullTextAnnotation);
+  const rawEntries = entriesFromFullText.length > 0
+    ? entriesFromFullText
+    : textEntriesFromTextAnnotations(result.textAnnotations, source.width, source.height);
+  const entries = rawEntries.map((entry, index) => reprojectTextEntryToFullImage({
+    ...entry,
+    source_image_id: source.sourceId || "ocr-source-full",
+    source_image_kind: source.sourceKind || "full",
+    source_region: source.region,
+    source_response_path: `/${source.sourceId || "ocr-source-full"}/text/${index}`,
+  }, source));
+  return { fullText, entries };
+}
+
+async function callGoogleVisionOcrSource({ visionProfile, source, endpoint, featureType, languageHints }) {
+  const apiKey = resolveEnv(visionProfile.apiKeyEnv, "Google Cloud Vision API key");
+  const url = new URL(endpoint);
+  url.searchParams.set("key", apiKey);
+  const requestBody = googleVisionRequestBodyForSource(source, featureType, languageHints);
   const requestBytes = Buffer.byteLength(requestBody, "utf8");
   if (requestBytes > GOOGLE_VISION_JSON_LIMIT_BYTES) {
     throw new Error(`Google Cloud Vision JSON OCR request is too large (${googleVisionSourceSummary(source, requestBytes)}). Reduce GOOGLE_VISION_INLINE_IMAGE_MAX_BYTES or use a smaller source image.`);
@@ -1644,20 +2321,80 @@ async function callGoogleVisionOcr(visionProfile, source) {
   if (!response.ok) {
     throw new Error(googleVisionErrorMessage(body?.error?.message || `request failed: ${response.status}`, source, requestBytes));
   }
-  const result = body?.responses?.[0] || {};
-  if (result.error) throw new Error(googleVisionErrorMessage(result.error.message || "provider returned an OCR error", source, requestBytes));
-  const fullText = result.fullTextAnnotation?.text || result.textAnnotations?.[0]?.description || "";
-  const entriesFromFullText = textEntriesFromFullTextAnnotation(result.fullTextAnnotation);
-  const entries = entriesFromFullText.length > 0
-    ? entriesFromFullText
-    : textEntriesFromTextAnnotations(result.textAnnotations, source.width, source.height);
-  const consolidated = consolidateOcrTextEntries(entries, source.width, source.height);
+  return {
+    source,
+    body,
+    requestBytes,
+    requestSummary: googleVisionSourceRequestSummary(source, endpoint, featureType, languageHints),
+    ...parseGoogleVisionOcrSource({ body, source }),
+  };
+}
+
+async function callGoogleVisionOcr(visionProfile, sourceOrSources) {
+  const endpoint = visionProfile.endpoint || "https://vision.googleapis.com/v1/images:annotate";
+  const featureType = visionProfile.featureType || "DOCUMENT_TEXT_DETECTION";
+  const languageHints = Array.isArray(visionProfile.languageHints)
+    ? visionProfile.languageHints.map(String).filter(Boolean)
+    : [];
+  const sources = Array.isArray(sourceOrSources?.sources)
+    ? sourceOrSources.sources
+    : [sourceOrSources].filter(Boolean);
+  const sourceSummary = sourceOrSources?.summary || {
+    strategy: "single_normalized_image",
+    tileCount: Math.max(0, sources.length - 1),
+    coordinateWidth: sources[0]?.coordinateWidth || sources[0]?.width || 0,
+    coordinateHeight: sources[0]?.coordinateHeight || sources[0]?.height || 0,
+  };
+  if (sources.length === 0) throw new Error("Google Cloud Vision OCR has no image sources to process.");
+
+  const sourceResults = [];
+  const sourceErrors = [];
+  for (const [index, source] of sources.entries()) {
+    try {
+      sourceResults.push(await callGoogleVisionOcrSource({ visionProfile, source, endpoint, featureType, languageHints }));
+    } catch (error) {
+      if (index === 0) throw error;
+      sourceErrors.push({
+        sourceId: source.sourceId || `ocr-source-${index}`,
+        sourceKind: source.sourceKind || "tile",
+        message: error.message || String(error),
+      });
+    }
+  }
+
+  const allEntries = sourceResults.flatMap((result) => result.entries);
+  const deduped = dedupeOcrEntries(allEntries);
+  const coordinateWidth = sourceSummary.coordinateWidth || sources[0]?.coordinateWidth || sources[0]?.width || 0;
+  const coordinateHeight = sourceSummary.coordinateHeight || sources[0]?.coordinateHeight || sources[0]?.height || 0;
+  const consolidated = consolidateOcrTextEntries(deduped.entries, coordinateWidth, coordinateHeight);
+  const placenames = deriveMapLabelPlacenames(deduped.entries, consolidated.groups);
+  const fullText = sourceResults.map((result) => result.fullText).filter(Boolean).join("\n\n");
+  const rawResponse = sourceResults.length === 1
+    ? sourceResults[0].body
+    : {
+      sourceResponses: sourceResults.map((result) => ({
+        sourceId: result.source.sourceId,
+        sourceKind: result.source.sourceKind,
+        region: result.source.region,
+        response: result.body,
+      })),
+      sourceErrors,
+    };
   return {
     parsedResponse: {
-      text: entries,
+      text: deduped.entries,
       text_groups: consolidated.groups,
-      text_grouping_summary: consolidated.summary,
-      placenames: [],
+      text_grouping_summary: {
+        ...consolidated.summary,
+        source_strategy: sourceSummary.strategy,
+        source_count: sources.length,
+        successful_source_count: sourceResults.length,
+        failed_source_count: sourceErrors.length,
+        pre_dedupe_text_count: allEntries.length,
+        duplicate_text_count: deduped.duplicatesRemoved,
+        tile_count: sourceSummary.tileCount || 0,
+      },
+      placenames,
       map_bbox_estimate: {
         west: 0,
         south: 0,
@@ -1668,36 +2405,29 @@ async function callGoogleVisionOcr(visionProfile, source) {
         reasoning: "Google Cloud Vision provides OCR text and image-space boxes only; geographic map extent is left for metadata writing or human review.",
       },
       description: fullText
-        ? `Google Cloud Vision OCR extracted ${entries.length} text segment(s); a deterministic secondary pass consolidated ${consolidated.groups.length} text group(s).`
+        ? `Google Cloud Vision OCR extracted ${deduped.entries.length} text segment(s) from ${sourceResults.length} source image(s); a deterministic secondary pass consolidated ${consolidated.groups.length} text group(s) and proposed ${placenames.length} placename candidate(s).`
         : "Google Cloud Vision OCR did not return text.",
       debug: {
-        ocr_strategy: `google_cloud_vision:${featureType}`,
+        ocr_strategy: sourceSummary.tileCount > 0 ? `google_cloud_vision:${featureType}:full_plus_tiles` : `google_cloud_vision:${featureType}`,
         text_grouping_strategy: OCR_TEXT_GROUPING_STRATEGY,
-        placename_extraction_strategy: "deferred_to_openai_metadata_writer",
+        placename_extraction_strategy: "mapkurator_inspired_deterministic_label_cleanup_v1",
         bbox_inference_strategy: "not_inferred_from_ocr",
-        limitations: "OCR boxes are generated by Google Cloud Vision. Placenames and descriptive metadata are prepared later by OpenAI from the OCR text.",
+        ocr_source_strategy: sourceSummary,
+        ocr_source_errors: sourceErrors,
+        limitations: "OCR boxes are generated by Google Cloud Vision. Large maps may be OCRed with a MapKurator-inspired tile/stitch pass. Placename candidates use deterministic map-label cleanup inspired by MapKurator post-OCR/entity-linking stages, but no external gazetteer is queried.",
       },
     },
-    rawResponse: body,
+    rawResponse,
     provider: "google_cloud_vision",
     requestBody: {
       endpoint,
-      requests: [{
-        image: {
-          content: "[redacted base64 image bytes]",
-          width: source.width,
-          height: source.height,
-          mimeType: source.mimeType || "image/jpeg",
-          originalBytes: source.originalBytes || null,
-          normalizedBytes: source.normalizedBytes || source.buffer?.length || null,
-        },
-        features: [{ type: featureType }],
-        ...(languageHints.length > 0 ? { imageContext: { languageHints } } : {}),
-      }],
+      requests: sourceResults.map((result) => result.requestSummary),
+      tiling: sourceSummary,
+      sourceErrors,
     },
-    usage: { provider: "google_cloud_vision", featureType },
-    confidence: entries.length > 0
-      ? entries.reduce((sum, entry) => sum + Number(entry.confidence || 0), 0) / entries.length
+    usage: { provider: "google_cloud_vision", featureType, sourceCount: sourceResults.length, tileCount: sourceSummary.tileCount || 0 },
+    confidence: deduped.entries.length > 0
+      ? deduped.entries.reduce((sum, entry) => sum + Number(entry.confidence || 0), 0) / deduped.entries.length
       : 0,
   };
 }
@@ -2392,6 +3122,13 @@ function withoutUndefined(value) {
   return Object.fromEntries(entries);
 }
 
+function optionalExtensions(value) {
+  const cleaned = withoutUndefined(value);
+  return cleaned && typeof cleaned === "object" && !Array.isArray(cleaned) && Object.keys(cleaned).length > 0
+    ? cleaned
+    : undefined;
+}
+
 function redactOpenAIRequestForPersistence(value) {
   if (Array.isArray(value)) return value.map(redactOpenAIRequestForPersistence);
   if (!value || typeof value !== "object") return value;
@@ -2435,6 +3172,11 @@ function extractionTextSegments(extraction, sourceCallId) {
       readingOrder: index,
       reasoning: entry?.reasoning,
       raw: entry,
+      extensions: optionalExtensions({
+        approxPolygon: entry?.approx_polygon,
+        sourceWordCount: entry?.source_word_count,
+        orientationDegrees: entry?.orientation_degrees,
+      }),
     }))
     .filter((entry) => entry.content.trim());
 }
@@ -2454,6 +3196,10 @@ function extractionTextGroups(extraction, textSegments, sourceCallId) {
       sourceTextIndices: Array.isArray(entry?.source_text_indices) ? entry.source_text_indices : undefined,
       sourceCallId,
       reasoning: entry?.reasoning || "Deterministically consolidated from adjacent OCR text segments.",
+      extensions: optionalExtensions({
+        sourceTextCount: entry?.source_text_count,
+        orientationDegrees: entry?.orientation_degrees,
+      }),
     }))
     .filter((entry) => entry.content.trim());
 }
@@ -2471,13 +3217,17 @@ function derivedPlacenamesForAiEnrichments(extraction, resource, textSegments, e
   for (const [index, place] of (Array.isArray(extraction?.placenames) ? extraction.placenames : []).entries()) {
     const name = normalizedText(place?.name);
     if (!name) continue;
+    const sourceIndices = Array.isArray(place?.source_text_indices)
+      ? place.source_text_indices
+      : Number.isInteger(Number(place?.source_text_index)) ? [Number(place.source_text_index)] : [];
     places.push(withoutUndefined({
       id: `place-${String(index + 1).padStart(4, "0")}`,
       name,
       normalizedName: name,
       type: place?.type || "other",
-      sourceTextIds: sourceTextIdsForIndex(place?.source_text_index, textSegments),
-      sourceTextIndices: Number.isInteger(Number(place?.source_text_index)) ? [Number(place.source_text_index)] : undefined,
+      sourceTextIds: sourceTextIdsForIndex(sourceIndices, textSegments),
+      sourceTextIndices: sourceIndices.length > 0 ? sourceIndices : undefined,
+      approxBbox: Array.isArray(place?.approx_bbox) ? place.approx_bbox : undefined,
       confidence: typeof place?.confidence === "number" ? Math.max(0, Math.min(1, place.confidence)) : undefined,
       status: "candidate",
       sourceCallId: extractionCallId,
@@ -4280,6 +5030,106 @@ async function writeArchivalSupplementArtifacts(profile, keys, supplement) {
   await putObjectBuffer(profile, keys.archivalSupplement, Buffer.from(renderArchivalSupplementMarkdown(supplement), "utf8"), "text/markdown; charset=utf-8");
 }
 
+function compactNumber(value, digits = 4) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return undefined;
+  return Number(number.toFixed(digits));
+}
+
+function compactBbox(bbox) {
+  if (!Array.isArray(bbox)) return undefined;
+  const values = bbox.slice(0, 4).map((value) => compactNumber(value));
+  return values.every((value) => value !== undefined) ? values : undefined;
+}
+
+function compactOcrEvidenceItem(item, extraKeys = []) {
+  if (!item || typeof item !== "object") return null;
+  const content = normalizedText(item.content || item.name);
+  if (!content) return null;
+  const compacted = withoutUndefined({
+    content,
+    name: item.name && item.name !== content ? normalizedText(item.name) : undefined,
+    type: item.type,
+    role: item.role,
+    confidence: compactNumber(item.confidence, 3),
+    approx_bbox: compactBbox(item.approx_bbox),
+    orientation_degrees: compactNumber(item.orientation_degrees, 1),
+    source_text_count: item.source_text_count,
+  });
+  for (const key of extraKeys) {
+    if (item[key] !== undefined) compacted[key] = item[key];
+  }
+  return compacted;
+}
+
+function textEvidenceScore(item) {
+  const content = normalizedText(item?.content);
+  if (!content) return -1;
+  const confidence = Number(item?.confidence);
+  const words = content.split(/\s+/).filter(Boolean);
+  const role = String(item?.role || "");
+  const usefulWords = words.filter((word) => /[A-Za-z]{3,}/.test(word));
+  const hasMapCue = /\b(map|guide|city|county|state|bay|lake|park|river|island|sound|canal|harbor|rail|ferry|boulevard|avenue|street|road|company|co\.)\b/i.test(content);
+  const mostlyNumeric = /^[\d\s.,:/-]+$/.test(content);
+  let score = Number.isFinite(confidence) ? confidence : 0.5;
+  score += Math.min(0.35, usefulWords.length * 0.045);
+  score += Math.min(0.2, content.length / 180);
+  if (role === "title") score += 0.5;
+  if (role === "label" || role === "place") score += 0.18;
+  if (hasMapCue) score += 0.18;
+  if (mostlyNumeric) score -= 0.45;
+  if (content.length <= 2) score -= 0.3;
+  return score;
+}
+
+function compactExtractionForMetadataWriter(extraction) {
+  const text = Array.isArray(extraction?.text) ? extraction.text : [];
+  const textGroups = Array.isArray(extraction?.text_groups) ? extraction.text_groups : [];
+  const placenames = Array.isArray(extraction?.placenames) ? extraction.placenames : [];
+  const seenText = new Set();
+  const compactText = text
+    .map((item) => ({ item, score: textEvidenceScore(item) }))
+    .filter(({ score }) => score >= 0)
+    .sort((a, b) => b.score - a.score)
+    .map(({ item }) => compactOcrEvidenceItem(item))
+    .filter(Boolean)
+    .filter((item) => {
+      const key = item.content.toLowerCase();
+      if (seenText.has(key)) return false;
+      seenText.add(key);
+      return true;
+    })
+    .slice(0, METADATA_WRITER_TEXT_LIMIT);
+
+  return withoutUndefined({
+    description: extraction?.description,
+    map_title: extraction?.map_title,
+    map_bbox_estimate: extraction?.map_bbox_estimate,
+    placenames: placenames
+      .map((item) => compactOcrEvidenceItem(item, ["source_text_index"]))
+      .filter(Boolean)
+      .slice(0, METADATA_WRITER_PLACENAME_LIMIT),
+    text_groups: textGroups
+      .map((item) => compactOcrEvidenceItem(item))
+      .filter(Boolean)
+      .slice(0, METADATA_WRITER_TEXT_GROUP_LIMIT),
+    text: compactText,
+    debug: {
+      ocr_strategy: extraction?.debug?.ocr_strategy,
+      text_grouping_strategy: extraction?.debug?.text_grouping_strategy,
+      placename_extraction_strategy: extraction?.debug?.placename_extraction_strategy,
+      ocr_source_strategy: extraction?.debug?.ocr_source_strategy,
+      compacted_for_metadata_writer: true,
+      original_text_count: text.length,
+      original_text_group_count: textGroups.length,
+      original_placename_count: placenames.length,
+      included_text_count: compactText.length,
+      included_text_group_count: Math.min(textGroups.length, METADATA_WRITER_TEXT_GROUP_LIMIT),
+      included_placename_count: Math.min(placenames.length, METADATA_WRITER_PLACENAME_LIMIT),
+    },
+  });
+}
+
 const OGM_AARDVARK_CONTROLLED_VALUE_GUIDANCE = [
   "OGM Aardvark controlled value guidance:",
   "- dct_format_s: use an OGM format label, not a MIME type. Common scanned image mappings: image/jpeg or .jpg -> JPEG; image/tiff or .tif -> TIFF; image/jp2 or .j2k -> JPEG2000; image/png -> PNG; application/pdf -> PDF. Use GeoTIFF only when the file is a georeferenced TIFF.",
@@ -4291,6 +5141,7 @@ const OGM_AARDVARK_CONTROLLED_VALUE_GUIDANCE = [
 ].join("\n");
 
 function aardvarkWriterMessages({ extraction, baseResource, batchDefaults, artifacts, fileName, checksum, resourceId, metadataDocuments, metadataSourceUrls }) {
+  const promptExtraction = compactExtractionForMetadataWriter(extraction);
   const metadataContext = metadataDocuments.length > 0
     ? metadataDocuments.map((document) => `--- ${document.name} (${document.type || "text/plain"}) ---\n${document.text}`).join("\n\n")
     : "No companion metadata document was supplied.";
@@ -4327,8 +5178,8 @@ function aardvarkWriterMessages({ extraction, baseResource, batchDefaults, artif
       "Base Aardvark record to improve:",
       safeJsonStringify(baseResource, 2),
       "",
-      "Historical map extraction response:",
-      safeJsonStringify(extraction, 2),
+      "Historical map extraction evidence (compacted for metadata writing; full OCR remains in enrichment_response.json and ai-enrichments.json):",
+      safeJsonStringify(promptExtraction, 2),
       "",
       "Optional companion metadata documents (TXT, FGDC XML, ISO XML, or similar):",
       metadataContext,
@@ -4994,11 +5845,12 @@ async function processUploadedImage(config, body) {
   let derivativeSummaries = [];
   if (visionProfile) {
     log("Google Cloud Vision OCR image normalization started", { profile: visionProfile.name || visionProfile.id });
-    const visionImage = await createVisionImageBuffer(buffer, contentType);
-    log("Google Cloud Vision OCR request started", { featureType: visionProfile.featureType || "DOCUMENT_TEXT_DETECTION", width: visionImage.width, height: visionImage.height, originalBytes: visionImage.originalBytes, normalizedBytes: visionImage.normalizedBytes, quality: visionImage.quality ?? null, maxDimension: visionImage.maxDimension ?? null });
-    extractionPromise = callGoogleVisionOcr(visionProfile, visionImage)
+    const visionSources = await createVisionOcrSources(buffer, contentType);
+    const visionImage = visionSources.primary;
+    log("Google Cloud Vision OCR request started", { featureType: visionProfile.featureType || "DOCUMENT_TEXT_DETECTION", width: visionImage.width, height: visionImage.height, originalBytes: visionImage.originalBytes, normalizedBytes: visionImage.normalizedBytes, quality: visionImage.quality ?? null, maxDimension: visionImage.maxDimension ?? null, sourceCount: visionSources.sources.length, tileCount: visionSources.summary.tileCount });
+    extractionPromise = callGoogleVisionOcr(visionProfile, visionSources)
       .then((result) => {
-        log("Google Cloud Vision OCR response received", { textSegments: result.parsedResponse?.text?.length || 0, textGroups: result.parsedResponse?.text_groups?.length || 0, confidence: result.confidence ?? null });
+        log("Google Cloud Vision OCR response received", { textSegments: result.parsedResponse?.text?.length || 0, textGroups: result.parsedResponse?.text_groups?.length || 0, placenames: result.parsedResponse?.placenames?.length || 0, sources: result.usage?.sourceCount || 0, tiles: result.usage?.tileCount || 0, confidence: result.confidence ?? null });
         return result;
       });
   } else {
@@ -5258,6 +6110,179 @@ async function regenerateAardvarkForS3Resource(config, body) {
   };
 }
 
+async function refreshOcrForS3ImageResource(config, body) {
+  const jobId = body.jobId || crypto.randomUUID();
+  const requested = body.resource || {};
+  const storageProfile = findProfile(config, "storage", body.storageProfileId);
+  const modelProfile = body.modelProfileId ? findProfile(config, "model", body.modelProfileId) : null;
+  const visionProfile = findProfile(config, "vision", body.visionProfileId);
+  const root = String(requested.root || (requested.resourceId ? `${uploadBasePrefix(storageProfile)}/${requested.resourceId}` : "")).replace(/\/+$/g, "");
+  if (!root) throw new Error("OCR refresh request is missing the S3 resource root.");
+  if (!modelProfile && body.skipMetadataWriter !== true) throw new Error("OCR refresh requires a model profile unless skipMetadataWriter is true.");
+
+  const fileName = sanitizeFileName(requested.fileName || requested.originalKey?.split("/").pop() || requested.resourceId || root.split("/").pop() || "resource");
+  const { milestones, log } = createUploadLogger(jobId, fileName);
+  log("S3 OCR refresh request received", { root });
+
+  const keys = {
+    ...uploadKeysFromRoot(root, fileName, requested.originalKey || requested.keys?.original || ""),
+    ...(requested.keys || {}),
+  };
+  keys.root = root;
+  keys.metadataSources = keys.metadataSources || `${root}/metadata_sources`;
+
+  log("Fetching existing Aardvark JSON and original image", { aardvark: keys.aardvark, original: keys.original });
+  const [existingAardvark, buffer] = await Promise.all([
+    fetchJsonObject(storageProfile, keys.aardvark),
+    fetchObjectBuffer(storageProfile, keys.original),
+  ]);
+  const resourceId = String(existingAardvark.id || requested.resourceId || root.split("/").pop() || crypto.randomUUID());
+  const checksum = sha256(buffer);
+  const contentType = body.contentType || contentTypeForKey(keys.original || fileName);
+  const artifacts = artifactUrlsForResource(storageProfile, keys, existingAardvark);
+  const baseResource = ensureReferenceJson(existingAardvark, artifacts);
+
+  log("Google Cloud Vision OCR image normalization started", { profile: visionProfile.name || visionProfile.id });
+  const visionSources = await createVisionOcrSources(buffer, contentType);
+  const visionImage = visionSources.primary;
+  log("Google Cloud Vision OCR request started", {
+    featureType: visionProfile.featureType || "DOCUMENT_TEXT_DETECTION",
+    width: visionImage.width,
+    height: visionImage.height,
+    originalBytes: visionImage.originalBytes,
+    normalizedBytes: visionImage.normalizedBytes,
+    quality: visionImage.quality ?? null,
+    maxDimension: visionImage.maxDimension ?? null,
+    sourceCount: visionSources.sources.length,
+    tileCount: visionSources.summary.tileCount,
+  });
+  const extractionResult = await callGoogleVisionOcr(visionProfile, visionSources);
+  log("Google Cloud Vision OCR response received", {
+    textSegments: extractionResult.parsedResponse?.text?.length || 0,
+    textGroups: extractionResult.parsedResponse?.text_groups?.length || 0,
+    placenames: extractionResult.parsedResponse?.placenames?.length || 0,
+    sources: extractionResult.usage?.sourceCount || 0,
+    tiles: extractionResult.usage?.tileCount || 0,
+    confidence: extractionResult.confidence ?? null,
+  });
+
+  const storedMetadataDocuments = await readMetadataDocumentsFromS3(storageProfile, keys, log);
+  const suppliedMetadataDocuments = normalizeMetadataDocuments(body.metadataDocuments);
+  const metadataDocuments = normalizeMetadataDocuments([...storedMetadataDocuments, ...suppliedMetadataDocuments]);
+  const metadataSourceUrls = uniqueStrings([
+    ...storedMetadataDocuments.map((document) => document.url),
+    ...(Array.isArray(requested.metadataSourceUrls) ? requested.metadataSourceUrls : []),
+  ]);
+
+  log("Uploading refreshed enrichment response JSON", { key: keys.extraction });
+  await putObjectBuffer(storageProfile, keys.extraction, Buffer.from(safeJsonStringify(extractionResult.parsedResponse, 2), "utf8"), "application/json");
+
+  let aardvarkWriter = null;
+  let resource = baseResource;
+  let metadataWriterError = "";
+  if (body.skipMetadataWriter === true) {
+    log("Aardvark metadata writer skipped by request");
+  } else {
+    try {
+      log("Aardvark metadata writer started", { metadataDocuments: metadataDocuments.length });
+      aardvarkWriter = await callAardvarkMetadataWriter(modelProfile, body, {
+        resourceId,
+        checksum,
+        fileName,
+        extraction: extractionResult.parsedResponse,
+        baseResource,
+        batchDefaults: body.batchDefaults || {},
+        artifacts,
+        metadataDocuments,
+        metadataSourceUrls,
+      });
+      resource = normalizeAardvarkResource(aardvarkWriter.resource, baseResource, {
+        resourceId,
+        checksum,
+        fileName,
+        extraction: extractionResult.parsedResponse,
+        artifacts,
+        metadataSourceUrls,
+      });
+      log("Aardvark metadata writer complete", { title: resource.dct_title_s });
+    } catch (error) {
+      metadataWriterError = error.message || String(error);
+      log("Aardvark metadata writer failed; preserving existing Aardvark record", { error: metadataWriterError });
+      if (body.preserveAardvarkOnWriterFailure === false) {
+        resource = normalizeAardvarkResource({}, baseResource, {
+          resourceId,
+          checksum,
+          fileName,
+          extraction: extractionResult.parsedResponse,
+          artifacts,
+          metadataSourceUrls,
+        });
+      }
+    }
+  }
+
+  const archivalSupplement = buildImageArchivalSupplement({
+    resourceId,
+    checksum,
+    fileName,
+    fileSize: buffer.length,
+    contentType,
+    modifiedAt: requested.updatedAt || requested.lastModified || "",
+    extraction: extractionResult.parsedResponse,
+    artifacts,
+    metadataDocuments,
+  });
+  log("Uploading refreshed archival accession supplement", { key: keys.archivalSupplement });
+  await writeArchivalSupplementArtifacts(storageProfile, keys, archivalSupplement);
+
+  const aiEnrichments = buildAiEnrichmentsForImage({
+    resourceId,
+    fileName,
+    checksum,
+    fileSize: buffer.length,
+    contentType,
+    modifiedAt: requested.updatedAt || requested.lastModified || "",
+    artifacts,
+    extractionResult,
+    metadataWriter: aardvarkWriter,
+    resource,
+    archivalSupplement,
+    metadataSourceUrls,
+    derivativeSummaries: [],
+  });
+  if (metadataWriterError) {
+    aiEnrichments.debug = {
+      ...(aiEnrichments.debug || {}),
+      metadataWriterError,
+    };
+  }
+  log("Uploading refreshed AI Enrichments JSON", { key: keys.aiEnrichments, prompts: aiEnrichments.prompts.length, apiCalls: aiEnrichments.apiCalls.length });
+  await putObjectBuffer(storageProfile, keys.aiEnrichments, Buffer.from(safeJsonStringify(aiEnrichments, 2), "utf8"), "application/json");
+
+  log("Uploading refreshed Aardvark JSON", { key: keys.aardvark });
+  await putObjectBuffer(storageProfile, keys.aardvark, Buffer.from(safeJsonStringify(resource, 2), "utf8"), "application/json");
+  log("S3 OCR refresh complete", { resourceId });
+
+  return {
+    resourceId,
+    fileName,
+    root,
+    checksum,
+    artifacts,
+    aiEnrichmentsUrl: artifacts.aiEnrichmentsUrl,
+    extraction: extractionResult.parsedResponse,
+    rawResponse: extractionResult.rawResponse,
+    usage: extractionResult.usage,
+    confidence: extractionResult.confidence,
+    aardvarkJson: resource,
+    distributions: distributionsFromResource(resource),
+    aardvarkEvidence: aardvarkWriter?.evidence || [],
+    archivalSupplement,
+    metadataWriterError: metadataWriterError || undefined,
+    proxyMilestones: milestones,
+  };
+}
+
 async function fetchAardvarkForS3Resource(config, body) {
   const requested = body.resource || {};
   const root = String(requested.root || "").replace(/\/+$/g, "");
@@ -5471,6 +6496,11 @@ async function route(req, res) {
     const result = await regenerateAardvarkForS3Resource(config, body);
     return send(res, 200, result);
   }
+  if (req.method === "POST" && url.pathname === "/api/uploads/refresh-s3-ocr") {
+    const body = await readJson(req);
+    const result = await refreshOcrForS3ImageResource(config, body);
+    return send(res, 200, result);
+  }
   if (req.method === "POST" && url.pathname === "/api/uploads/aardvark-json") {
     const body = await readJson(req);
     const result = await fetchAardvarkForS3Resource(config, body);
@@ -5490,8 +6520,8 @@ async function route(req, res) {
         throw new Error(`Source image fetch failed for ${objectKey}: ${error.message || String(error)}`);
       }
       try {
-        const source = await createVisionImageBuffer(buffer, body.asset?.content_type || contentTypeForKey(objectKey));
-        const vision = await callGoogleVisionOcr(visionProfile, source);
+        const sources = await createVisionOcrSources(buffer, body.asset?.content_type || contentTypeForKey(objectKey));
+        const vision = await callGoogleVisionOcr(visionProfile, sources);
         return send(res, 200, { ...vision, derivatives: [] });
       } catch (error) {
         throw new Error(`Google Cloud Vision extraction failed for ${objectKey}: ${error.message || String(error)}`);
