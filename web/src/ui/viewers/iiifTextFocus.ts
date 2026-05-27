@@ -1,7 +1,7 @@
 import type { TextExtractionAnnotation } from "./textExtractionOverlay";
 
 export interface IiifTextFocusInput {
-    bbox: TextExtractionAnnotation["bbox"];
+    bbox: NonNullable<TextExtractionAnnotation["bbox"]>;
     imageWidth: number;
     imageHeight: number;
     viewportWidth: number;

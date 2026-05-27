@@ -578,6 +578,11 @@
         "authority": { "type": "string" },
         "authorityId": { "type": "string" },
         "uri": { "$ref": "#/$defs/uriString" },
+        "gazetteerMatches": {
+          "type": "array",
+          "description": "Provider-specific gazetteer hits for this placename. Multiple entries can coexist without declaring one gazetteer primary.",
+          "items": { "$ref": "#/$defs/gazetteerMatch" }
+        },
         "coordinates": {
           "type": "object",
           "additionalProperties": false,
@@ -615,6 +620,74 @@
         "sourceCallId": { "type": "string" },
         "reasoning": { "type": "string" },
         "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "gazetteerMatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "authorityId"],
+      "properties": {
+        "provider": {
+          "type": "string",
+          "enum": ["whosonfirst", "openstreetmap", "geonames"]
+        },
+        "authority": { "type": "string" },
+        "authorityId": { "type": "string" },
+        "uri": { "$ref": "#/$defs/uriString" },
+        "name": { "type": "string" },
+        "matchedName": { "type": "string" },
+        "nameSource": { "type": "string" },
+        "status": { "type": "string" },
+        "matchType": { "type": "string" },
+        "confidence": { "$ref": "#/$defs/confidence" },
+        "placetype": { "type": "string" },
+        "category": { "type": "string" },
+        "type": { "type": "string" },
+        "displayName": { "type": "string" },
+        "featureClass": { "type": "string" },
+        "featureClassName": { "type": "string" },
+        "featureCode": { "type": "string" },
+        "country": { "type": "string" },
+        "region": { "type": "string" },
+        "population": { "type": "number" },
+        "timezone": { "type": "string" },
+        "bbox": {
+          "type": "array",
+          "items": { "type": "number" },
+          "minItems": 4,
+          "maxItems": 4
+        },
+        "coordinates": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["lon", "lat"],
+          "properties": {
+            "lon": {
+              "type": "number",
+              "minimum": -180,
+              "maximum": 180
+            },
+            "lat": {
+              "type": "number",
+              "minimum": -90,
+              "maximum": 90
+            }
+          }
+        },
+        "candidates": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/jsonValue" }
+        },
+        "hierarchy": { "$ref": "#/$defs/jsonValue" },
+        "concordances": { "$ref": "#/$defs/jsonValue" },
+        "tags": { "$ref": "#/$defs/jsonValue" },
+        "wikidata": { "type": "string" },
+        "gnisFeatureId": { "type": "string" },
+        "isCurrent": { "type": "boolean" },
+        "supersededBy": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
       }
     },
     "geoBbox": {

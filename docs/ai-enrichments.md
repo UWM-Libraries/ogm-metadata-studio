@@ -51,6 +51,7 @@ The current enrichment workbench already produces most of the required content:
 | `enrichment_response.json/text[]` | `extractedMapText[]` |
 | `enrichment_response.json/text_groups[]` | `textGroups[]` |
 | `enrichment_response.json/placenames[]` | `derivedPlacenames[]` |
+| Local WOF/OSM/GeoNames concordance indexes | `derivedPlacenames[].gazetteerMatches[]`, legacy `authority` / `authorityId` fields, `coordinates`, `geocoding`, and `extensions.wofConcordance` / `extensions.osmConcordance` / `extensions.geonamesConcordance` |
 | `enrichment_response.json/map_bbox_estimate` | `mapExtent` |
 | `enrichment_response.json/description` | `description` |
 | `enrichment_response.json/debug` | `debug` |
@@ -61,6 +62,16 @@ The current enrichment workbench already produces most of the required content:
 | IIIF, thumbnail, COG, archival supplement, metadata sources | `sourceAssets[]` and `artifacts` |
 
 The normalized text bounding box is `[x1, y1, x2, y2]` in image coordinates from `0` to `1`, measured from the upper-left corner. This matches the current `approx_bbox` convention used by the map text overlay; when converting to the companion standard, map `approx_bbox` to `approxBbox` and `source_text_index` / `source_text_indices` to `sourceTextIndices`.
+
+When `web/.cache/gazetteers/wof/index.ndjson` exists, the enrichment proxy runs a local Who's On First concordance pass before writing this companion document. The pass uses fuzzy lexical retrieval plus context, placetype, OCR-confidence, and optional map-extent scoring. Primary administrative matches can provide a WOF bbox boundary, such as the locality bbox for Seattle, so supplemental matching can scan in-bound WOF records against OCR tokens and cleaned phrase evidence. Confirmed matches get `authority: "whosonfirst"` and a Spelunker URI; ambiguous and unmatched labels keep reviewable candidate data without pretending to be authoritative. Top-level `extensions.wofConcordance` summarizes index availability, record count, chosen boundary, and matched / ambiguous / unmatched counts for downstream review filters.
+
+When `web/.cache/gazetteers/osm/index.ndjson` exists, the proxy then runs a local OpenStreetMap pass against WOF-selected placenames, unclaimed placenames, and high-confidence OCR labels. WOF and OSM hits are represented as peer entries in `derivedPlacenames[].gazetteerMatches[]`; legacy single-authority fields are kept only for compatibility with older consumers. OSM-only supplemental matches use a provider entry with an authority id such as `node/13436471476`, an OSM URI, and OSM tags such as `natural=cape`, GNIS ids, or Wikidata ids when present.
+
+When `web/.cache/gazetteers/geonames/index.ndjson` exists, the proxy also runs GeoNames after WOF and OSM. GeoNames records can be attached directly from WOF `gn:id` concordances, by contextual name matching, or as GeoNames-only supplemental placenames. GeoNames matches use provider `geonames`, authority ids such as `5809844`, GeoNames URIs, coordinates, feature class/code, population, and reviewable candidates.
+
+The proxy also writes `extensions.gazetteerEvidenceGraph`, a compact graph of the text evidence nodes, derived placename nodes, gazetteer match nodes, and edges connecting OCR evidence to placenames and placenames to WOF/OSM/GeoNames matches. This is the review/debug surface for questions like "which OCR boxes produced this authority match?" and "which WOF match also has OSM or GeoNames overlap?"
+
+For existing processed S3 uploads, the `Persist Gazetteer Matches` workbench action recomputes these layers and overwrites the persisted `ai-enrichments.json`. It is safe to rerun after index or matcher changes because generated supplemental WOF/OSM/GeoNames placenames are rebuilt from the current OCR evidence instead of appended repeatedly.
 
 ## Indexing Guidance
 

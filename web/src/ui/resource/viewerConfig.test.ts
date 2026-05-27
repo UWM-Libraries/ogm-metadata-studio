@@ -72,7 +72,8 @@ describe('viewerConfig', () => {
             expect(detectViewerConfig(resource)).toEqual({
                 protocol: "iiif_image",
                 endpoint: "http://example.com/uploads/abc/iiif/info.json",
-                textExtractionEndpoint: "http://example.com/uploads/abc/enrichment_response.json",
+                textExtractionEndpoint: "http://example.com/uploads/abc/ai-enrichments.json",
+                textExtractionFallbackEndpoint: "http://example.com/uploads/abc/enrichment_response.json",
             });
         });
 
@@ -88,6 +89,23 @@ describe('viewerConfig', () => {
                 protocol: "iiif_image",
                 endpoint: "http://example.com/iiif/info.json",
                 textExtractionEndpoint: "http://example.com/extraction.json",
+            });
+        });
+
+        it('prefers AI Enrichments JSON for IIIF text overlays when available', () => {
+            const resource = {
+                ...baseResource,
+                dct_references_s: JSON.stringify({
+                    "http://iiif.io/api/image": "http://example.com/iiif",
+                    "https://opengeometadata.org/reference/enrichment-response": "http://example.com/extraction.json",
+                    "https://opengeometadata.org/reference/ai-enrichments": { url: "http://example.com/ai-enrichments.json" },
+                })
+            };
+            expect(detectViewerConfig(resource)).toEqual({
+                protocol: "iiif_image",
+                endpoint: "http://example.com/iiif/info.json",
+                textExtractionEndpoint: "http://example.com/ai-enrichments.json",
+                textExtractionFallbackEndpoint: "http://example.com/extraction.json",
             });
         });
 

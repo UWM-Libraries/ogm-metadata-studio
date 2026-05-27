@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Distribution, Resource } from '../aardvark/model';
 import { detectViewerConfig, ViewerConfig } from './resource/viewerConfig';
 import { MapLibreResourceViewer } from './viewers/MapLibreResourceViewer';
@@ -7,6 +7,19 @@ import { IiifImageViewer } from './viewers/IiifImageViewer';
 import { AttributePreviewTable } from './viewers/AttributePreviewTable';
 import type { SelectableGeoJsonFeature } from './viewers/geospatialFeature';
 import { normalizeTextExtractionAnnotations, type TextExtractionAnnotation } from './viewers/textExtractionOverlay';
+
+function localAiEnrichmentsOverrideEndpoint(resourceId: string | undefined): string | undefined {
+    if (!resourceId || typeof window === "undefined") return undefined;
+    if ((import.meta as { env?: { MODE?: string } }).env?.MODE === "test") return undefined;
+    if (!["localhost", "127.0.0.1", "::1"].includes(window.location.hostname)) return undefined;
+    const basePath = (import.meta as { env?: { BASE_URL?: string } }).env?.BASE_URL || "/";
+    const base = basePath.endsWith("/") ? basePath : `${basePath}/`;
+    const endpoint = new URL(`${base}dev-artifacts/${encodeURIComponent(resourceId)}/ai-enrichments.json`, window.location.origin);
+    endpoint.searchParams.set("localAi", "1");
+    const viewerCacheKey = window.location.search.replace(/^\?/, "");
+    if (viewerCacheKey) endpoint.searchParams.set("viewerCacheKey", viewerCacheKey);
+    return endpoint.toString();
+}
 
 interface ResourceViewerProps {
     resource: Resource;
@@ -23,19 +36,36 @@ export const ResourceViewer: React.FC<ResourceViewerProps> = ({ resource, distri
             return null;
         }
     }, [distributions, resource]);
-    const extractionEndpoint = config?.protocol === "iiif_image" ? config.textExtractionEndpoint : undefined;
-    const [selectedFeature, setSelectedFeature] = useState<SelectableGeoJsonFeature | null>(null);
+    const configuredExtractionEndpoint = config?.protocol === "iiif_image" ? config.textExtractionEndpoint : undefined;
+    const extractionFallbackEndpoint = config?.protocol === "iiif_image" ? config.textExtractionFallbackEndpoint : undefined;
+    const localExtractionOverrideEndpoint = configuredExtractionEndpoint || extractionFallbackEndpoint
+        ? localAiEnrichmentsOverrideEndpoint(resource.id)
+        : undefined;
+    const extractionEndpoints = useMemo(() => (
+        [localExtractionOverrideEndpoint, configuredExtractionEndpoint, extractionFallbackEndpoint]
+            .filter((endpoint): endpoint is string => Boolean(endpoint))
+            .filter((endpoint, index, endpoints) => endpoints.indexOf(endpoint) === index)
+    ), [configuredExtractionEndpoint, extractionFallbackEndpoint, localExtractionOverrideEndpoint]);
+    const extractionEndpointSignature = extractionEndpoints.length > 0
+        ? extractionEndpoints.join("\n")
+        : undefined;
+    const selectedFeatureKey = `${config?.endpoint || ""}\n${config?.attributeTableEndpoint || ""}`;
+    const [selectedFeatureState, setSelectedFeatureState] = useState<{ key: string; feature: SelectableGeoJsonFeature } | null>(null);
+    const selectedFeature = selectedFeatureState?.key === selectedFeatureKey ? selectedFeatureState.feature : null;
+    const setSelectedFeatureForCurrentViewer = useCallback((feature: SelectableGeoJsonFeature) => {
+        setSelectedFeatureState({ key: selectedFeatureKey, feature });
+    }, [selectedFeatureKey]);
     const [loadedTextAnnotations, setLoadedTextAnnotations] = useState<{
         endpoint: string;
         annotations: TextExtractionAnnotation[];
         error?: string;
     } | null>(null);
-    const textAnnotations = loadedTextAnnotations && loadedTextAnnotations.endpoint === extractionEndpoint
+    const textAnnotations = loadedTextAnnotations && loadedTextAnnotations.endpoint === extractionEndpointSignature
         ? loadedTextAnnotations.annotations
         : [];
-    const textExtractionStatus = !extractionEndpoint
+    const textExtractionStatus = extractionEndpoints.length === 0
         ? "none"
-        : !loadedTextAnnotations || loadedTextAnnotations.endpoint !== extractionEndpoint
+        : !loadedTextAnnotations || loadedTextAnnotations.endpoint !== extractionEndpointSignature
             ? "loading"
             : loadedTextAnnotations.error
                 ? "error"
@@ -51,28 +81,41 @@ export const ResourceViewer: React.FC<ResourceViewerProps> = ({ resource, distri
                 : "";
 
     useEffect(() => {
-        if (!extractionEndpoint) return undefined;
+        if (extractionEndpoints.length === 0) return undefined;
 
         const controller = new AbortController();
         let isCurrent = true;
-        fetch(extractionEndpoint, { signal: controller.signal })
-            .then((response) => {
-                if (!response.ok) throw new Error(`Extraction JSON returned ${response.status}`);
-                return response.json();
-            })
-            .then((json) => {
-                if (isCurrent) {
-                    setLoadedTextAnnotations({
-                        endpoint: extractionEndpoint,
-                        annotations: normalizeTextExtractionAnnotations(json),
-                    });
+
+        const fetchAnnotations = async (endpoint: string): Promise<TextExtractionAnnotation[]> => {
+            const response = await fetch(endpoint, { signal: controller.signal });
+            if (!response.ok) throw new Error(`Extraction JSON returned ${response.status}`);
+            return normalizeTextExtractionAnnotations(await response.json());
+        };
+
+        const load = async () => {
+            let firstError: unknown = null;
+            for (const endpoint of extractionEndpoints) {
+                try {
+                    const annotations = await fetchAnnotations(endpoint);
+                    if (isCurrent) {
+                        setLoadedTextAnnotations({
+                            endpoint: extractionEndpointSignature || endpoint,
+                            annotations,
+                        });
+                    }
+                    return;
+                } catch (error: unknown) {
+                    firstError ||= error;
                 }
-            })
-            .catch((error: unknown) => {
+            }
+            throw firstError;
+        };
+
+        load().catch((error: unknown) => {
                 const name = error instanceof Error ? error.name : "";
                 if (isCurrent && name !== "AbortError") {
                     setLoadedTextAnnotations({
-                        endpoint: extractionEndpoint,
+                        endpoint: extractionEndpointSignature || extractionEndpoints[0] || "",
                         annotations: [],
                         error: error instanceof Error ? error.message : "Could not load the extraction response.",
                     });
@@ -83,11 +126,7 @@ export const ResourceViewer: React.FC<ResourceViewerProps> = ({ resource, distri
             isCurrent = false;
             controller.abort();
         };
-    }, [extractionEndpoint]);
-
-    useEffect(() => {
-        setSelectedFeature(null);
-    }, [config?.endpoint, config?.attributeTableEndpoint]);
+    }, [extractionEndpointSignature, extractionEndpoints]);
 
     if (!config) return null;
 
@@ -154,7 +193,7 @@ export const ResourceViewer: React.FC<ResourceViewerProps> = ({ resource, distri
                     <AttributePreviewTable
                         url={attributeTableEndpoint}
                         selectedFeatureId={selectedFeature?.id}
-                        onSelectFeature={setSelectedFeature}
+                        onSelectFeature={setSelectedFeatureForCurrentViewer}
                     />
                 )}
             </>

@@ -8,6 +8,9 @@ import { tmpdir } from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { pipeline } from "node:stream/promises";
+import { buildWofConcordanceLayer } from "./wof-concordance.mjs";
+import { buildOsmConcordanceLayer } from "./osm-concordance.mjs";
+import { refreshWofConcordanceInAiEnrichments } from "./ai-enrichments-wof-refresh.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const execFileAsync = promisify(execFile);
@@ -3433,7 +3436,26 @@ function buildAiEnrichmentsForImage(args) {
     completedAt: createdAt,
     variables: { resourceId, fileName, checksum, artifactUrls: artifacts },
   } : null;
-  const placenames = derivedPlacenamesForAiEnrichments(extraction, resource, textSegments, extractionCallId, "call-openai-aardvark-metadata-writer");
+  const mapExtent = mapExtentForAiEnrichments(extraction, extractionCallId);
+  const basePlacenames = derivedPlacenamesForAiEnrichments(extraction, resource, textSegments, extractionCallId, "call-openai-aardvark-metadata-writer");
+  const wofConcordance = buildWofConcordanceLayer({
+    placenames: basePlacenames,
+    textGroups,
+    textSegments,
+    extraction,
+    resource,
+    mapExtent,
+  });
+  const osmConcordance = buildOsmConcordanceLayer({
+    placenames: wofConcordance.placenames,
+    textGroups,
+    textSegments,
+    extraction,
+    resource,
+    mapExtent,
+    boundary: wofConcordance.extension?.boundary,
+  });
+  const placenames = osmConcordance.placenames;
   const apiCalls = [
     extractionResult?.provider === "google_cloud_vision" ? ocrApiCallRecord({ result: extractionResult, completedAt: createdAt }) : null,
     extractionOpenAiCall ? openAiApiCallRecord({
@@ -3528,7 +3550,7 @@ function buildAiEnrichmentsForImage(args) {
     extractedMapText: textSegments,
     textGroups,
     derivedPlacenames: placenames,
-    mapExtent: mapExtentForAiEnrichments(extraction, extractionCallId),
+    mapExtent,
     description: extraction?.description || asStringArray(resource?.dct_description_sm)[0] || "",
     debug: {
       ...(extraction?.debug || {}),
@@ -3571,6 +3593,10 @@ function buildAiEnrichmentsForImage(args) {
       status: "machine_generated",
       notes: "Review derived metadata, placenames, and OCR before treating candidate values as authoritative.",
     },
+    extensions: optionalExtensions({
+      wofConcordance: wofConcordance.extension,
+      osmConcordance: osmConcordance.extension,
+    }),
   });
 }
 
@@ -6283,6 +6309,115 @@ async function refreshOcrForS3ImageResource(config, body) {
   };
 }
 
+function extractionProviderFromLegacyResponse(extraction) {
+  return String(extraction?.debug?.ocr_strategy || "").startsWith("google_cloud_vision")
+    ? "google_cloud_vision"
+    : "openai";
+}
+
+async function refreshWofConcordanceForS3Resource(config, body) {
+  const jobId = body.jobId || crypto.randomUUID();
+  const requested = body.resource || {};
+  const root = String(requested.root || "").replace(/\/+$/g, "");
+  if (!root) throw new Error("WOF concordance refresh request is missing the S3 resource root.");
+
+  const storageProfile = findProfile(config, "storage", body.storageProfileId);
+  const fileName = sanitizeFileName(requested.fileName || requested.resourceId || root.split("/").pop() || "resource");
+  const { milestones, log } = createUploadLogger(jobId, fileName);
+  log("WOF concordance refresh request received", { root });
+
+  const keys = {
+    ...uploadKeysFromRoot(root, fileName, requested.originalKey || requested.keys?.original || ""),
+    ...(requested.keys || {}),
+  };
+  keys.root = root;
+  keys.metadataSources = keys.metadataSources || `${root}/metadata_sources`;
+
+  log("Fetching existing Aardvark JSON", { aardvark: keys.aardvark });
+  const existingAardvark = await fetchJsonObject(storageProfile, keys.aardvark);
+  const resourceId = String(existingAardvark.id || requested.resourceId || root.split("/").pop() || crypto.randomUUID());
+  const artifacts = artifactUrlsForResource(storageProfile, keys, existingAardvark);
+  const resource = ensureReferenceJson({ ...existingAardvark, id: resourceId }, artifacts);
+
+  let aiEnrichments;
+  let extraction = {};
+  let createdAiEnrichments = false;
+  if (await objectExists(storageProfile, keys.aiEnrichments).catch(() => false)) {
+    log("Fetching existing AI Enrichments JSON", { aiEnrichments: keys.aiEnrichments });
+    aiEnrichments = await fetchJsonObject(storageProfile, keys.aiEnrichments);
+  } else {
+    createdAiEnrichments = true;
+    log("AI Enrichments JSON missing; rebuilding from legacy extraction response", { extraction: keys.extraction });
+    extraction = await fetchJsonObject(storageProfile, keys.extraction);
+    const extractionProvider = extractionProviderFromLegacyResponse(extraction);
+    const archivalSupplement = await objectExists(storageProfile, keys.archivalSupplementJson).catch(() => false)
+      ? await fetchJsonObject(storageProfile, keys.archivalSupplementJson)
+      : null;
+    aiEnrichments = buildAiEnrichmentsForImage({
+      resourceId,
+      fileName,
+      checksum: checksumFromResource(resource),
+      fileSize: Number(resource.gbl_fileSize_s || requested.sizeBytes || 0),
+      contentType: contentTypeForKey(fileName),
+      modifiedAt: requested.updatedAt || requested.lastModified || "",
+      artifacts,
+      extractionResult: {
+        provider: extractionProvider,
+        parsedResponse: extraction,
+        rawResponse: null,
+        usage: extractionProvider === "google_cloud_vision"
+          ? { provider: "google_cloud_vision", rawResponseNotAvailable: true }
+          : { provider: "openai", rawResponseNotAvailable: true },
+      },
+      metadataWriter: null,
+      resource,
+      archivalSupplement,
+      metadataSourceUrls: Array.isArray(requested.metadataSourceUrls) ? requested.metadataSourceUrls : [],
+      derivativeSummaries: [],
+    });
+  }
+
+  const distributions = distributionsWithAiEnrichments(resource, artifacts.aiEnrichmentsUrl);
+  const refreshed = refreshWofConcordanceInAiEnrichments(aiEnrichments, {
+    resource,
+    distributions,
+    extraction,
+  });
+  log("Uploading persisted WOF concordance AI Enrichments JSON", {
+    key: keys.aiEnrichments,
+    matched: refreshed.wofConcordance?.matched || 0,
+    supplemental: refreshed.wofConcordance?.supplementalPlacenames || 0,
+    osmMatched: refreshed.osmConcordance?.matched || 0,
+    osmSupplemental: refreshed.osmConcordance?.supplementalPlacenames || 0,
+    geonamesMatched: refreshed.geonamesConcordance?.matched || 0,
+    geonamesOverlap: refreshed.geonamesConcordance?.overlapPlacenames || 0,
+    removedSupplemental: refreshed.removedSupplementalPlacenameCount,
+  });
+  await putObjectBuffer(storageProfile, keys.aiEnrichments, Buffer.from(safeJsonStringify(refreshed.aiEnrichments, 2), "utf8"), "application/json");
+
+  if (resource.dct_references_s !== existingAardvark.dct_references_s) {
+    log("Uploading Aardvark JSON with AI Enrichments reference", { key: keys.aardvark });
+    await putObjectBuffer(storageProfile, keys.aardvark, Buffer.from(safeJsonStringify(resource, 2), "utf8"), "application/json");
+  }
+  log("WOF concordance refresh complete", { resourceId, createdAiEnrichments });
+
+  return {
+    resourceId,
+    fileName,
+    root,
+    artifacts,
+    aiEnrichmentsUrl: artifacts.aiEnrichmentsUrl,
+    createdAiEnrichments,
+    wofConcordance: refreshed.wofConcordance,
+    osmConcordance: refreshed.osmConcordance,
+    geonamesConcordance: refreshed.geonamesConcordance,
+    removedSupplementalPlacenameCount: refreshed.removedSupplementalPlacenameCount,
+    aardvarkJson: resource,
+    distributions: distributionsFromResource(resource),
+    proxyMilestones: milestones,
+  };
+}
+
 async function fetchAardvarkForS3Resource(config, body) {
   const requested = body.resource || {};
   const root = String(requested.root || "").replace(/\/+$/g, "");
@@ -6499,6 +6634,11 @@ async function route(req, res) {
   if (req.method === "POST" && url.pathname === "/api/uploads/refresh-s3-ocr") {
     const body = await readJson(req);
     const result = await refreshOcrForS3ImageResource(config, body);
+    return send(res, 200, result);
+  }
+  if (req.method === "POST" && url.pathname === "/api/uploads/refresh-wof-concordance") {
+    const body = await readJson(req);
+    const result = await refreshWofConcordanceForS3Resource(config, body);
     return send(res, 200, result);
   }
   if (req.method === "POST" && url.pathname === "/api/uploads/aardvark-json") {
