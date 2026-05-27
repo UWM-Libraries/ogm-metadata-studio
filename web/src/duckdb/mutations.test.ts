@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { upsertResource, deleteResource, upsertThumbnail, upsertStaticMap, ensureEmbeddings } from './mutations';
+import { upsertResource, deleteResource, upsertThumbnail, upsertStaticMap, ensureEmbeddings, parseCentroidForH3 } from './mutations';
 import * as dbInit from './dbInit';
 import * as queries from './queries';
 
@@ -44,6 +44,16 @@ describe('DuckDB Mutations', () => {
     beforeEach(() => {
         vi.clearAllMocks();
         vi.mocked(dbInit.getDuckDbContext).mockResolvedValue(mockCtx as any);
+    });
+
+    describe('parseCentroidForH3', () => {
+        it('parses GeoJSON Point centroids as [lat, lng]', () => {
+            expect(parseCentroidForH3('{"type":"Point","coordinates":[-93.361,46.4415]}')).toEqual([46.4415, -93.361]);
+        });
+
+        it('parses legacy comma-separated lat,lng centroids', () => {
+            expect(parseCentroidForH3('46.4415,-93.361')).toEqual([46.4415, -93.361]);
+        });
     });
 
     describe('upsertResource', () => {

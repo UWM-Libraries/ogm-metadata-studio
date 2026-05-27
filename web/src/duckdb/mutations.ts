@@ -11,20 +11,32 @@ import { H3_RES_COLUMNS } from "./schema";
 export function parseCentroidForH3(dcatCentroid: string | null | undefined): [number, number] | null {
     if (!dcatCentroid || String(dcatCentroid).trim() === "") return null;
     const s = String(dcatCentroid).trim();
+    const valid = (lat: number, lng: number) => (
+        Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180
+    );
     try {
         if (s.startsWith("[")) {
             const arr = JSON.parse(s);
             if (Array.isArray(arr) && arr.length >= 2 && typeof arr[0] === "number" && typeof arr[1] === "number") {
-                return [arr[1], arr[0]]; // [lon, lat] -> [lat, lng]
+                if (valid(arr[1], arr[0])) return [arr[1], arr[0]]; // [lon, lat] -> [lat, lng]
+                if (valid(arr[0], arr[1])) return [arr[0], arr[1]]; // tolerate [lat, lng]
             }
         }
         const obj = JSON.parse(s);
         if (obj?.type === "Point" && Array.isArray(obj?.coordinates) && obj.coordinates.length >= 2) {
             const [lon, lat] = obj.coordinates;
-            return [lat, lon];
+            if (valid(lat, lon)) return [lat, lon];
         }
     } catch {
         // ignore
+    }
+
+    const commaPair = s.match(/^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$/);
+    if (commaPair) {
+        const first = Number(commaPair[1]);
+        const second = Number(commaPair[2]);
+        if (valid(first, second)) return [first, second]; // common legacy Aardvark/GBL lat,lng
+        if (valid(second, first)) return [second, first]; // tolerate lon,lat when unambiguous
     }
     return null;
 }

@@ -8,6 +8,7 @@ import {
 } from "./types";
 import { H3_RES_COLUMNS } from "./schema";
 import * as duckdb from "@duckdb/duckdb-wasm";
+import { latLngToCell } from "h3-js";
 
 const REPEATABLE_FIELD_SET = new Set(REPEATABLE_STRING_FIELDS);
 
@@ -459,13 +460,25 @@ export async function getMapH3(req: MapH3Request): Promise<MapH3Response> {
             ? `resources JOIN ${globalHitsTable} gh ON resources.id = gh.id`
             : "resources";
         const sql = `
-            SELECT resources."${col}" as h3, count(*) as c
+            SELECT resources."${col}" as h3, resources.dcat_centroid as centroid, count(*) as c
             FROM ${fromClause}
-            WHERE ${baseWhere} AND resources."${col}" IS NOT NULL AND resources."${col}" != ''
-            GROUP BY resources."${col}"
+            WHERE ${baseWhere}
+              AND (
+                (resources."${col}" IS NOT NULL AND resources."${col}" != '')
+                OR (resources.dcat_centroid IS NOT NULL AND trim(resources.dcat_centroid) != '')
+              )
+            GROUP BY resources."${col}", resources.dcat_centroid
         `;
         const res = await conn.query(sql);
-        const hexes = res.toArray().map((r: any) => ({ h3: String(r.h3), count: Number(r.c) }));
+        const hexCounts = new Map<string, number>();
+        for (const row of res.toArray() as { h3?: unknown; centroid?: unknown; c?: unknown }[]) {
+            const fromColumn = row.h3 == null ? "" : String(row.h3).trim();
+            const h3 = fromColumn || h3FromCentroid(row.centroid, resolution);
+            if (!h3) continue;
+            hexCounts.set(h3, (hexCounts.get(h3) ?? 0) + Number(row.c ?? 0));
+        }
+        const hexes = Array.from(hexCounts, ([h3, count]) => ({ h3, count }))
+            .sort((a, b) => b.count - a.count);
 
         let globalCount: number | undefined;
         try {
@@ -485,6 +498,48 @@ export async function getMapH3(req: MapH3Request): Promise<MapH3Response> {
             }
         }
     }
+}
+
+function h3FromCentroid(value: unknown, resolution: number): string | null {
+    const centroid = parseCentroidForH3(value);
+    if (!centroid) return null;
+    return latLngToCell(centroid[0], centroid[1], resolution);
+}
+
+function parseCentroidForH3(value: unknown): [number, number] | null {
+    if (value == null || String(value).trim() === "") return null;
+    const s = String(value).trim();
+    const valid = (lat: number, lng: number) => (
+        Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180
+    );
+
+    try {
+        if (s.startsWith("[")) {
+            const arr = JSON.parse(s);
+            if (Array.isArray(arr) && arr.length >= 2) {
+                const first = Number(arr[0]);
+                const second = Number(arr[1]);
+                if (valid(second, first)) return [second, first];
+                if (valid(first, second)) return [first, second];
+            }
+        }
+        const obj = JSON.parse(s);
+        if (obj?.type === "Point" && Array.isArray(obj.coordinates) && obj.coordinates.length >= 2) {
+            const lon = Number(obj.coordinates[0]);
+            const lat = Number(obj.coordinates[1]);
+            if (valid(lat, lon)) return [lat, lon];
+        }
+    } catch {
+        // Not JSON; try legacy comma-separated values below.
+    }
+
+    const commaPair = s.match(/^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$/);
+    if (!commaPair) return null;
+    const first = Number(commaPair[1]);
+    const second = Number(commaPair[2]);
+    if (valid(first, second)) return [first, second];
+    if (valid(second, first)) return [second, first];
+    return null;
 }
 
 export async function queryDistributions(
