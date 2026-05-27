@@ -76,6 +76,36 @@ npm run coverage
 
 The administrator enrichment workbench uses a local proxy for private S3-compatible storage access and OpenAI calls. See [docs/enrichment-workbench.md](docs/enrichment-workbench.md) for setup and workflow details.
 
+### Running the enrichment proxy
+
+The browser app and the enrichment proxy run as separate local processes. Start them from `web/` in two terminals:
+
+```bash
+# Terminal 1: React/Vite app
+npm run dev
+
+# Terminal 2: local S3/OpenAI/vision proxy
+npm run proxy
+```
+
+By default, the app runs at `http://localhost:5173/ogm-metadata-studio/` and the proxy listens at `http://localhost:8787`. The browser uses `VITE_ENRICHMENT_PROXY_URL` when set; otherwise it falls back to `http://localhost:8787`.
+
+The proxy loads optional environment files from `web/.env` and `web/.env.local`. Use `web/.env.example` as a template. Common settings are:
+
+```bash
+VITE_ENRICHMENT_PROXY_URL=http://localhost:8787
+ENRICHMENT_PROXY_PORT=8787
+OPENAI_API_KEY=...
+GOOGLE_CLOUD_VISION_API_KEY=...
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+AWS_SESSION_TOKEN=...
+```
+
+In the Enrichments UI, storage/model/vision profiles should store environment variable names such as `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `OPENAI_API_KEY`, or `GOOGLE_CLOUD_VISION_API_KEY`, not the secret values themselves. Non-secret profile configuration is saved in `web/local-enrichment.config.json` by default; override that path with `ENRICHMENT_PROXY_CONFIG` when needed.
+
+For geospatial package processing, install GDAL and optionally `tippecanoe` on the host running the proxy. The proxy will use them for GeoJSON/GeoParquet/COG/PMTiles derivatives when available and will record missing optional tools instead of blocking metadata publication.
+
 For shareable AI/OCR provenance beside Aardvark records, see the draft [OpenGeoMetadata AI Enrichments](docs/ai-enrichments.md) companion standard and its [JSON Schema](schemas/ai-enrichments/schema.json).
 
 ## 🤝 Contributing

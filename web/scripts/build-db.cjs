@@ -1,6 +1,7 @@
 const duckdb = require('duckdb');
 const fs = require('fs');
 const path = require('path');
+const { latLngToCell } = require('h3-js');
 // const glob = require('glob'); // Not using this, DuckDB handles globs
 
 const METADATA_DIR = path.join(__dirname, '../../metadata');
@@ -43,6 +44,8 @@ const COMMA_SPLIT_REPEATABLE_FIELDS = new Set([
     "dcat_keyword_sm",
     "dct_temporal_sm",
 ]);
+
+const H3_RES_COLUMNS = ["h3_res2", "h3_res3", "h3_res4", "h3_res5", "h3_res6", "h3_res7", "h3_res8"];
 
 function normalizeRepeatableStringValue(field, value) {
     const text = String(value ?? "").trim();
@@ -106,6 +109,68 @@ function normalizeResourceRows(rows) {
     return { rows: normalizedRows, changed };
 }
 
+function validLatLng(lat, lng) {
+    return Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180;
+}
+
+function parseCentroidForH3(value) {
+    if (value == null || String(value).trim() === "") return null;
+    const s = String(value).trim();
+
+    try {
+        if (s.startsWith("[")) {
+            const arr = JSON.parse(s);
+            if (Array.isArray(arr) && arr.length >= 2) {
+                const first = Number(arr[0]);
+                const second = Number(arr[1]);
+                if (validLatLng(second, first)) return [second, first];
+                if (validLatLng(first, second)) return [first, second];
+            }
+        }
+        const obj = JSON.parse(s);
+        if (obj?.type === "Point" && Array.isArray(obj.coordinates) && obj.coordinates.length >= 2) {
+            const lon = Number(obj.coordinates[0]);
+            const lat = Number(obj.coordinates[1]);
+            if (validLatLng(lat, lon)) return [lat, lon];
+        }
+    } catch {
+        // Not JSON; try legacy comma-separated values below.
+    }
+
+    const commaPair = s.match(/^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$/);
+    if (!commaPair) return null;
+    const first = Number(commaPair[1]);
+    const second = Number(commaPair[2]);
+    if (validLatLng(first, second)) return [first, second];
+    if (validLatLng(second, first)) return [second, first];
+    return null;
+}
+
+function parseEnvelopeCenter(value) {
+    if (value == null || String(value).trim() === "") return null;
+    const text = String(value).trim();
+    const envelope = text.match(/^ENVELOPE\(([^,]+),([^,]+),([^,]+),([^,]+)\)$/i);
+    if (envelope) {
+        const minX = Number(envelope[1]);
+        const maxX = Number(envelope[2]);
+        const maxY = Number(envelope[3]);
+        const minY = Number(envelope[4]);
+        const lat = (minY + maxY) / 2;
+        const lng = (minX + maxX) / 2;
+        return validLatLng(lat, lng) ? [lat, lng] : null;
+    }
+
+    const csv = text.split(',').map((part) => Number(part.trim()));
+    if (csv.length === 4 && csv.every(Number.isFinite)) {
+        const [minX, minY, maxX, maxY] = csv;
+        const lat = (minY + maxY) / 2;
+        const lng = (minX + maxX) / 2;
+        return validLatLng(lat, lng) ? [lat, lng] : null;
+    }
+
+    return null;
+}
+
 async function buildDatabase() {
     console.log('Building DuckDB/Parquet artifact...');
     console.log(`Scanning looking for JSONs in: ${METADATA_DIR}`);
@@ -155,13 +220,68 @@ async function buildDatabase() {
         return true;
     };
 
+    const ensureH3Columns = async () => {
+        const columns = await all('DESCRIBE resources');
+        const existing = new Set(columns.map((row) => String(row.column_name)));
+        for (const col of H3_RES_COLUMNS) {
+            if (!existing.has(col)) {
+                await run(`ALTER TABLE resources ADD COLUMN "${col}" VARCHAR`);
+            }
+        }
+    };
+
+    const populateH3Columns = async () => {
+        await ensureH3Columns();
+        const rows = await all(`
+            SELECT id, dcat_centroid, dcat_bbox
+            FROM resources
+            WHERE id IS NOT NULL
+              AND ("h3_res2" IS NULL OR "h3_res2" = '')
+              AND (
+                (dcat_centroid IS NOT NULL AND trim(CAST(dcat_centroid AS VARCHAR)) != '')
+                OR (dcat_bbox IS NOT NULL AND trim(CAST(dcat_bbox AS VARCHAR)) != '')
+              )
+        `);
+        const updates = [];
+        for (const row of rows) {
+            const centroid = parseCentroidForH3(row.dcat_centroid) || parseEnvelopeCenter(row.dcat_bbox);
+            if (!centroid) continue;
+            const update = { id: String(row.id) };
+            for (let i = 0; i < H3_RES_COLUMNS.length; i++) {
+                update[H3_RES_COLUMNS[i]] = latLngToCell(centroid[0], centroid[1], i + 2);
+            }
+            updates.push(update);
+        }
+        if (updates.length === 0) {
+            console.log('H3 columns already populated or no centroid data available.');
+            return false;
+        }
+
+        const tempJson = path.join(publicDir, `.resources-h3-${Date.now()}.json`);
+        fs.writeFileSync(tempJson, JSON.stringify(updates));
+        try {
+            await run(`
+                CREATE TEMP TABLE h3_updates AS
+                SELECT * FROM read_json_auto('${tempJson}', format='array', union_by_name=true)
+            `);
+            const assignments = H3_RES_COLUMNS.map((col) => `"${col}" = h."${col}"`).join(', ');
+            await run(`UPDATE resources SET ${assignments} FROM h3_updates h WHERE resources.id = h.id`);
+            await run('DROP TABLE h3_updates');
+        } finally {
+            fs.rmSync(tempJson, { force: true });
+        }
+        console.log(`Populated H3 columns for ${updates.length.toLocaleString()} resources.`);
+        return true;
+    };
+
     const normalizeExistingParquet = async () => {
         await run(`
             CREATE TABLE resources AS
             SELECT * FROM read_parquet('${OUTPUT_FILE}')
         `);
         const changed = await normalizeResourcesTable();
-        if (changed) {
+        const h3Changed = await populateH3Columns();
+        if (changed || h3Changed) {
             await run(`COPY resources TO '${OUTPUT_FILE}' (FORMAT PARQUET)`);
             console.log(`Cleaned existing published parquet at ${OUTPUT_FILE}.`);
         }
@@ -195,6 +315,7 @@ async function buildDatabase() {
             // If we create a valid empty parquet it's safer.
 
             await run("CREATE TABLE resources (id VARCHAR, dct_title_s VARCHAR)"); // Minimal schema to pass
+            await ensureH3Columns();
             await run(`COPY resources TO '${OUTPUT_FILE}' (FORMAT PARQUET)`);
             return;
         }
@@ -218,6 +339,7 @@ async function buildDatabase() {
         const result = await all('SELECT count(*) as count FROM resources');
         console.log(`Loaded ${result[0].count} records from JSON files.`);
         await normalizeResourcesTable();
+        await populateH3Columns();
 
         // Export to Parquet
         console.log(`Exporting to ${OUTPUT_FILE}...`);

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import * as queries from './queries';
 import * as dbInit from './dbInit';
+import { latLngToCell } from 'h3-js';
 
 // Mock types
 const mockToArray = vi.fn();
@@ -180,6 +181,26 @@ describe('DuckDB Queries', () => {
             const res = await queries.getFacetValues({ field: 'dct_subject_sm' });
             expect(res.values).toHaveLength(1);
             expect(res.total).toBe(100);
+        });
+    });
+
+    describe('getMapH3', () => {
+        it('falls back to centroid-derived H3 when published rows have empty H3 columns', async () => {
+            const expectedHex = latLngToCell(46.4415, -93.361, 4);
+            mockConn.query
+                .mockResolvedValueOnce({
+                    toArray: () => [
+                        { h3: '', centroid: '46.4415,-93.361', c: 2 },
+                        { h3: expectedHex, centroid: null, c: 3 },
+                    ]
+                })
+                .mockResolvedValueOnce({ toArray: () => [{ c: 5 }] });
+
+            const res = await queries.getMapH3({ resolution: 4 });
+
+            expect(res.hexes).toEqual([{ h3: expectedHex, count: 5 }]);
+            expect(res.globalCount).toBe(5);
+            expect(mockConn.query.mock.calls[0][0]).toContain('resources.dcat_centroid as centroid');
         });
     });
 
