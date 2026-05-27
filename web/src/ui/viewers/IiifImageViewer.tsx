@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { colorWithAlpha, type TextExtractionAnnotation } from './textExtractionOverlay';
+import { colorWithAlpha, defaultAnnotationLayerVisibility, type TextExtractionAnnotation } from './textExtractionOverlay';
 import { viewStateForTextAnnotation } from './iiifTextFocus';
 
 interface IiifImageViewerProps {
@@ -61,6 +61,27 @@ function clamp(value: number, min: number, max: number): number {
     return Math.min(max, Math.max(min, value));
 }
 
+function constrainAxis(offset: number, viewportSize: number, imageSize: number, scale: number): number {
+    const scaledImageSize = imageSize * scale;
+    if (scaledImageSize <= viewportSize) return (viewportSize - scaledImageSize) / 2;
+    return clamp(offset, viewportSize - scaledImageSize, 0);
+}
+
+function constrainViewToImage(view: ViewState, info: IiifImageInfo, viewport: { width: number; height: number }): ViewState {
+    if (viewport.width <= 0 || viewport.height <= 0 || info.width <= 0 || info.height <= 0) return view;
+    return {
+        ...view,
+        x: constrainAxis(view.x, viewport.width, info.width, view.scale),
+        y: constrainAxis(view.y, viewport.height, info.height, view.scale),
+    };
+}
+
+function viewStatesEqual(a: ViewState, b: ViewState): boolean {
+    return Math.abs(a.scale - b.scale) < 0.0001
+        && Math.abs(a.x - b.x) < 0.1
+        && Math.abs(a.y - b.y) < 0.1;
+}
+
 export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
     infoUrl,
     className = '',
@@ -70,6 +91,8 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
     textExtractionMessage = "",
 }) => {
     const containerRef = useRef<HTMLDivElement>(null);
+    const annotationListRef = useRef<HTMLDivElement>(null);
+    const annotationEntryRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
     const dragRef = useRef<{ pointerId: number; startX: number; startY: number; view: ViewState } | null>(null);
     const viewRef = useRef<ViewState>({ scale: 1, x: 0, y: 0 });
     const viewAnimationRef = useRef<number | null>(null);
@@ -81,26 +104,79 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
     const [containerSize, setContainerSize] = useState({ width: 0, height: 0 });
     const [view, setView] = useState<ViewState>({ scale: 1, x: 0, y: 0 });
     const [showTextOverlay, setShowTextOverlay] = useState(true);
+    const [showWofAnnotations, setShowWofAnnotations] = useState(true);
+    const [showOsmAnnotations, setShowOsmAnnotations] = useState(true);
+    const [showGeoNamesAnnotations, setShowGeoNamesAnnotations] = useState(true);
+    const [showExtractionAnnotations, setShowExtractionAnnotations] = useState(true);
     const [showTextPanel, setShowTextPanel] = useState(true);
     const [showSelectedTextOnly, setShowSelectedTextOnly] = useState(false);
     const [selectedTextId, setSelectedTextId] = useState<string | null>(null);
+    const annotationDefaultsRef = useRef("");
 
     const normalizedInfoUrl = useMemo(() => normalizeInfoUrl(infoUrl), [infoUrl]);
     const info = infoState.url === normalizedInfoUrl ? infoState.info : null;
     const error = infoState.url === normalizedInfoUrl ? infoState.error : null;
     const hasTextAnnotations = textAnnotations.length > 0;
+    const hasWofAnnotations = textAnnotations.some((annotation) => annotation.layer === "wof");
+    const hasOsmAnnotations = textAnnotations.some((annotation) => annotation.layer === "osm");
+    const hasGeoNamesAnnotations = textAnnotations.some((annotation) => annotation.layer === "geonames");
+    const hasExtractionAnnotations = textAnnotations.some((annotation) => annotation.layer === "extraction");
     const showTextStatus = !hasTextAnnotations && textExtractionStatus !== "none";
-    const activeSelectedTextId = textAnnotations.some((annotation) => annotation.id === selectedTextId)
+    const enabledTextAnnotations = textAnnotations.filter((annotation) => (
+        annotation.layer === "wof"
+            ? showWofAnnotations
+            : annotation.layer === "osm"
+                ? showOsmAnnotations
+                : annotation.layer === "geonames"
+                    ? showGeoNamesAnnotations
+                    : showExtractionAnnotations
+    ));
+    const activeSelectedTextId = enabledTextAnnotations.some((annotation) => annotation.id === selectedTextId)
         ? selectedTextId
         : null;
     const isShowingSelectedTextOnly = showSelectedTextOnly && Boolean(activeSelectedTextId);
-    const visibleTextAnnotations = isShowingSelectedTextOnly
-        ? textAnnotations.filter((annotation) => annotation.id === activeSelectedTextId)
-        : textAnnotations;
+    const visibleTextAnnotations = !showTextOverlay
+        ? []
+        : isShowingSelectedTextOnly
+            ? enabledTextAnnotations.filter((annotation) => annotation.id === activeSelectedTextId)
+            : enabledTextAnnotations;
+    const showOnlyWof = hasWofAnnotations && showWofAnnotations && !showOsmAnnotations && !showGeoNamesAnnotations && !showExtractionAnnotations;
+    const showOnlyOsm = hasOsmAnnotations && showOsmAnnotations && !showWofAnnotations && !showGeoNamesAnnotations && !showExtractionAnnotations;
+    const showOnlyGeoNames = hasGeoNamesAnnotations && showGeoNamesAnnotations && !showWofAnnotations && !showOsmAnnotations && !showExtractionAnnotations;
+    const showOnlyExtraction = hasExtractionAnnotations && showExtractionAnnotations && !showWofAnnotations && !showOsmAnnotations && !showGeoNamesAnnotations;
+    const annotationPanelTitle = showOnlyWof
+        ? "WOF Matches"
+        : showOnlyOsm
+            ? "OSM Matches"
+            : showOnlyGeoNames
+                ? "GeoNames Matches"
+                : showOnlyExtraction
+                    ? "Extraction Entries"
+                    : (showWofAnnotations || showOsmAnnotations || showGeoNamesAnnotations) && !showExtractionAnnotations
+                        ? "Gazetteer Matches"
+                        : "Overlay Entries";
+
+    useEffect(() => {
+        const signature = `${normalizedInfoUrl}:${textAnnotations.length}:${hasWofAnnotations ? "wof" : "no-wof"}:${hasOsmAnnotations ? "osm" : "no-osm"}:${hasGeoNamesAnnotations ? "geonames" : "no-geonames"}:${hasExtractionAnnotations ? "ocr" : "no-ocr"}`;
+        if (annotationDefaultsRef.current === signature) return;
+        annotationDefaultsRef.current = signature;
+        const defaults = defaultAnnotationLayerVisibility(textAnnotations);
+        setShowWofAnnotations(defaults.showWof);
+        setShowOsmAnnotations(defaults.showOsm);
+        setShowGeoNamesAnnotations(defaults.showGeoNames);
+        setShowExtractionAnnotations(defaults.showExtraction);
+        setShowSelectedTextOnly(false);
+        setSelectedTextId(null);
+    }, [hasExtractionAnnotations, hasGeoNamesAnnotations, hasOsmAnnotations, hasWofAnnotations, normalizedInfoUrl, textAnnotations]);
 
     useEffect(() => {
         viewRef.current = view;
     }, [view]);
+
+    const constrainView = useCallback((candidate: ViewState) => {
+        if (!info) return candidate;
+        return constrainViewToImage(candidate, info, containerSize);
+    }, [containerSize, info]);
 
     const cancelViewAnimation = useCallback(() => {
         if (viewAnimationRef.current !== null) {
@@ -111,20 +187,30 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
 
     useEffect(() => cancelViewAnimation, [cancelViewAnimation]);
 
+    useEffect(() => {
+        setView((current) => {
+            const next = constrainView(current);
+            if (viewStatesEqual(current, next)) return current;
+            viewRef.current = next;
+            return next;
+        });
+    }, [constrainView]);
+
     const animateViewTo = useCallback((target: ViewState, duration = 520) => {
         cancelViewAnimation();
         const start = viewRef.current;
+        const boundedTarget = constrainView(target);
         const startedAt = window.performance.now();
         const easeOutCubic = (value: number) => 1 - Math.pow(1 - value, 3);
 
         const step = (now: number) => {
             const progress = Math.min(1, (now - startedAt) / duration);
             const eased = easeOutCubic(progress);
-            const next = {
-                scale: start.scale + (target.scale - start.scale) * eased,
-                x: start.x + (target.x - start.x) * eased,
-                y: start.y + (target.y - start.y) * eased,
-            };
+            const next = constrainView({
+                scale: start.scale + (boundedTarget.scale - start.scale) * eased,
+                x: start.x + (boundedTarget.x - start.x) * eased,
+                y: start.y + (boundedTarget.y - start.y) * eased,
+            });
             viewRef.current = next;
             setView(next);
             if (progress < 1) {
@@ -135,10 +221,10 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
         };
 
         viewAnimationRef.current = window.requestAnimationFrame(step);
-    }, [cancelViewAnimation]);
+    }, [cancelViewAnimation, constrainView]);
 
     const focusTextAnnotation = useCallback((annotation: TextExtractionAnnotation) => {
-        if (!info || containerSize.width <= 0 || containerSize.height <= 0) return;
+        if (!annotation.bbox || !info || containerSize.width <= 0 || containerSize.height <= 0) return;
         const rightInset = showTextPanel && containerSize.width >= 640 ? 344 : 0;
         const target = viewStateForTextAnnotation({
             bbox: annotation.bbox,
@@ -157,6 +243,28 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
         setShowTextOverlay(true);
         focusTextAnnotation(annotation);
     }, [focusTextAnnotation]);
+
+    const setAnnotationEntryRef = useCallback((id: string, element: HTMLButtonElement | null) => {
+        if (element) annotationEntryRefs.current.set(id, element);
+        else annotationEntryRefs.current.delete(id);
+    }, []);
+
+    useEffect(() => {
+        if (!activeSelectedTextId || !showTextPanel) return;
+        const container = annotationListRef.current;
+        const entry = annotationEntryRefs.current.get(activeSelectedTextId);
+        if (!container || !entry) return;
+        const frame = window.requestAnimationFrame(() => {
+            const containerRect = container.getBoundingClientRect();
+            const entryRect = entry.getBoundingClientRect();
+            if (entryRect.top < containerRect.top) {
+                container.scrollTo({ top: container.scrollTop + entryRect.top - containerRect.top, behavior: "smooth" });
+            } else if (entryRect.bottom > containerRect.bottom) {
+                container.scrollTo({ top: container.scrollTop + entryRect.bottom - containerRect.bottom, behavior: "smooth" });
+            }
+        });
+        return () => window.cancelAnimationFrame(frame);
+    }, [activeSelectedTextId, showTextPanel]);
 
     useEffect(() => {
         const controller = new AbortController();
@@ -204,14 +312,14 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
         if (!info || containerSize.width <= 0 || containerSize.height <= 0) return;
         cancelViewAnimation();
         const scale = Math.min(containerSize.width / info.width, containerSize.height / info.height);
-        const next = {
+        const next = constrainView({
             scale,
             x: (containerSize.width - info.width * scale) / 2,
             y: (containerSize.height - info.height * scale) / 2,
-        };
+        });
         viewRef.current = next;
         setView(next);
-    }, [cancelViewAnimation, containerSize.height, containerSize.width, info]);
+    }, [cancelViewAnimation, constrainView, containerSize.height, containerSize.width, info]);
 
     useEffect(() => {
         const frame = window.requestAnimationFrame(fitView);
@@ -267,15 +375,15 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
         setView((current) => {
             const imageX = (localX - current.x) / current.scale;
             const imageY = (localY - current.y) / current.scale;
-            const next = {
+            const next = constrainView({
                 scale,
                 x: localX - imageX * scale,
                 y: localY - imageY * scale,
-            };
+            });
             viewRef.current = next;
             return next;
         });
-    }, [cancelViewAnimation, info]);
+    }, [cancelViewAnimation, constrainView, info]);
 
     const handleWheel = useCallback((event: React.WheelEvent<HTMLDivElement>) => {
         event.preventDefault();
@@ -297,9 +405,10 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
             x: drag.view.x + event.clientX - drag.startX,
             y: drag.view.y + event.clientY - drag.startY,
         };
-        viewRef.current = next;
-        setView(next);
-    }, []);
+        const constrained = constrainView(next);
+        viewRef.current = constrained;
+        setView(constrained);
+    }, [constrainView]);
 
     const handlePointerUp = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
         if (dragRef.current?.pointerId === event.pointerId) dragRef.current = null;
@@ -320,7 +429,7 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
         <div className={`${className} ${heightClassName} relative overflow-hidden bg-slate-950 text-white`}>
             <div
                 ref={containerRef}
-                className="absolute inset-0 cursor-grab touch-none overflow-hidden active:cursor-grabbing"
+                className="absolute inset-0 z-0 cursor-grab touch-none overflow-hidden active:cursor-grabbing"
                 onWheel={handleWheel}
                 onPointerDown={handlePointerDown}
                 onPointerMove={handlePointerMove}
@@ -333,7 +442,7 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
                         src={tile.url}
                         alt=""
                         draggable={false}
-                        className="absolute select-none"
+                        className="absolute max-w-none select-none"
                         style={{
                             left: tile.left,
                             top: tile.top,
@@ -344,17 +453,20 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
                 )) : (
                     <div className="flex h-full items-center justify-center text-sm text-slate-300">Loading IIIF image...</div>
                 )}
-                {info && showTextOverlay && visibleTextAnnotations.map((annotation) => {
-                    const left = view.x + annotation.bbox.x1 * info.width * view.scale;
-                    const top = view.y + annotation.bbox.y1 * info.height * view.scale;
-                    const width = (annotation.bbox.x2 - annotation.bbox.x1) * info.width * view.scale;
-                    const height = (annotation.bbox.y2 - annotation.bbox.y1) * info.height * view.scale;
+                {info && showTextOverlay && visibleTextAnnotations.filter((annotation) => annotation.bbox).map((annotation) => {
+                    const bbox = annotation.bbox!;
+                    const left = view.x + bbox.x1 * info.width * view.scale;
+                    const top = view.y + bbox.y1 * info.height * view.scale;
+                    const width = (bbox.x2 - bbox.x1) * info.width * view.scale;
+                    const height = (bbox.y2 - bbox.y1) * info.height * view.scale;
                     const isSelected = activeSelectedTextId === annotation.id;
 
                     return (
                         <button
                             key={annotation.id}
                             type="button"
+                            data-annotation-id={annotation.id}
+                            data-annotation-overlay="true"
                             className={`absolute select-none rounded-sm border-2 text-left shadow-[0_0_0_1px_rgba(15,23,42,0.65)] transition ${isSelected ? "z-20 ring-2 ring-white" : "z-10 hover:ring-2 hover:ring-white/80"}`}
                             style={{
                                 left,
@@ -381,7 +493,7 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
                     );
                 })}
             </div>
-            <div className="absolute left-3 top-3 flex items-center gap-1 rounded-md bg-slate-900/80 p-1 shadow">
+            <div className="absolute left-3 top-3 z-40 flex items-center gap-1 rounded-md bg-slate-900/80 p-1 shadow">
                 <button type="button" className="h-8 w-8 rounded bg-white/10 text-sm font-semibold hover:bg-white/20" title="Zoom in" onClick={() => zoomAt(view.scale * 1.3)}>+</button>
                 <button type="button" className="h-8 w-8 rounded bg-white/10 text-sm font-semibold hover:bg-white/20" title="Zoom out" onClick={() => zoomAt(view.scale / 1.3)}>-</button>
                 <button type="button" className="h-8 rounded bg-white/10 px-2 text-xs font-medium hover:bg-white/20" title="Fit image" onClick={fitView}>Fit</button>
@@ -395,6 +507,46 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
                         >
                             Boxes
                         </button>
+                        {hasWofAnnotations && (
+                            <button
+                                type="button"
+                                className={`h-8 rounded px-2 text-xs font-medium ${showWofAnnotations ? "bg-white/20 text-white" : "bg-white/10 text-slate-300 hover:bg-white/20"}`}
+                                title="Toggle Who's On First matches"
+                                onClick={() => setShowWofAnnotations((current) => !current)}
+                            >
+                                WOF
+                            </button>
+                        )}
+                        {hasOsmAnnotations && (
+                            <button
+                                type="button"
+                                className={`h-8 rounded px-2 text-xs font-medium ${showOsmAnnotations ? "bg-white/20 text-white" : "bg-white/10 text-slate-300 hover:bg-white/20"}`}
+                                title="Toggle OpenStreetMap matches"
+                                onClick={() => setShowOsmAnnotations((current) => !current)}
+                            >
+                                OSM
+                            </button>
+                        )}
+                        {hasGeoNamesAnnotations && (
+                            <button
+                                type="button"
+                                className={`h-8 rounded px-2 text-xs font-medium ${showGeoNamesAnnotations ? "bg-white/20 text-white" : "bg-white/10 text-slate-300 hover:bg-white/20"}`}
+                                title="Toggle GeoNames matches"
+                                onClick={() => setShowGeoNamesAnnotations((current) => !current)}
+                            >
+                                GN
+                            </button>
+                        )}
+                        {hasExtractionAnnotations && (
+                            <button
+                                type="button"
+                                className={`h-8 rounded px-2 text-xs font-medium ${showExtractionAnnotations ? "bg-white/20 text-white" : "bg-white/10 text-slate-300 hover:bg-white/20"}`}
+                                title="Toggle raw extraction entries"
+                                onClick={() => setShowExtractionAnnotations((current) => !current)}
+                            >
+                                OCR
+                            </button>
+                        )}
                         <button
                             type="button"
                             className={`h-8 rounded px-2 text-xs font-medium ${showTextPanel ? "bg-white/20 text-white" : "bg-white/10 text-slate-300 hover:bg-white/20"}`}
@@ -407,7 +559,7 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
                 )}
             </div>
             {showTextStatus && (
-                <div className="absolute left-3 top-14 max-w-80 rounded-md bg-slate-900/85 px-3 py-2 text-xs text-slate-200 shadow ring-1 ring-white/10">
+                <div className="absolute left-3 top-14 z-40 max-w-80 rounded-md bg-slate-900/85 px-3 py-2 text-xs text-slate-200 shadow ring-1 ring-white/10">
                     <div className="font-semibold">
                         {textExtractionStatus === "loading" ? "Loading Text Extraction" : textExtractionStatus === "empty" ? "No Text Boxes Found" : "Text Extraction Unavailable"}
                     </div>
@@ -415,10 +567,10 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
                 </div>
             )}
             {hasTextAnnotations && showTextPanel && (
-                <div className="absolute bottom-3 left-3 right-3 max-h-44 overflow-hidden rounded-md bg-slate-950/90 text-xs shadow-xl ring-1 ring-white/15 backdrop-blur sm:left-auto sm:top-3 sm:w-80 sm:max-h-none">
+                <div data-testid="iiif-annotation-panel" className="absolute bottom-3 left-3 right-3 z-50 max-h-44 overflow-hidden rounded-md bg-slate-950/95 text-xs shadow-xl ring-1 ring-white/15 backdrop-blur sm:left-auto sm:top-3 sm:w-80 sm:max-h-none">
                     <div className="flex items-center gap-2 border-b border-white/10 px-3 py-2">
-                        <div className="font-semibold text-slate-100">Extracted Text</div>
-                        <div className="text-slate-400">{isShowingSelectedTextOnly ? `1 / ${textAnnotations.length}` : textAnnotations.length}</div>
+                        <div className="font-semibold text-slate-100">{annotationPanelTitle}</div>
+                        <div className="text-slate-400">{isShowingSelectedTextOnly ? `1 / ${enabledTextAnnotations.length}` : enabledTextAnnotations.length}</div>
                         <button
                             type="button"
                             className="ml-auto rounded bg-white/10 px-2 py-1 text-[10px] font-medium text-slate-200 hover:bg-white/20 disabled:cursor-not-allowed disabled:opacity-40"
@@ -430,7 +582,7 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
                                 } else if (activeSelectedTextId) {
                                     setShowSelectedTextOnly(true);
                                     setShowTextOverlay(true);
-                                    const annotation = textAnnotations.find((item) => item.id === activeSelectedTextId);
+                                    const annotation = enabledTextAnnotations.find((item) => item.id === activeSelectedTextId);
                                     if (annotation) focusTextAnnotation(annotation);
                                 }
                             }}
@@ -438,13 +590,19 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
                             {isShowingSelectedTextOnly ? "Show All" : "Show Selected"}
                         </button>
                     </div>
-                    <div className="max-h-36 overflow-auto sm:max-h-[calc(100%-2.25rem)]">
-                        {textAnnotations.map((annotation) => {
+                    <div ref={annotationListRef} data-testid="iiif-annotation-list" className="max-h-36 overflow-auto sm:max-h-[calc(100%-2.25rem)]">
+                        {enabledTextAnnotations.length === 0 && (
+                            <div className="px-3 py-3 text-slate-400">No overlay layer selected.</div>
+                        )}
+                        {enabledTextAnnotations.map((annotation) => {
                             const isSelected = activeSelectedTextId === annotation.id;
                             return (
                                 <button
                                     key={annotation.id}
+                                    ref={(element) => setAnnotationEntryRef(annotation.id, element)}
                                     type="button"
+                                    data-annotation-id={annotation.id}
+                                    data-annotation-row="true"
                                     className={`grid w-full grid-cols-[1.75rem_minmax(0,1fr)] gap-2 border-b border-white/10 px-3 py-2 text-left last:border-b-0 ${isSelected ? "bg-white/15" : "hover:bg-white/10"}`}
                                     onClick={() => selectTextAnnotation(annotation)}
                                 >
@@ -457,8 +615,12 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
                                     <span className="min-w-0">
                                         <span className="line-clamp-3 whitespace-pre-wrap text-slate-100">{annotation.content}</span>
                                         <span className="mt-1 flex flex-wrap gap-2 text-[10px] uppercase text-slate-400">
-                                            <span>{annotation.role}</span>
+                                            <span>{annotation.layer === "wof" ? "WOF" : annotation.layer === "osm" ? "OSM" : annotation.layer === "geonames" ? "GN" : annotation.role}</span>
+                                            {annotation.authorityId && <span>{annotation.authorityId}</span>}
+                                            {annotation.placetype && <span>{annotation.placetype}</span>}
                                             {annotation.source === "text_group" && <span>{annotation.sourceTextIndices?.length || 0} boxes</span>}
+                                            {(annotation.source === "wof_match" || annotation.source === "osm_match" || annotation.source === "geonames_match") && (annotation.sourceTextIndices?.length || 0) > 1 && <span>{annotation.sourceTextIndices?.length || 0} boxes</span>}
+                                            {(annotation.source === "wof_match" || annotation.source === "osm_match" || annotation.source === "geonames_match") && !annotation.bbox && <span>no box</span>}
                                             {annotation.confidence !== undefined && <span>{Math.round(annotation.confidence * 100)}%</span>}
                                         </span>
                                     </span>
@@ -469,7 +631,7 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
                 </div>
             )}
             {info && !(hasTextAnnotations && showTextPanel) && (
-                <div className="absolute bottom-3 right-3 rounded bg-slate-900/80 px-2 py-1 text-xs text-slate-300">
+                <div className="absolute bottom-3 right-3 z-40 rounded bg-slate-900/80 px-2 py-1 text-xs text-slate-300">
                     {info.width} x {info.height} - scale {tileData.scaleFactor}x
                 </div>
             )}

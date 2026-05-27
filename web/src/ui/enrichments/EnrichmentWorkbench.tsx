@@ -33,7 +33,7 @@ import {
 } from "./uploadDirectory";
 
 type Panel = "upload" | "config" | "inventory";
-type BusyOperation = "" | "upload" | "regenerate" | "refresh";
+type BusyOperation = "" | "upload" | "regenerate" | "refresh" | "wof";
 type EnrichmentPhase = "starting" | "requesting" | "storing" | "completed" | "failed";
 type UploadStatus = "queued" | "hashing" | "processing" | "publishing" | "completed" | "cached" | "failed";
 type UploadKind = "image" | "geospatial";
@@ -49,7 +49,7 @@ interface EnrichmentMilestone {
 }
 
 interface EnrichmentProgress {
-    kind: "regeneration" | "refresh";
+    kind: "regeneration" | "refresh" | "wof";
     total: number;
     completed: number;
     failed: number;
@@ -682,6 +682,7 @@ export const EnrichmentWorkbench: React.FC = () => {
     const isUploading = busyOperation === "upload";
     const isRegenerating = busyOperation === "regenerate";
     const isRefreshing = busyOperation === "refresh";
+    const isRefreshingWof = busyOperation === "wof";
     const isRestoring = restoreStatus.inProgress;
     const restoreLabel = restoreStatus.total > 0
         ? `Restoring local records into DuckDB: ${restoreStatus.processed.toLocaleString()} / ${restoreStatus.total.toLocaleString()}`
@@ -850,6 +851,31 @@ export const EnrichmentWorkbench: React.FC = () => {
                 status: "active",
                 label: "S3 refresh started",
                 detail: `${total} processed S3 resource(s) queued for local DuckDB refresh.`,
+            }],
+        });
+    };
+
+    const startWofRefreshProgress = (total: number) => {
+        const startedAt = Date.now();
+        setElapsedSeconds(0);
+        setRunProgress({
+            kind: "wof",
+            total,
+            completed: 0,
+            failed: 0,
+            currentIndex: 0,
+            currentAsset: "",
+            phase: "starting",
+            phaseProgress: 0.02,
+            message: `Starting gazetteer concordance persistence for ${total} S3 resource(s).`,
+            startedAt,
+            updatedAt: startedAt,
+            milestones: [{
+                id: crypto.randomUUID(),
+                at: milestoneTime(),
+                status: "active",
+                label: "Gazetteer persistence started",
+                detail: `${total} processed S3 resource(s) queued for WOF/OSM/GeoNames concordance refresh.`,
             }],
         });
     };
@@ -1729,6 +1755,153 @@ export const EnrichmentWorkbench: React.FC = () => {
         }
     };
 
+    const refreshWofConcordanceFromS3 = async () => {
+        if (isRestoring) {
+            setStatus(`${restoreLabel}. Gazetteer concordance persistence is available when restore finishes.`);
+            addToast("Wait for local DuckDB restore to finish before refreshing gazetteer concordances.", "info");
+            return;
+        }
+        if (!selectedStorageProfile) {
+            addToast("Choose a storage profile before refreshing gazetteer concordances.", "info");
+            return;
+        }
+
+        runAbortRef.current?.abort();
+        const controller = new AbortController();
+        runAbortRef.current = controller;
+        setBusyOperation("wof");
+        setStatus(`Scanning ${selectedStorageProfile.name} for processed S3 resources...`);
+        setRunProgress(null);
+
+        try {
+            const discovered = await enrichmentProxyClient.listProcessedS3Resources(selectedStorageProfile.id, controller.signal);
+            const resources = discovered.resources;
+            if (controller.signal.aborted) throw new Error("Gazetteer concordance refresh canceled.");
+            if (resources.length === 0) {
+                setStatus("No processed S3 resources with Aardvark and extraction JSON were found.");
+                addToast("No processed S3 resources found.", "info");
+                return;
+            }
+
+            startWofRefreshProgress(resources.length);
+            let published = 0;
+            let failed = 0;
+            let matchedTotal = 0;
+            let supplementalTotal = 0;
+
+            for (let index = 0; index < resources.length; index++) {
+                const s3Resource = resources[index];
+                const name = s3Resource.fileName || s3Resource.resourceId;
+                if (controller.signal.aborted) throw new Error("Gazetteer concordance refresh canceled.");
+                setStatus(`Persisting gazetteer matches ${index + 1} / ${resources.length}: ${name}`);
+                updateRunProgress({
+                    currentIndex: index,
+                    currentAsset: name,
+                    phase: "requesting",
+                    phaseProgress: 0.35,
+                    message: `Refreshing WOF/OSM/GeoNames concordance for ${name} and writing ai-enrichments.json back to S3.`,
+                }, {
+                    status: "active",
+                    label: `Refreshing gazetteers ${name}`,
+                    detail: s3Resource.root,
+                });
+
+                try {
+                    const response = await enrichmentProxyClient.refreshWofConcordance({
+                        jobId: `wof-${crypto.randomUUID()}`,
+                        storageProfileId: selectedStorageProfile.id,
+                        resource: s3Resource,
+                    }, controller.signal);
+                    if (controller.signal.aborted) throw new Error("Gazetteer concordance refresh canceled.");
+
+                    const matched = Number(response.wofConcordance?.matched || 0) + Number(response.osmConcordance?.matched || 0) + Number(response.geonamesConcordance?.matched || 0);
+                    const supplemental = Number(response.wofConcordance?.supplementalPlacenames || 0) + Number(response.osmConcordance?.supplementalPlacenames || 0) + Number(response.geonamesConcordance?.supplementalPlacenames || 0);
+                    matchedTotal += matched;
+                    supplementalTotal += supplemental;
+                    updateRunProgress({
+                        phase: "storing",
+                        phaseProgress: 0.82,
+                        message: `Publishing ${name} locally after persisting ${matched} gazetteer match(es).`,
+                    }, {
+                        status: "done",
+                        label: "Persisted gazetteer concordance",
+                        detail: `${matched} matched, ${supplemental} supplemental.`,
+                    });
+
+                    const { resource } = await withTimeout(
+                        publishAardvarkResponseToLocalCatalog(response, { label: name }),
+                        `Publishing ${name}`,
+                        30_000,
+                    );
+                    published += 1;
+                    updateRunProgress({
+                        completed: published,
+                        currentIndex: index + 1,
+                        phase: "completed",
+                        phaseProgress: 0,
+                        message: `Persisted gazetteer concordances for ${published} of ${resources.length} resource(s).`,
+                    }, {
+                        status: "done",
+                        label: `Published ${resource.id}`,
+                        detail: `${resource.dct_title_s || name} saved to DuckDB and IndexedDB.`,
+                    });
+                } catch (error: any) {
+                    if (String(error.message || "").includes("canceled")) throw error;
+                    failed += 1;
+                    updateRunProgress({
+                        failed,
+                        currentIndex: index + 1,
+                        phase: "failed",
+                        phaseProgress: 0,
+                        message: `Gazetteer concordance refresh failed for ${name}: ${error.message}`,
+                    }, {
+                        status: "error",
+                        label: `Failed ${name}`,
+                        detail: error.message,
+                    });
+                }
+            }
+
+            await ensureDefaultEnrichmentData();
+            if (activePanel === "inventory") void refreshS3Inventory(false);
+            setStatus(`Gazetteer concordance persistence complete: ${published} published${failed > 0 ? `, ${failed} failed` : ""}.`);
+            updateRunProgress({
+                phase: failed > 0 ? "failed" : "completed",
+                phaseProgress: 1,
+                completed: published,
+                failed,
+                message: `Gazetteer concordance persistence complete: ${matchedTotal} total match(es), ${supplementalTotal} supplemental.`,
+                finishedAt: Date.now(),
+            }, {
+                status: failed > 0 ? "error" : "done",
+                label: "Gazetteer persistence complete",
+                detail: `${published} published, ${failed} failed.`,
+            });
+            addToast(failed > 0 ? `Persisted gazetteers for ${published}; ${failed} failed.` : `Persisted gazetteer concordances for ${published} resource(s).`, failed > 0 ? "error" : "success");
+        } catch (error: any) {
+            if (String(error.message || "").includes("canceled")) {
+                setStatus("Gazetteer concordance refresh canceled.");
+                addToast("Gazetteer concordance refresh canceled.", "info");
+            } else {
+                setStatus(`Gazetteer concordance refresh failed: ${error.message}`);
+                updateRunProgress({
+                    phase: "failed",
+                    phaseProgress: 0,
+                    message: `Gazetteer concordance refresh failed: ${error.message}`,
+                    finishedAt: Date.now(),
+                }, {
+                    status: "error",
+                    label: "Gazetteer refresh failed",
+                    detail: error.message,
+                });
+                addToast("Gazetteer concordance refresh failed.", "error");
+            }
+        } finally {
+            if (runAbortRef.current === controller) runAbortRef.current = null;
+            setBusyOperation("");
+        }
+    };
+
     const saveProxyConfig = async (nextConfig: ProxyConfig) => {
         try {
             const normalized = { ...nextConfig, visionProfiles: nextConfig.visionProfiles || [] };
@@ -1833,7 +2006,7 @@ export const EnrichmentWorkbench: React.FC = () => {
     };
 
     const cancelRun = () => {
-        const label = "Aardvark regeneration";
+        const label = isRefreshingWof ? "Gazetteer concordance refresh" : isRefreshing ? "S3 refresh" : "Aardvark regeneration";
         runAbortRef.current?.abort();
         runAbortRef.current = null;
         setBusyOperation("");
@@ -1861,9 +2034,13 @@ export const EnrichmentWorkbench: React.FC = () => {
             <button type="button" onClick={refreshLocalAardvarkFromS3} disabled={isBusy || isRestoring || !selectedStorageId} className="rounded border border-emerald-300 px-3 py-1.5 text-xs font-medium text-emerald-700 disabled:opacity-40 dark:border-emerald-700 dark:text-emerald-200">
                 {isRefreshing ? "Refreshing..." : "Refresh Local from S3"}
             </button>
+            <button type="button" onClick={refreshWofConcordanceFromS3} disabled={isBusy || isRestoring || !selectedStorageId} className="rounded border border-sky-300 px-3 py-1.5 text-xs font-medium text-sky-700 disabled:opacity-40 dark:border-sky-700 dark:text-sky-200">
+                {isRefreshingWof ? "Persisting Gazetteers..." : "Persist Gazetteer Matches"}
+            </button>
             {isUploading && <button type="button" onClick={cancelUpload} className="rounded border border-amber-300 px-3 py-1.5 text-xs text-amber-800 dark:border-amber-700 dark:text-amber-200">Cancel</button>}
             {isRegenerating && <button type="button" onClick={cancelRun} className="rounded border border-amber-300 px-3 py-1.5 text-xs text-amber-800 dark:border-amber-700 dark:text-amber-200">Cancel Regeneration</button>}
             {isRefreshing && <button type="button" onClick={cancelRun} className="rounded border border-amber-300 px-3 py-1.5 text-xs text-amber-800 dark:border-amber-700 dark:text-amber-200">Cancel Refresh</button>}
+            {isRefreshingWof && <button type="button" onClick={cancelRun} className="rounded border border-amber-300 px-3 py-1.5 text-xs text-amber-800 dark:border-amber-700 dark:text-amber-200">Cancel Gazetteers</button>}
             <button type="button" onClick={clearFinishedUploads} disabled={isUploading || completedUploadCount === 0} className="rounded border border-gray-300 px-3 py-1.5 text-xs disabled:opacity-40 dark:border-slate-700">Clear Finished</button>
             <label className="flex items-center gap-2 rounded border border-gray-200 px-2 py-1.5 text-xs text-slate-700 dark:border-slate-700 dark:text-slate-200">
                 <input
@@ -1908,10 +2085,10 @@ export const EnrichmentWorkbench: React.FC = () => {
                             {restoreLabel}. Upload processing is paused until restore finishes.
                         </div>
                     )}
-                    {runProgress && (runProgress.kind === "regeneration" || runProgress.kind === "refresh") && (
+                    {runProgress && (runProgress.kind === "regeneration" || runProgress.kind === "refresh" || runProgress.kind === "wof") && (
                         <div className="rounded-md border border-indigo-100 bg-indigo-50/70 p-3 text-xs dark:border-indigo-900/70 dark:bg-indigo-950/20" role="status" aria-live="polite">
                             <div className="mb-2 flex flex-wrap items-center gap-2">
-                                <div className="font-semibold text-slate-900 dark:text-slate-100">{runProgress.kind === "refresh" ? "S3 Refresh Progress" : "Aardvark Regeneration Progress"}</div>
+                                <div className="font-semibold text-slate-900 dark:text-slate-100">{runProgress.kind === "wof" ? "Gazetteer Persistence Progress" : runProgress.kind === "refresh" ? "S3 Refresh Progress" : "Aardvark Regeneration Progress"}</div>
                                 <div className="text-slate-500 dark:text-slate-400">{runProgressPercent}%</div>
                                 <div className="ml-auto text-slate-500 dark:text-slate-400">Elapsed {runElapsedLabel}</div>
                             </div>

@@ -32,6 +32,12 @@ VITE_ENRICHMENT_PROXY_URL=http://localhost:8787
 # Optional S3 guardrails:
 # ENRICHMENT_PROXY_S3_LIST_TIMEOUT_MS=30000
 # ENRICHMENT_PROXY_MAX_LIST_PAGES=1000
+# Optional local WOF concordance:
+# ENRICHMENT_PROXY_WOF_INDEX_PATH=./.cache/gazetteers/wof/index.ndjson
+# Optional local OSM fallback concordance:
+# ENRICHMENT_PROXY_OSM_INDEX_PATH=./.cache/gazetteers/osm/index.ndjson
+# Optional local GeoNames concordance:
+# ENRICHMENT_PROXY_GEONAMES_INDEX_PATH=./.cache/gazetteers/geonames/index.ndjson
 
 OPENAI_API_KEY=...
 GOOGLE_CLOUD_VISION_API_KEY=...
@@ -71,9 +77,117 @@ Companion metadata matching is filename-based: `reno.jpg` will use `reno.xml`, `
 
 Use `Regenerate S3 Aardvark` when the extraction response and derivative assets already exist in S3 but the Aardvark-writing prompt or normalization logic has improved. The workbench scans the selected storage profile's upload directory for UUID resource folders with both `enrichment_response.json` and `aardvark.json`, re-runs only the Aardvark metadata-writing pass, overwrites the S3 `aardvark.json`, and republishes the resource plus distributions into DuckDB.
 
+Use `Persist Gazetteer Matches` after the local WOF or OSM index or matching logic changes. The workbench scans the same processed S3 upload folders, reads each existing `ai-enrichments.json` when present, recomputes the concordance layers, overwrites `ai-enrichments.json` in S3, and republishes the Aardvark record locally so the viewer keeps pointing at the persisted enrichment document. If an older processed image has `aardvark.json` and `enrichment_response.json` but no companion enrichment document yet, the proxy creates `ai-enrichments.json` first and then writes the gazetteer matches into it.
+
 Inventory sync remains available for staged S3 assets, prompt response review, and draft workflows. Prompt responses and draft provenance are kept in DuckDB/IndexedDB and in `records.duckdb` exports. Aardvark JSON exports remain clean.
 
 For shareable provenance, the project now drafts a companion `ai-enrichments.json` standard alongside `aardvark.json`. The companion document is designed to hold OpenAI/Google Vision prompts and responses, extracted map text, derived placenames, field evidence, and query-time indexing hints while keeping Aardvark focused on reviewed catalog metadata. New image-processing runs write `ai-enrichments.json` beside `aardvark.json` and preserve the exact rendered OpenAI prompts, provider, model, model parameters, request payload with binary image bytes redacted, and raw/parsed provider responses. See [OpenGeoMetadata AI Enrichments](ai-enrichments.md) and the schema at [`schemas/ai-enrichments/schema.json`](../schemas/ai-enrichments/schema.json).
+
+## Local WOF Concordance
+
+The proxy can enrich derived placenames with a local Who's On First compact index before `ai-enrichments.json` is written. It never calls a WOF API at runtime. If the configured index is missing, the proxy records a missing-index note in `extensions.wofConcordance` and leaves placenames unmodified.
+
+Download the larger source data into the ignored local cache:
+
+```bash
+cd web
+mkdir -p ./.cache/gazetteers/wof/sources
+curl -L --fail --continue-at - \
+  --output ./.cache/gazetteers/wof/sources/whosonfirst-data-admin-us-latest.db.bz2 \
+  https://data.geocode.earth/wof/dist/sqlite/whosonfirst-data-admin-us-latest.db.bz2
+curl -L --fail --continue-at - \
+  --output ./.cache/gazetteers/wof/sources/whosonfirst-data-admin-xy-latest.db.bz2 \
+  https://data.geocode.earth/wof/dist/sqlite/whosonfirst-data-admin-xy-latest.db.bz2
+bunzip2 -k ./.cache/gazetteers/wof/sources/whosonfirst-data-admin-us-latest.db.bz2
+bunzip2 -k ./.cache/gazetteers/wof/sources/whosonfirst-data-admin-xy-latest.db.bz2
+git clone --depth 1 \
+  https://github.com/whosonfirst-data/whosonfirst-data-venue-us-wa.git \
+  ./.cache/gazetteers/wof/sources/whosonfirst-data-venue-us-wa
+```
+
+Build a WA-wide reference index when you want broad local development coverage:
+
+```bash
+cd web
+npm run build:wof-index -- /path/to/whosonfirst-data-admin-us-latest.db \
+  /path/to/whosonfirst-data-admin-xy-latest.db \
+  --geojson-root /path/to/whosonfirst-data-venue-us-wa \
+  --country US \
+  --include-blank-country \
+  --bbox=-125,45,-116,50 \
+  --output ./.cache/gazetteers/wof/index-us-wa.ndjson \
+  --label wof-us-wa
+```
+
+For the Seattle proof map, point the proxy at a smaller Seattle runtime index. This keeps the full source cache available while avoiding a very large in-memory fuzzy index:
+
+```bash
+cd web
+npm run build:wof-index -- ./.cache/gazetteers/wof/sources/whosonfirst-data-admin-us-latest.db \
+  ./.cache/gazetteers/wof/sources/whosonfirst-data-admin-xy-latest.db \
+  --geojson-root ./.cache/gazetteers/wof/sources/whosonfirst-data-venue-us-wa \
+  --country US \
+  --include-blank-country \
+  --bbox=-122.46,47.48,-122.22,47.75 \
+  --output ./.cache/gazetteers/wof/index.ndjson \
+  --label wof-seattle
+```
+
+At runtime, the matcher uses existing `derivedPlacenames[]`, `textGroups[]`, and selected high-confidence `extractedMapText[]` evidence. After administrative WOF matches, it chooses the strongest WOF bbox as a local concordance boundary, such as the WOF locality bbox for `Seattle (Wash.)`. Supplemental matching then scans WOF records inside that boundary and reconciles their names against OCR text tokens and cleaned phrase evidence, which helps recover labels split across OCR boxes. It stores selected WOF hits in `gazetteerMatches[]` with WOF ids, URIs, coordinates, and reviewable candidates; ambiguous and unmatched labels keep candidates/status in `geocoding` and `extensions.wofConcordance` rather than forcing a false match.
+
+## Local OSM Concordance
+
+The proxy can also run a local OpenStreetMap fallback after WOF. It never calls OSM or Nominatim at runtime; the matcher reads `./.cache/gazetteers/osm/index.ndjson` when present. This is useful for features absent from WOF but present in OSM, such as `Meadow Point`, where OSM carries `natural=cape`, GNIS, and Wikidata tags.
+
+Build a Seattle-scoped index from Overpass into the ignored local cache:
+
+```bash
+cd web
+npm run build:osm-index -- \
+  --bbox=-122.46,47.48,-122.22,47.75 \
+  --output ./.cache/gazetteers/osm/index.ndjson \
+  --source ./.cache/gazetteers/osm/sources/seattle-overpass.json \
+  --label osm-seattle \
+  --refresh
+```
+
+The index is NDJSON with a metadata line followed by compact OSM records:
+
+```json
+{"type":"metadata","label":"osm-seattle","recordCount":1234}
+{"osmType":"node","osmId":"13436471476","name":"Meadow Point","category":"natural","type":"cape","bbox":[-122.4060444,47.6934167,-122.4059444,47.6935167],"centroid":{"lon":-122.4059944,"lat":47.6934667},"tags":{"gnis:feature_id":"1506604","natural":"cape","wikidata":"Q137714531"}}
+```
+
+OSM fills labels WOF has not already matched and also records exact/high-confidence hits for WOF-selected placenames. WOF and OSM are represented as peer entries in `gazetteerMatches[]`, so the image viewer can show both gazetteer layers on the map. OSM-only supplemental matches are stored with an OSM match entry, an id like `node/13436471476`, an OSM URI, `geocoding.candidates`, and `extensions.osmConcordance`; legacy `authority` fields remain for older consumers.
+
+## Local GeoNames Concordance
+
+GeoNames runs after WOF and OSM. It can attach direct overlaps from WOF `gn:id` concordances, match unclaimed placenames, and add supplemental OCR placenames from a local compact index. Runtime matching never calls the GeoNames web service.
+
+Build a Seattle-scoped GeoNames index from the GeoNames US dump:
+
+```bash
+cd web
+npm run build:geonames-index -- \
+  --source ./.cache/gazetteers/geonames/sources/US.zip \
+  --output ./.cache/gazetteers/geonames/index.ndjson \
+  --bbox=-122.435956,47.495514,-122.236044,47.734165 \
+  --label geonames-seattle \
+  --refresh
+```
+
+The index is NDJSON with a metadata line followed by compact GeoNames records:
+
+```json
+{"type":"metadata","label":"geonames-seattle","recordCount":1234}
+{"geonameId":"5809844","name":"Seattle","featureClass":"P","featureCode":"PPLA2","country":"US","admin1":"WA","centroid":{"lon":-122.3321,"lat":47.6062}}
+```
+
+GeoNames matches are represented as peer entries in `gazetteerMatches[]` with provider `geonames`, GeoNames ids, URIs, coordinates, feature class/code, and candidates. If WOF or OSM is already primary, GeoNames is stored as an overlap rather than replacing that authority.
+
+Each refresh also writes `extensions.gazetteerEvidenceGraph`, which connects source OCR text nodes to derived placename nodes and then to WOF/OSM/GeoNames match nodes. This keeps the concordance reviewable even when a match has no map bbox or when a WOF-selected place has secondary OSM or GeoNames overlap.
+
+The gazetteer refresh is idempotent: previously generated supplemental WOF/OSM/GeoNames placenames are removed before the refreshed concordance layers are rebuilt, so repeated persistence runs update candidates and counts without duplicating old matches.
 
 ## Geospatial Package Uploads
 

@@ -247,6 +247,53 @@ export interface RegenerateAardvarkResponse {
     proxyMilestones?: ProcessUploadedImageResponse["proxyMilestones"];
 }
 
+export interface RefreshWofConcordanceRequest {
+    jobId: string;
+    storageProfileId: string;
+    resource: ProcessedS3Resource;
+}
+
+export interface RefreshWofConcordanceResponse {
+    resourceId: string;
+    fileName: string;
+    root: string;
+    artifacts: ProcessUploadedImageResponse["artifacts"];
+    aiEnrichmentsUrl?: string;
+    createdAiEnrichments?: boolean;
+    wofConcordance?: {
+        status?: string;
+        matched?: number;
+        ambiguous?: number;
+        unmatched?: number;
+        supplementalPlacenames?: number;
+        boundarySupplementalPlacenames?: number;
+        [key: string]: unknown;
+    };
+    osmConcordance?: {
+        status?: string;
+        matched?: number;
+        ambiguous?: number;
+        unmatched?: number;
+        overlapPlacenames?: number;
+        supplementalPlacenames?: number;
+        [key: string]: unknown;
+    };
+    geonamesConcordance?: {
+        status?: string;
+        matched?: number;
+        ambiguous?: number;
+        unmatched?: number;
+        overlapPlacenames?: number;
+        supplementalPlacenames?: number;
+        directConcordancePlacenames?: number;
+        [key: string]: unknown;
+    };
+    removedSupplementalPlacenameCount?: number;
+    aardvarkJson: Record<string, unknown>;
+    distributions: Distribution[];
+    proxyMilestones?: ProcessUploadedImageResponse["proxyMilestones"];
+}
+
 export interface FetchAardvarkFromS3Request {
     storageProfileId: string;
     resource: ProcessedS3Resource;
@@ -433,6 +480,15 @@ export class EnrichmentProxyClient {
 
     async regenerateAardvark(request: RegenerateAardvarkRequest, signal?: AbortSignal): Promise<RegenerateAardvarkResponse> {
         const res = await fetchWithTimeout(`${this.baseUrl}/api/uploads/regenerate-aardvark`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: safeJsonStringify(request),
+        }, ENRICHMENT_TIMEOUT_MS, signal);
+        return parseResponse(res);
+    }
+
+    async refreshWofConcordance(request: RefreshWofConcordanceRequest, signal?: AbortSignal): Promise<RefreshWofConcordanceResponse> {
+        const res = await fetchWithTimeout(`${this.baseUrl}/api/uploads/refresh-wof-concordance`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: safeJsonStringify(request),

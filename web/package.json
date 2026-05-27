@@ -7,6 +7,9 @@
   },
   "scripts": {
     "build:db": "node ./scripts/build-db.cjs",
+    "build:wof-index": "python3 ./scripts/build-wof-index.py",
+    "build:osm-index": "node ./scripts/build-osm-index.mjs",
+    "build:geonames-index": "node ./scripts/build-geonames-index.mjs",
     "proxy": "node ./proxy/enrichment-proxy.mjs",
     "dev": "npm run build:db && vite",
     "build": "npm run build:db && vite build",

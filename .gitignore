@@ -4,6 +4,8 @@ Thumbs.db
 
 # Node.js / Web
 node_modules/
+web/.cache/
+web/public/dev-artifacts/
 dist/
 dist-ssr/
 *.local

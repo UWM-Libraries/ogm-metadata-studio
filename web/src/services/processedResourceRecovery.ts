@@ -9,13 +9,15 @@ import {
     type ProcessedS3Resource,
     type ProcessUploadedImageResponse,
     type RegenerateAardvarkResponse,
+    type RefreshWofConcordanceResponse,
 } from "./EnrichmentProxyClient";
 
 type LocalCatalogPublishResponse =
     | FetchAardvarkFromS3Response
     | ProcessUploadedImageResponse
     | ProcessGeospatialPackageResponse
-    | RegenerateAardvarkResponse;
+    | RegenerateAardvarkResponse
+    | RefreshWofConcordanceResponse;
 
 export interface LocalCatalogPublishResult {
     resource: Resource;

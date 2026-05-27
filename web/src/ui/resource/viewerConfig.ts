@@ -6,8 +6,11 @@ export interface ViewerConfig {
     endpoint: string;
     geometry?: string; // GeoJSON string
     textExtractionEndpoint?: string;
+    textExtractionFallbackEndpoint?: string;
     attributeTableEndpoint?: string;
 }
+
+const AI_ENRICHMENTS_RELATION = "https://opengeometadata.org/reference/ai-enrichments";
 
 function referenceUrl(refs: Record<string, unknown>, keys: string[]): string | undefined {
     const extract = (value: unknown): string | undefined => {
@@ -118,6 +121,42 @@ function extractionEndpointFromIiif(iiifUrl: string | undefined): string | undef
     return uploadMatch ? `${uploadMatch[1]}/enrichment_response.json` : undefined;
 }
 
+function aiEnrichmentsEndpointFromIiif(iiifUrl: string | undefined): string | undefined {
+    if (!iiifUrl) return undefined;
+    const normalized = iiifUrl.replace(/\/+$/, "");
+    const uploadMatch = normalized.match(/^(.*\/uploads\/[^/]+)\/iiif(?:\/info\.json)?$/i);
+    return uploadMatch ? `${uploadMatch[1]}/ai-enrichments.json` : undefined;
+}
+
+function aiEnrichmentsEndpointFromExtraction(extractionUrl: string | undefined): string | undefined {
+    if (!extractionUrl) return undefined;
+    try {
+        const parsed = new URL(extractionUrl);
+        if (!/\/enrichment_response\.json$/i.test(parsed.pathname)) return undefined;
+        parsed.pathname = parsed.pathname.replace(/\/enrichment_response\.json$/i, "/ai-enrichments.json");
+        return parsed.toString();
+    } catch {
+        return extractionUrl.replace(/\/enrichment_response\.json(?:([?#].*)?)$/i, "/ai-enrichments.json$1");
+    }
+}
+
+function extractionEndpointFields(args: {
+    explicitAiEndpoint?: string;
+    legacyEndpoint?: string;
+    iiifEndpoint?: string;
+}): Pick<ViewerConfig, "textExtractionEndpoint" | "textExtractionFallbackEndpoint"> {
+    const inferredAiEndpoint = args.explicitAiEndpoint
+        || aiEnrichmentsEndpointFromIiif(args.iiifEndpoint)
+        || aiEnrichmentsEndpointFromExtraction(args.legacyEndpoint);
+    const primary = inferredAiEndpoint || args.legacyEndpoint;
+    if (!primary) return {};
+    const fallback = args.legacyEndpoint && args.legacyEndpoint !== primary ? args.legacyEndpoint : undefined;
+    return {
+        textExtractionEndpoint: primary,
+        ...(fallback ? { textExtractionFallbackEndpoint: fallback } : {}),
+    };
+}
+
 // Helper: Extract Geometry (BBox to Polygon or Centroid? GBL usually expects BBox as Polygon)
 export function getViewerGeometry(resource: Resource): string | undefined {
     const parseEnvelope = (str: string): string | null => {
@@ -194,13 +233,17 @@ export function detectViewerConfig(resource: Resource, distributions: Distributi
 
     if (Object.keys(refs).length === 0) return null;
 
-    const textExtractionEndpoint = referenceUrl(refs, [
+    const explicitAiEnrichmentsEndpoint = referenceUrl(refs, [
+        AI_ENRICHMENTS_RELATION,
+        "ai-enrichments",
+        "ai_enrichments",
+    ]);
+    const legacyTextExtractionEndpoint = referenceUrl(refs, [
         "https://opengeometadata.org/reference/enrichment-response",
         "http://opengeometadata.org/reference/enrichment-response",
         "enrichment_response",
         "extraction",
     ]);
-
     // Priority Logic
     // IIIF Manifest
     const iiifManifest = referenceUrl(refs, ["http://iiif.io/api/presentation#manifest", "https://iiif.io/api/presentation#manifest", "iiif_manifest"]);
@@ -208,7 +251,10 @@ export function detectViewerConfig(resource: Resource, distributions: Distributi
         return {
             protocol: "iiif_manifest",
             endpoint: iiifManifest,
-            ...(textExtractionEndpoint ? { textExtractionEndpoint } : {}),
+            ...extractionEndpointFields({
+                explicitAiEndpoint: explicitAiEnrichmentsEndpoint,
+                legacyEndpoint: legacyTextExtractionEndpoint,
+            }),
         };
     }
 
@@ -220,7 +266,11 @@ export function detectViewerConfig(resource: Resource, distributions: Distributi
         return {
             protocol: "iiif_image",
             endpoint,
-            textExtractionEndpoint: textExtractionEndpoint || extractionEndpointFromIiif(endpoint),
+            ...extractionEndpointFields({
+                explicitAiEndpoint: explicitAiEnrichmentsEndpoint,
+                legacyEndpoint: legacyTextExtractionEndpoint || extractionEndpointFromIiif(endpoint),
+                iiifEndpoint: endpoint,
+            }),
         };
     }
 
@@ -231,7 +281,10 @@ export function detectViewerConfig(resource: Resource, distributions: Distributi
             protocol: "wms",
             endpoint: wms,
             geometry: getViewerGeometry(resource), // WMS often needs bounds/geom to focus
-            ...(textExtractionEndpoint ? { textExtractionEndpoint } : {}),
+            ...extractionEndpointFields({
+                explicitAiEndpoint: explicitAiEnrichmentsEndpoint,
+                legacyEndpoint: legacyTextExtractionEndpoint,
+            }),
         };
     }
     // XYZ Tiles
@@ -241,7 +294,10 @@ export function detectViewerConfig(resource: Resource, distributions: Distributi
             protocol: "xyz",
             endpoint: xyz,
             geometry: getViewerGeometry(resource),
-            ...(textExtractionEndpoint ? { textExtractionEndpoint } : {}),
+            ...extractionEndpointFields({
+                explicitAiEndpoint: explicitAiEnrichmentsEndpoint,
+                legacyEndpoint: legacyTextExtractionEndpoint,
+            }),
         };
     }
 
@@ -251,7 +307,10 @@ export function detectViewerConfig(resource: Resource, distributions: Distributi
             protocol: "cog",
             endpoint: cog,
             geometry: getViewerGeometry(resource),
-            ...(textExtractionEndpoint ? { textExtractionEndpoint } : {}),
+            ...extractionEndpointFields({
+                explicitAiEndpoint: explicitAiEnrichmentsEndpoint,
+                legacyEndpoint: legacyTextExtractionEndpoint,
+            }),
         };
     }
 
@@ -276,7 +335,10 @@ export function detectViewerConfig(resource: Resource, distributions: Distributi
             endpoint: pmtiles,
             geometry: getViewerGeometry(resource),
             ...(geojson ? { attributeTableEndpoint: geojson } : {}),
-            ...(textExtractionEndpoint ? { textExtractionEndpoint } : {}),
+            ...extractionEndpointFields({
+                explicitAiEndpoint: explicitAiEnrichmentsEndpoint,
+                legacyEndpoint: legacyTextExtractionEndpoint,
+            }),
         };
     }
 
@@ -287,7 +349,10 @@ export function detectViewerConfig(resource: Resource, distributions: Distributi
             endpoint: geojson,
             geometry: getViewerGeometry(resource),
             attributeTableEndpoint: geojson,
-            ...(textExtractionEndpoint ? { textExtractionEndpoint } : {}),
+            ...extractionEndpointFields({
+                explicitAiEndpoint: explicitAiEnrichmentsEndpoint,
+                legacyEndpoint: legacyTextExtractionEndpoint,
+            }),
         };
     }
 
@@ -298,7 +363,10 @@ export function detectViewerConfig(resource: Resource, distributions: Distributi
             protocol: "arcgis_feature_layer",
             endpoint: arcgisFeatureLayer,
             geometry: getViewerGeometry(resource),
-            ...(textExtractionEndpoint ? { textExtractionEndpoint } : {}),
+            ...extractionEndpointFields({
+                explicitAiEndpoint: explicitAiEnrichmentsEndpoint,
+                legacyEndpoint: legacyTextExtractionEndpoint,
+            }),
         };
     }
 
@@ -309,7 +377,10 @@ export function detectViewerConfig(resource: Resource, distributions: Distributi
             protocol: "arcgis_tiled_map_layer",
             endpoint: arcgisTiledMapLayer,
             geometry: getViewerGeometry(resource),
-            ...(textExtractionEndpoint ? { textExtractionEndpoint } : {}),
+            ...extractionEndpointFields({
+                explicitAiEndpoint: explicitAiEnrichmentsEndpoint,
+                legacyEndpoint: legacyTextExtractionEndpoint,
+            }),
         };
     }
 
@@ -320,7 +391,10 @@ export function detectViewerConfig(resource: Resource, distributions: Distributi
             protocol: "arcgis_dynamic_map_layer",
             endpoint: arcgisDynamicMapLayer,
             geometry: getViewerGeometry(resource),
-            ...(textExtractionEndpoint ? { textExtractionEndpoint } : {}),
+            ...extractionEndpointFields({
+                explicitAiEndpoint: explicitAiEnrichmentsEndpoint,
+                legacyEndpoint: legacyTextExtractionEndpoint,
+            }),
         };
     }
 
@@ -331,7 +405,10 @@ export function detectViewerConfig(resource: Resource, distributions: Distributi
             protocol: "arcgis_image_map_layer",
             endpoint: arcgisImageMapLayer,
             geometry: getViewerGeometry(resource),
-            ...(textExtractionEndpoint ? { textExtractionEndpoint } : {}),
+            ...extractionEndpointFields({
+                explicitAiEndpoint: explicitAiEnrichmentsEndpoint,
+                legacyEndpoint: legacyTextExtractionEndpoint,
+            }),
         };
     }
 
