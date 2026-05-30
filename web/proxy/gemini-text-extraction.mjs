@@ -35,6 +35,7 @@ const MAP_LABEL_ROLE_ENUM = [
   "other",
 ];
 const PROJECTED_GEOMETRY_MIN_CONFIDENCE = 0.82;
+const PROJECTED_GEOMETRY_MIN_DIMENSION = 0.0005;
 const PROJECTED_GEOMETRY_MAX_AREA = 0.08;
 const OCR_SUPPORT_CONNECTOR_TOKENS = new Set(["and", "of", "the"]);
 const NEIGHBORHOOD_ROLE_ALIASES = new Set(["neighborhood", "neighbourhood", "district", "borough", "suburb", "quarter", "macrohood", "microhood"]);
@@ -1475,8 +1476,8 @@ function projectedGeometryAccepted(label) {
   const width = bbox[2] - bbox[0];
   const height = bbox[3] - bbox[1];
   const area = width * height;
-  return width >= 0.0015
-    && height >= 0.0015
+  return width >= PROJECTED_GEOMETRY_MIN_DIMENSION
+    && height >= PROJECTED_GEOMETRY_MIN_DIMENSION
     && width <= 0.7
     && height <= 0.7
     && area <= PROJECTED_GEOMETRY_MAX_AREA;

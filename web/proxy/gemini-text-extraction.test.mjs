@@ -426,6 +426,43 @@ describe("Gemini map-label extraction fusion", () => {
     expect(merged.parsedResponse.debug.gemini_label_extraction_counts.accepted_projected_geometry_count).toBe(2);
   });
 
+  it("accepts high-confidence skinny projected geometry for dense topo labels", () => {
+    const merged = mergeGoogleVisionWithOpenAIReconciliation({
+      ocrResult: {
+        parsedResponse: {
+          text: [],
+          text_groups: [],
+          placenames: [],
+          debug: {},
+        },
+        provider: "google_cloud_vision",
+      },
+      openAIReconciliation: {
+        model: "gpt-5.4-mini",
+        derivatives: [derivative],
+        parsedResponse: {
+          labels: [
+            {
+              content: "15 MINUTE SERIES (TOPOGRAPHIC)",
+              role: "title",
+              confidence: 0.97,
+              bbox1000: [100, 100, 500, 108],
+              sourceRegionId: "ocr-source-tile-01",
+            },
+          ],
+        },
+        rawResponse: { output: [] },
+        requestBody: {},
+      },
+    });
+
+    expect(merged.parsedResponse.label_candidates[0]).toMatchObject({
+      content: "15 MINUTE SERIES (TOPOGRAPHIC)",
+      geometry_status: "model_projected",
+      candidate_status: "accepted",
+    });
+  });
+
   it("uses nearby OCR fragments as composite geometry support for merged model labels", () => {
     const merged = mergeGoogleVisionWithGeminiExtraction({
       ocrResult: {

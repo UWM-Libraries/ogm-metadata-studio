@@ -160,6 +160,43 @@ describe("text extraction overlay helpers", () => {
         expect(defaultAnnotationLayerVisibility(annotations)).toEqual({ showWof: false, showOsm: false, showGeoNames: false, showOgm: false, showCandidates: true, showExtraction: false });
     });
 
+    it("hides labels that still need geometry review", () => {
+        const annotations = normalizeTextExtractionAnnotations({
+            text: [
+                {
+                    id: "uncertain-text",
+                    content: "DATUM IS MEAN SEA LEVEL",
+                    approxBbox: [0.1, 0.1, 0.3, 0.12],
+                    confidence: 0.95,
+                    role: "marginalia",
+                    candidateStatus: "needs_review_geometry",
+                },
+            ],
+            labelCandidates: [
+                {
+                    id: "uncertain-candidate",
+                    content: "STATE OF NEVADA",
+                    role: "publication",
+                    approxBbox: [0.2, 0.2, 0.32, 0.22],
+                    confidence: 0.98,
+                    candidateStatus: "needs_review_geometry",
+                    geometryStatus: "model_projected",
+                },
+                {
+                    id: "accepted-candidate",
+                    content: "Amargosa River",
+                    role: "waterbody",
+                    approxBbox: [0.4, 0.4, 0.55, 0.43],
+                    confidence: 0.96,
+                    candidateStatus: "accepted",
+                    geometryStatus: "ocr_backed",
+                },
+            ],
+        });
+
+        expect(annotations.map((annotation) => annotation.content)).toEqual(["Amargosa River"]);
+    });
+
     it("deduplicates repeated label candidates using OCR-backed bounding boxes", () => {
         const annotations = normalizeTextExtractionAnnotations({
             labelCandidates: [
@@ -400,6 +437,36 @@ describe("text extraction overlay helpers", () => {
             sourceTextIndices: [1083],
             bbox: { x1: 0.4, y1: 0.4, x2: 0.62, y2: 0.5 },
         });
+    });
+
+    it("does not append unrelated generic labels to complete feature candidates", () => {
+        const annotations = normalizeTextExtractionAnnotations({
+            labelCandidates: [
+                {
+                    id: "amargosa-river",
+                    content: "Amargosa River",
+                    role: "waterbody",
+                    approxBbox: [0.4, 0.4, 0.55, 0.43],
+                    confidence: 0.98,
+                    geometryStatus: "ocr_backed",
+                    candidateStatus: "accepted",
+                },
+                {
+                    id: "lathrop-wells",
+                    content: "LATHROP WELLS",
+                    role: "label",
+                    approxBbox: [0.56, 0.4, 0.68, 0.43],
+                    confidence: 0.96,
+                    geometryStatus: "model_projected",
+                    candidateStatus: "accepted",
+                },
+            ],
+        });
+
+        expect(annotations.map((annotation) => annotation.content)).toEqual([
+            "Amargosa River",
+            "LATHROP WELLS",
+        ]);
     });
 
     it("drops overlapping suffix fragments before merging title labels", () => {

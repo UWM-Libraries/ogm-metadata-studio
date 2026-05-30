@@ -124,6 +124,7 @@ function looksLikeRejectedMapSymbolContent(content: string, role: string): boole
 function isRejectedTextRecord(record: Record<string, unknown>): boolean {
     const status = String(record.candidate_status || record.candidateStatus || "").toLowerCase();
     if (status.startsWith("rejected")) return true;
+    if (status === "needs_review_geometry") return true;
     const content = String(record.content || record.name || "").trim();
     if (!content) return true;
     return looksLikeRejectedMapSymbolContent(content, roleFromRecord(record));
@@ -503,7 +504,10 @@ function candidatePairShouldMerge(a: CandidateGroupItem, b: CandidateGroupItem):
     if (!candidateRoleCompatible(a, b)) return false;
     if (!candidateItemsSpatiallyAdjacent(a, b)) return false;
     const combined = [a.content, b.content].join(" ");
-    if (candidatePhraseLooksUseful(combined) && !(candidatePhraseLooksUseful(a.content) && candidatePhraseLooksUseful(b.content))) return true;
+    const aAlreadyUseful = candidatePhraseLooksUseful(a.content);
+    const bAlreadyUseful = candidatePhraseLooksUseful(b.content);
+    if (a.role !== b.role && (aAlreadyUseful || bAlreadyUseful)) return false;
+    if (candidatePhraseLooksUseful(combined) && !(aAlreadyUseful && bAlreadyUseful)) return true;
     return (isAbbreviationPhraseFragment(a.content) || isAbbreviationPhraseFragment(b.content))
         && !candidatePhraseLooksUseful(a.content)
         && !candidatePhraseLooksUseful(b.content);
