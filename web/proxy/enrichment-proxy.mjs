@@ -10,6 +10,8 @@ import { promisify } from "node:util";
 import { pipeline } from "node:stream/promises";
 import { buildWofConcordanceLayer } from "./wof-concordance.mjs";
 import { buildOsmConcordanceLayer } from "./osm-concordance.mjs";
+import { buildGeoNamesConcordanceLayer } from "./geonames-concordance.mjs";
+import { buildCanonicalConcordanceLayer } from "./canonical-concordance.mjs";
 import { refreshWofConcordanceInAiEnrichments } from "./ai-enrichments-wof-refresh.mjs";
 import { filterRejectedMapText } from "./map-text-sanity.mjs";
 import {
@@ -21,12 +23,16 @@ import {
 } from "./vision-extraction-augmentation.mjs";
 import {
   callGeminiMapLabelExtraction,
+  callKimiMapAgentSwarm,
   callOpenAIMapLabelReconciliation,
   GEMINI_LABEL_EXTRACTION_CALL_ID,
   HYBRID_GEMINI_VISION_OCR_PROVIDER,
+  HYBRID_KIMI_VISION_OCR_PROVIDER,
   HYBRID_OPENAI_VISION_OCR_PROVIDER,
+  KIMI_AGENT_SWARM_CALL_ID,
   OPENAI_LABEL_RECONCILIATION_CALL_ID,
   mergeGoogleVisionWithGeminiExtraction,
+  mergeGoogleVisionWithKimiAgentSwarm,
   mergeGoogleVisionWithOpenAIReconciliation,
   redactGeminiRequestForPersistence,
 } from "./gemini-text-extraction.mjs";
@@ -171,6 +177,16 @@ const DEFAULT_CONFIG = {
       defaultModel: "gemini-3.5-flash",
       modelParams: {},
     },
+    {
+      id: "kimi-k2-6-swarm",
+      name: "Kimi K2.6 cached map-agent swarm",
+      provider: "kimi",
+      apiKeyEnv: "MOONSHOT_API_KEY",
+      defaultModel: "kimi-k2.6",
+      modelParams: {
+        thinking: { type: "disabled" },
+      },
+    },
   ],
 };
 
@@ -268,7 +284,8 @@ function validateConfigEnvReferences(config) {
   }
   for (const profile of config.modelProfiles) {
     const provider = String(profile.provider || "openai").toLowerCase();
-    validateEnvReference(profile.apiKeyEnv, provider === "gemini" ? "Gemini API key" : "OpenAI API key");
+    const label = provider === "gemini" ? "Gemini API key" : provider === "kimi" ? "Kimi API key" : "OpenAI API key";
+    validateEnvReference(profile.apiKeyEnv, label);
   }
   for (const profile of config.visionProfiles || []) {
     validateEnvReference(profile.apiKeyEnv, "Google Cloud Vision API key");
@@ -1358,6 +1375,8 @@ function normalizedBoxCenterInside(box, container) {
 function textReconciliationTargetCrops(request = {}, provider = "gemini") {
   const providerSpecific = provider === "openai"
     ? request.openaiTextReconciliationTargetCrops ?? request.openaiTextExtractionTargetCrops
+    : provider === "kimi"
+      ? request.kimiAgentSwarmTargetCrops ?? request.kimiTextExtractionTargetCrops
     : request.geminiTextExtractionTargetCrops;
   const value = Number(
     providerSpecific
@@ -1525,8 +1544,9 @@ async function createTextReconciliationDerivatives({ buffer, contentType, assetI
 
   const derivatives = [];
   const isOpenAI = provider === "openai";
-  const cropPrefix = isOpenAI ? "openai-reconcile-crop" : "gemini-crop";
-  const cropKind = isOpenAI ? "openai_text_reconciliation_crop" : "gemini_text_crop";
+  const isKimi = provider === "kimi";
+  const cropPrefix = isOpenAI ? "openai-reconcile-crop" : isKimi ? "kimi-swarm-crop" : "gemini-crop";
+  const cropKind = isOpenAI ? "openai_text_reconciliation_crop" : isKimi ? "kimi_agent_swarm_crop" : "gemini_text_crop";
   for (const [index, tile] of selectedTiles.entries()) {
     const cropNumber = Number.isInteger(tile.selection?.originalIndex) ? tile.selection.originalIndex + 1 : index + 1;
     const cropId = `${cropPrefix}-${String(cropNumber).padStart(3, "0")}`;
@@ -1559,6 +1579,8 @@ async function createTextReconciliationDerivatives({ buffer, contentType, assetI
       tileSelection: tile.selection,
       notes: isOpenAI
         ? "OpenAI map-label reconciliation crop rendered from the original image at map-coordinate resolution."
+        : isKimi
+          ? "Kimi map-agent swarm crop rendered from the original image at map-coordinate resolution."
         : "Gemini exhaustive text extraction crop rendered from the original image at map-coordinate resolution.",
     });
   }
@@ -1571,6 +1593,29 @@ async function createGeminiTextExtractionDerivatives(args) {
 
 async function createOpenAITextReconciliationDerivatives(args) {
   return createTextReconciliationDerivatives({ ...args, provider: "openai" });
+}
+
+async function createKimiAgentSwarmDerivatives(args) {
+  return createTextReconciliationDerivatives({ ...args, provider: "kimi" });
+}
+
+async function createTextReconciliationDerivativesForProfile(modelProfile, args) {
+  if (shouldReconcileLabelsWithOpenAI(modelProfile, args.request)) {
+    return createOpenAITextReconciliationDerivatives({
+      ...args,
+      assetId: `${args.assetId}:openai-label-reconciliation`,
+    });
+  }
+  if (shouldRunKimiAgentSwarm(modelProfile, args.request)) {
+    return createKimiAgentSwarmDerivatives({
+      ...args,
+      assetId: `${args.assetId}:kimi-agent-swarm`,
+    });
+  }
+  return createGeminiTextExtractionDerivatives({
+    ...args,
+    assetId: `${args.assetId}:gemini-label-extraction`,
+  });
 }
 
 function formatBytes(bytes) {
@@ -3686,6 +3731,10 @@ function optionalExtensions(value) {
 
 function redactOpenAIRequestForPersistence(value) {
   if (Array.isArray(value)) return value.map(redactOpenAIRequestForPersistence);
+  if (typeof value === "string" && value.startsWith("data:") && value.includes(";base64,")) {
+    const mediaType = value.match(/^data:([^;]+);base64,/)?.[1] || "application/octet-stream";
+    return `data:${mediaType};base64,[redacted bytes]`;
+  }
   if (!value || typeof value !== "object") return value;
   const next = {};
   for (const [key, item] of Object.entries(value)) {
@@ -3789,8 +3838,91 @@ function sourceTextIdsForIndex(indices, textSegments) {
     .filter(Boolean);
 }
 
+function placenameIdentityKey(value) {
+  return String(value || "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/\p{Diacritic}/gu, "")
+    .replace(/\([^)]*\)/g, " ")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .replace(/\b(?:wash|washington|wa|minn|minnesota|mn|wis|wisconsin|wi|ill|illinois|il|mich|michigan|mi|ind|indiana|in|iowa|ia|ohio|oh|us|usa|united states)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function resourceSpatialPlacenameType(name) {
+  const normalized = normalizedText(name).toLowerCase();
+  if (/\bcounty\b/.test(normalized)) return "county";
+  if (/\b(?:bay|canal|channel|creek|harbor|inlet|lake|river|sound|waterway)\b/.test(normalized)) return "waterbody";
+  if (/\b(?:park|playfield|reservation|reserve)\b/.test(normalized)) return "park";
+  if (/\([^)]*(?:wash|washington|wa|minn|minnesota|mn|wis|wisconsin|wi|ill|illinois|il|mich|michigan|mi|ind|indiana|in|iowa|ia|ohio|oh)[^)]*\)/i.test(String(name || ""))) return "locality";
+  return "other";
+}
+
+function mergeAiEnrichmentPlacename(existing, candidate) {
+  const sourceTextIds = Array.from(new Set([
+    ...asStringArray(existing?.sourceTextIds),
+    ...asStringArray(candidate?.sourceTextIds),
+  ]));
+  const sourceTextIndices = Array.from(new Set([
+    ...(Array.isArray(existing?.sourceTextIndices) ? existing.sourceTextIndices : []),
+    ...(Array.isArray(candidate?.sourceTextIndices) ? candidate.sourceTextIndices : []),
+  ].map(Number).filter((index) => Number.isInteger(index) && index >= 0))).sort((a, b) => a - b);
+  const sourceCallIds = Array.from(new Set([
+    existing?.sourceCallId,
+    candidate?.sourceCallId,
+    ...asStringArray(existing?.extensions?.sourceCallIds),
+    ...asStringArray(candidate?.extensions?.sourceCallIds),
+  ].map((item) => String(item || "").trim()).filter(Boolean)));
+  const existingType = String(existing?.type || "other").toLowerCase();
+  const candidateType = String(candidate?.type || "other").toLowerCase();
+  const preferCandidateType = existingType === "other" && candidateType !== "other";
+  return withoutUndefined({
+    ...existing,
+    type: preferCandidateType ? candidate.type : existing.type,
+    sourceTextIds,
+    sourceTextIndices: sourceTextIndices.length > 0 ? sourceTextIndices : undefined,
+    approxBbox: existing?.approxBbox || candidate?.approxBbox,
+    confidence: Math.max(Number(existing?.confidence || 0), Number(candidate?.confidence || 0)) || existing?.confidence || candidate?.confidence,
+    status: existing?.status === "confirmed" ? existing.status : candidate?.status || existing?.status,
+    sourceCallId: existing?.sourceCallId || candidate?.sourceCallId,
+    reasoning: existing?.reasoning || candidate?.reasoning,
+    extensions: optionalExtensions({
+      ...(existing?.extensions || {}),
+      sourceCallIds: sourceCallIds.length > 1 ? sourceCallIds : existing?.extensions?.sourceCallIds || candidate?.extensions?.sourceCallIds,
+    }),
+  });
+}
+
+function pushAiEnrichmentPlacename(places, byIdentity, candidate) {
+  const key = placenameIdentityKey(candidate?.name);
+  if (!key) return;
+  const existingIndex = byIdentity.get(key);
+  if (existingIndex === undefined) {
+    byIdentity.set(key, places.length);
+    places.push(candidate);
+    return;
+  }
+  places[existingIndex] = mergeAiEnrichmentPlacename(places[existingIndex], candidate);
+}
+
 function derivedPlacenamesForAiEnrichments(extraction, resource, textSegments, extractionCallId, metadataCallId) {
   const places = [];
+  const byIdentity = new Map();
+  for (const name of asStringArray(resource?.dct_spatial_sm)) {
+    pushAiEnrichmentPlacename(places, byIdentity, withoutUndefined({
+      id: `place-${String(places.length + 1).padStart(4, "0")}`,
+      name,
+      normalizedName: name,
+      type: resourceSpatialPlacenameType(name),
+      sourceTextIds: [],
+      confidence: 0.82,
+      status: "confirmed",
+      sourceCallId: metadataCallId,
+      reasoning: "Pinned from the Aardvark metadata writer's spatial coverage output before visual placenames so gazetteer matching keeps catalog-level map context.",
+    }));
+  }
+
   for (const [index, place] of (Array.isArray(extraction?.placenames) ? extraction.placenames : []).entries()) {
     const name = normalizedText(place?.name);
     if (!name) continue;
@@ -3799,7 +3931,7 @@ function derivedPlacenamesForAiEnrichments(extraction, resource, textSegments, e
       : Number.isInteger(Number(place?.source_text_index)) ? [Number(place.source_text_index)] : [];
     const placeSourceCallId = place?.source_call_id || place?.sourceCallId || extractionCallId;
     const placeSourceCallIds = asStringArray(place?.source_call_ids);
-    places.push(withoutUndefined({
+    pushAiEnrichmentPlacename(places, byIdentity, withoutUndefined({
       id: `place-${String(index + 1).padStart(4, "0")}`,
       name,
       normalizedName: name,
@@ -3817,23 +3949,7 @@ function derivedPlacenamesForAiEnrichments(extraction, resource, textSegments, e
     }));
   }
 
-  const existing = new Set(places.map((place) => place.normalizedName.toLowerCase()));
-  for (const name of asStringArray(resource?.dct_spatial_sm)) {
-    if (existing.has(name.toLowerCase())) continue;
-    existing.add(name.toLowerCase());
-    places.push(withoutUndefined({
-      id: `place-${String(places.length + 1).padStart(4, "0")}`,
-      name,
-      normalizedName: name,
-      type: "other",
-      sourceTextIds: [],
-      confidence: 0.75,
-      status: "confirmed",
-      sourceCallId: metadataCallId,
-      reasoning: "Derived from the Aardvark metadata writer's spatial coverage output.",
-    }));
-  }
-  return places;
+  return places.map((place, index) => ({ ...place, id: `place-${String(index + 1).padStart(4, "0")}` }));
 }
 
 function aiEnrichmentLink(url, label, mediaType) {
@@ -3991,6 +4107,94 @@ function geminiApiCallRecord({ id, sequence, purpose, call, parsedResponse, sour
   });
 }
 
+function kimiPromptRecord({ id, label, purpose, call }) {
+  if (!call?.systemPrompt && !call?.userPrompt) return null;
+  return withoutUndefined({
+    id,
+    label,
+    purpose,
+    provider: "kimi",
+    model: call.model,
+    renderedAt: safeDateTime(call.completedAt) || new Date().toISOString(),
+    systemPrompt: call.systemPrompt,
+    userPrompt: call.userPrompt,
+    messages: [
+      call.systemPrompt ? { role: "system", content: call.systemPrompt } : null,
+      call.userPrompt ? { role: "user", content: call.userPrompt } : null,
+    ].filter(Boolean),
+    outputSchema: call.requestBody?.response_format?.json_schema?.schema,
+    variables: call.variables,
+    sourceCallId: call.id,
+    checksum: {
+      algorithm: "SHA-256",
+      value: promptChecksum(call.systemPrompt, call.userPrompt),
+      purpose: "Checksum of the exact rendered Kimi prompt text persisted in this AI Enrichments record.",
+    },
+    extensions: optionalExtensions({
+      promptCacheKeys: call.parsedResponse?.cropStatuses?.map((status) => status?.promptCacheKey).filter(Boolean),
+      responseCacheHitCount: call.parsedResponse?.extractionStatus?.responseCacheHitCount,
+    }),
+  });
+}
+
+function kimiModelParamsForCall(call) {
+  const body = call?.requestBody;
+  if (!body) return undefined;
+  if (Array.isArray(body.cropRequests)) {
+    return withoutUndefined({
+      strategy: body.strategy,
+      ...(body.modelParams || {}),
+    });
+  }
+  return Object.fromEntries(Object.entries(body).filter(([key]) => !["model", "messages", "response_format"].includes(key)));
+}
+
+function kimiApiCallRecord({ id, sequence, purpose, call, parsedResponse, sourceAssetIds = [] }) {
+  if (!call?.requestBody && !call?.rawResponse) return null;
+  return withoutUndefined({
+    id,
+    sequence,
+    provider: "kimi",
+    service: "chat/completions",
+    endpoint: "https://api.moonshot.ai/v1/chat/completions",
+    method: "POST",
+    purpose,
+    model: call.model || call.requestBody?.model,
+    modelParams: kimiModelParamsForCall(call),
+    promptIds: call.promptId ? [call.promptId] : undefined,
+    sourceAssetIds,
+    completedAt: safeDateTime(call.completedAt) || new Date().toISOString(),
+    status: call.error ? "failed" : "completed",
+    request: {
+      promptIds: call.promptId ? [call.promptId] : undefined,
+      systemPrompt: call.systemPrompt,
+      userPrompt: call.userPrompt,
+      messages: [
+        call.systemPrompt ? { role: "system", content: call.systemPrompt } : null,
+        call.userPrompt ? { role: "user", content: call.userPrompt } : null,
+      ].filter(Boolean),
+      outputSchema: call.requestBody?.response_format?.json_schema?.schema,
+      payload: {
+        rawJson: redactOpenAIRequestForPersistence(call.requestBody),
+        redacted: true,
+        redactionNotes: "Inline image bytes and credentials are not persisted; rendered text prompts, cache keys, and response-cache status are preserved.",
+      },
+      redactions: ["api_key", "image_url_base64"],
+    },
+    response: {
+      raw: call.rawResponse ? { rawJson: call.rawResponse, redacted: false } : undefined,
+      parsed: parsedResponse ? { rawJson: parsedResponse, redacted: false } : undefined,
+      usage: call.usage,
+      error: call.error,
+    },
+    error: call.error,
+    extensions: optionalExtensions({
+      responseCacheHitCount: call.parsedResponse?.extractionStatus?.responseCacheHitCount,
+      cachedTokens: call.usage?.cached_tokens,
+    }),
+  });
+}
+
 function ocrApiCallRecord({ result, completedAt }) {
   return withoutUndefined({
     id: "call-google-vision-ocr",
@@ -4107,14 +4311,17 @@ function buildAiEnrichmentsForImage(args) {
   const isHybridVisionOcr = extractionResult?.provider === HYBRID_VISION_OCR_PROVIDER;
   const isGeminiHybridVisionOcr = extractionResult?.provider === HYBRID_GEMINI_VISION_OCR_PROVIDER;
   const isOpenAIHybridVisionOcr = extractionResult?.provider === HYBRID_OPENAI_VISION_OCR_PROVIDER;
-  const ocrExtractionResult = (isHybridVisionOcr || isGeminiHybridVisionOcr || isOpenAIHybridVisionOcr) ? extractionResult?.ocrResult : extractionResult?.provider === "google_cloud_vision" ? extractionResult : null;
+  const isKimiHybridVisionOcr = extractionResult?.provider === HYBRID_KIMI_VISION_OCR_PROVIDER;
+  const ocrExtractionResult = (isHybridVisionOcr || isGeminiHybridVisionOcr || isOpenAIHybridVisionOcr || isKimiHybridVisionOcr) ? extractionResult?.ocrResult : extractionResult?.provider === "google_cloud_vision" ? extractionResult : null;
   const extractionCallId = isOpenAiExtraction
     ? "call-openai-historical-map-extraction"
     : isGeminiHybridVisionOcr
       ? GEMINI_LABEL_EXTRACTION_CALL_ID
       : isOpenAIHybridVisionOcr
         ? OPENAI_LABEL_RECONCILIATION_CALL_ID
-        : GOOGLE_VISION_OCR_CALL_ID;
+        : isKimiHybridVisionOcr
+          ? KIMI_AGENT_SWARM_CALL_ID
+          : GOOGLE_VISION_OCR_CALL_ID;
   const textSegments = extractionTextSegments(extraction, extractionCallId);
   const textGroups = extractionTextGroups(extraction, textSegments, extractionCallId);
   const metadataCall = metadataWriter ? {
@@ -4182,7 +4389,22 @@ function buildAiEnrichmentsForImage(args) {
       ocrPlacenameCount: extractionResult.ocrResult?.parsedResponse?.placenames?.length || 0,
     },
   } : null;
-  const metadataSequence = (visionAugmentationCall || geminiLabelExtractionCall || openAIReconciliationCall) ? 3 : 2;
+  const kimiSwarmCall = extractionResult?.kimiSwarm ? {
+    ...extractionResult.kimiSwarm,
+    id: KIMI_AGENT_SWARM_CALL_ID,
+    promptId: "prompt-kimi-map-agent-swarm",
+    completedAt: createdAt,
+    variables: {
+      resourceId,
+      fileName,
+      checksum,
+      artifactUrls: artifacts,
+      ocrTextCount: extractionResult.ocrResult?.parsedResponse?.text?.length || 0,
+      ocrTextGroupCount: extractionResult.ocrResult?.parsedResponse?.text_groups?.length || 0,
+      ocrPlacenameCount: extractionResult.ocrResult?.parsedResponse?.placenames?.length || 0,
+    },
+  } : null;
+  const metadataSequence = (visionAugmentationCall || geminiLabelExtractionCall || openAIReconciliationCall || kimiSwarmCall) ? 3 : 2;
   const mapExtent = mapExtentForAiEnrichments(extraction, extractionCallId);
   const basePlacenames = derivedPlacenamesForAiEnrichments(extraction, resource, textSegments, extractionCallId, "call-openai-aardvark-metadata-writer");
   const skipConcordance = AI_ENRICHMENTS_CONCORDANCE_PLACENAME_LIMIT > 0
@@ -4216,7 +4438,29 @@ function buildAiEnrichmentsForImage(args) {
       mapExtent,
       boundary: wofConcordance.extension?.boundary,
     });
-  const placenames = osmConcordance.placenames;
+  const geonamesConcordance = skipConcordance
+    ? { placenames: osmConcordance.placenames, extension: skippedConcordanceExtension }
+    : buildGeoNamesConcordanceLayer({
+      placenames: osmConcordance.placenames,
+      textGroups,
+      textSegments,
+      extraction,
+      resource,
+      mapExtent,
+      boundary: wofConcordance.extension?.boundary,
+    });
+  const canonicalConcordance = skipConcordance
+    ? { placenames: geonamesConcordance.placenames, extension: skippedConcordanceExtension }
+    : buildCanonicalConcordanceLayer({
+      placenames: geonamesConcordance.placenames,
+      textGroups,
+      textSegments,
+      extraction,
+      resource,
+      mapExtent,
+      boundary: wofConcordance.extension?.boundary,
+    });
+  const placenames = canonicalConcordance.placenames;
   const apiCalls = [
     ocrExtractionResult ? ocrApiCallRecord({ result: ocrExtractionResult, completedAt: createdAt }) : null,
     extractionOpenAiCall ? openAiApiCallRecord({
@@ -4249,6 +4493,14 @@ function buildAiEnrichmentsForImage(args) {
       purpose: "map_text_extraction",
       call: openAIReconciliationCall,
       parsedResponse: openAIReconciliationCall.parsedResponse,
+      sourceAssetIds: ["source-original-image", ...derivativeSummaries.map((derivative) => derivative.id).filter(Boolean)],
+    }) : null,
+    kimiSwarmCall ? kimiApiCallRecord({
+      id: KIMI_AGENT_SWARM_CALL_ID,
+      sequence: 2,
+      purpose: "map_text_extraction",
+      call: kimiSwarmCall,
+      parsedResponse: kimiSwarmCall.parsedResponse,
       sourceAssetIds: ["source-original-image", ...derivativeSummaries.map((derivative) => derivative.id).filter(Boolean)],
     }) : null,
     metadataCall ? openAiApiCallRecord({
@@ -4284,6 +4536,12 @@ function buildAiEnrichmentsForImage(args) {
       label: "OpenAI map-label reconciliation after OCR",
       purpose: "map_text_extraction",
       call: openAIReconciliationCall,
+    }) : null,
+    kimiSwarmCall ? kimiPromptRecord({
+      id: "prompt-kimi-map-agent-swarm",
+      label: "Kimi K2.6 cached map-agent swarm after OCR",
+      purpose: "map_text_extraction",
+      call: kimiSwarmCall,
     }) : null,
     metadataCall ? openAiPromptRecord({
       id: "prompt-openai-aardvark-metadata-writer",
@@ -4408,9 +4666,13 @@ function buildAiEnrichmentsForImage(args) {
     extensions: optionalExtensions({
       wofConcordance: wofConcordance.extension,
       osmConcordance: osmConcordance.extension,
+      geonamesConcordance: geonamesConcordance.extension,
+      canonicalGazetteer: canonicalConcordance.extension,
+      kimiSwarm: extraction?.kimi_swarm,
       textExtractionGraph: (Array.isArray(extraction?.text_extraction_runs) || Array.isArray(extraction?.label_candidates)) ? withoutUndefined({
         textExtractionRuns: extraction?.text_extraction_runs,
         labelCandidates: extraction?.label_candidates,
+        kimiSwarmClaims: extraction?.kimi_swarm?.claims,
       }) : undefined,
     }),
   });
@@ -6697,26 +6959,17 @@ async function processUploadedImage(config, body) {
         if (shouldRunTextReconciliation(textExtractionModelProfile, body)) {
           const providerLabel = textReconciliationProviderLabel(textExtractionModelProfile);
           log(`${providerLabel} map-label reconciliation crop generation started`);
-          const derivatives = shouldReconcileLabelsWithOpenAI(textExtractionModelProfile, body)
-            ? await createOpenAITextReconciliationDerivatives({
-              buffer,
-              contentType,
-              assetId: `${storageProfile.id}:${storageProfile.bucket}/${keys.original}:openai-label-reconciliation`,
-              visionSources,
-              ocrExtraction: result.parsedResponse,
-              request: body,
-            })
-            : await createGeminiTextExtractionDerivatives({
-              buffer,
-              contentType,
-              assetId: `${storageProfile.id}:${storageProfile.bucket}/${keys.original}:gemini-label-extraction`,
-              visionSources,
-              ocrExtraction: result.parsedResponse,
-              request: body,
-            });
+          const derivatives = await createTextReconciliationDerivativesForProfile(textExtractionModelProfile, {
+            buffer,
+            contentType,
+            assetId: `${storageProfile.id}:${storageProfile.bucket}/${keys.original}`,
+            visionSources,
+            ocrExtraction: result.parsedResponse,
+            request: body,
+          });
           log(`${providerLabel} map-label reconciliation derivatives ready`, { count: derivatives.length, bytes: derivatives.reduce((sum, derivative) => sum + Number(derivative.bytes || 0), 0) });
           const augmented = await maybeAugmentGoogleVisionOcrWithTextReconciliation({ modelProfile: textExtractionModelProfile, request: body, derivatives, ocrResult: result, log });
-          if ([HYBRID_GEMINI_VISION_OCR_PROVIDER, HYBRID_OPENAI_VISION_OCR_PROVIDER].includes(augmented.provider)) {
+          if ([HYBRID_GEMINI_VISION_OCR_PROVIDER, HYBRID_OPENAI_VISION_OCR_PROVIDER, HYBRID_KIMI_VISION_OCR_PROVIDER].includes(augmented.provider)) {
             derivativeSummaries = derivatives.map(({ dataUri, ...derivative }) => derivative);
           }
           return augmented;
@@ -7055,26 +7308,17 @@ async function refreshOcrForS3ImageResource(config, body) {
   if (shouldRunTextReconciliation(textExtractionModelProfile, body)) {
     const providerLabel = textReconciliationProviderLabel(textExtractionModelProfile);
     log(`${providerLabel} map-label reconciliation crop generation started`);
-    const derivatives = shouldReconcileLabelsWithOpenAI(textExtractionModelProfile, body)
-      ? await createOpenAITextReconciliationDerivatives({
-        buffer,
-        contentType,
-        assetId: `${storageProfile.id}:${storageProfile.bucket}/${keys.original}:openai-label-reconciliation`,
-        visionSources,
-        ocrExtraction: extractionResult.parsedResponse,
-        request: body,
-      })
-      : await createGeminiTextExtractionDerivatives({
-        buffer,
-        contentType,
-        assetId: `${storageProfile.id}:${storageProfile.bucket}/${keys.original}:gemini-label-extraction`,
-        visionSources,
-        ocrExtraction: extractionResult.parsedResponse,
-        request: body,
-      });
+    const derivatives = await createTextReconciliationDerivativesForProfile(textExtractionModelProfile, {
+      buffer,
+      contentType,
+      assetId: `${storageProfile.id}:${storageProfile.bucket}/${keys.original}`,
+      visionSources,
+      ocrExtraction: extractionResult.parsedResponse,
+      request: body,
+    });
     log(`${providerLabel} map-label reconciliation derivatives ready`, { count: derivatives.length, bytes: derivatives.reduce((sum, derivative) => sum + Number(derivative.bytes || 0), 0) });
     extractionResult = await maybeAugmentGoogleVisionOcrWithTextReconciliation({ modelProfile: textExtractionModelProfile, request: body, derivatives, ocrResult: extractionResult, log });
-    if ([HYBRID_GEMINI_VISION_OCR_PROVIDER, HYBRID_OPENAI_VISION_OCR_PROVIDER].includes(extractionResult.provider)) {
+    if ([HYBRID_GEMINI_VISION_OCR_PROVIDER, HYBRID_OPENAI_VISION_OCR_PROVIDER, HYBRID_KIMI_VISION_OCR_PROVIDER].includes(extractionResult.provider)) {
       derivativeSummaries = derivatives.map(({ dataUri, ...derivative }) => derivative);
     }
   } else if (shouldAugmentOcrWithOpenAIVision(modelProfile, body)) {
@@ -7568,9 +7812,19 @@ function shouldReconcileLabelsWithOpenAI(modelProfile, request) {
   );
 }
 
+function shouldRunKimiAgentSwarm(modelProfile, request) {
+  return Boolean(
+    modelProfile
+    && String(modelProfile.provider || "").toLowerCase() === "kimi"
+    && request?.kimiAgentSwarm !== false
+    && request?.textExtractionModelProfileId,
+  );
+}
+
 function shouldRunTextReconciliation(modelProfile, request) {
   return shouldExtractLabelsWithGemini(modelProfile, request)
-    || shouldReconcileLabelsWithOpenAI(modelProfile, request);
+    || shouldReconcileLabelsWithOpenAI(modelProfile, request)
+    || shouldRunKimiAgentSwarm(modelProfile, request);
 }
 
 function resolveGeminiApiKey(modelProfile) {
@@ -7584,8 +7838,22 @@ function resolveGeminiApiKey(modelProfile) {
   return resolveEnv(modelProfile?.apiKeyEnv || "GEMINI_API_KEY", "Gemini API key");
 }
 
+function resolveKimiApiKey(modelProfile) {
+  const primary = resolveOptionalEnv(modelProfile?.apiKeyEnv, "Kimi API key");
+  if (primary) return primary;
+  for (const fallbackName of ["MOONSHOT_API_KEY", "KIMI_API_KEY", "KIMI_OPEN_PLATFORM_API_KEY"]) {
+    if (fallbackName === modelProfile?.apiKeyEnv) continue;
+    const fallback = resolveOptionalEnv(fallbackName, "Kimi API key");
+    if (fallback) return fallback;
+  }
+  return resolveEnv(modelProfile?.apiKeyEnv || "MOONSHOT_API_KEY", "Kimi API key");
+}
+
 function textReconciliationProviderLabel(modelProfile) {
-  return String(modelProfile?.provider || "openai").toLowerCase() === "gemini" ? "Gemini" : "OpenAI";
+  const provider = String(modelProfile?.provider || "openai").toLowerCase();
+  if (provider === "gemini") return "Gemini";
+  if (provider === "kimi") return "Kimi";
+  return "OpenAI";
 }
 
 async function maybeAugmentGoogleVisionOcrWithGemini({ modelProfile, request, derivatives, ocrResult, log = () => undefined }) {
@@ -7660,12 +7928,54 @@ async function maybeReconcileGoogleVisionOcrWithOpenAI({ modelProfile, request, 
   }
 }
 
+async function maybeAugmentGoogleVisionOcrWithKimi({ modelProfile, request, derivatives, ocrResult, log = () => undefined }) {
+  if (!shouldRunKimiAgentSwarm(modelProfile, request)) return ocrResult;
+  try {
+    log("Kimi map-agent swarm request started", { model: request?.kimiAgentSwarmModel || request?.textExtractionModel || modelProfile.defaultModel, derivatives: derivatives.length });
+    const apiKey = resolveKimiApiKey(modelProfile);
+    const kimiSwarm = await callKimiMapAgentSwarm({
+      modelProfile,
+      request,
+      derivatives,
+      ocrExtraction: ocrResult?.parsedResponse,
+      apiKey,
+      log,
+    });
+    const hybrid = mergeGoogleVisionWithKimiAgentSwarm({ ocrResult, kimiSwarm });
+    log("Kimi map-agent swarm response received", {
+      labels: kimiSwarm.parsedResponse?.labels?.length || 0,
+      claims: kimiSwarm.parsedResponse?.claims?.length || 0,
+      agents: kimiSwarm.parsedResponse?.agents?.length || 0,
+      addedTextSegments: hybrid.parsedResponse?.text_grouping_summary?.kimi_swarm_added_text_count || 0,
+      responseCacheHitCount: kimiSwarm.parsedResponse?.extractionStatus?.responseCacheHitCount || 0,
+      cachedTokens: kimiSwarm.usage?.cached_tokens,
+    });
+    return hybrid;
+  } catch (error) {
+    const message = error.message || String(error);
+    log("Kimi map-agent swarm failed; preserving Google Vision OCR", { error: message });
+    return {
+      ...ocrResult,
+      parsedResponse: {
+        ...(ocrResult?.parsedResponse || {}),
+        debug: {
+          ...(ocrResult?.parsedResponse?.debug || {}),
+          kimi_agent_swarm_error: message,
+        },
+      },
+    };
+  }
+}
+
 async function maybeAugmentGoogleVisionOcrWithTextReconciliation(args) {
   if (shouldExtractLabelsWithGemini(args.modelProfile, args.request)) {
     return maybeAugmentGoogleVisionOcrWithGemini(args);
   }
   if (shouldReconcileLabelsWithOpenAI(args.modelProfile, args.request)) {
     return maybeReconcileGoogleVisionOcrWithOpenAI(args);
+  }
+  if (shouldRunKimiAgentSwarm(args.modelProfile, args.request)) {
+    return maybeAugmentGoogleVisionOcrWithKimi(args);
   }
   return args.ocrResult;
 }
@@ -7765,8 +8075,10 @@ async function route(req, res) {
     const profile = findProfile(config, "model", body.profileId);
     const provider = String(profile.provider || "openai").toLowerCase();
     if (provider === "gemini") resolveGeminiApiKey(profile);
+    else if (provider === "kimi") resolveKimiApiKey(profile);
     else resolveEnv(profile.apiKeyEnv, "OpenAI API key");
-    return send(res, 200, { ok: true, message: provider === "gemini" ? `Gemini profile '${profile.name}' can resolve Gemini API credentials.` : `OpenAI profile '${profile.name}' can resolve ${profile.apiKeyEnv}.` });
+    const label = provider === "gemini" ? "Gemini" : provider === "kimi" ? "Kimi" : "OpenAI";
+    return send(res, 200, { ok: true, message: `${label} profile '${profile.name}' can resolve ${provider === "kimi" ? "Kimi API credentials" : provider === "gemini" ? "Gemini API credentials" : profile.apiKeyEnv}.` });
   }
   if (req.method === "POST" && url.pathname === "/api/config/test-vision") {
     const body = await readJson(req);
@@ -7825,23 +8137,14 @@ async function route(req, res) {
         const sources = await createVisionOcrSources(buffer, body.asset?.content_type || contentTypeForKey(objectKey));
         const vision = await callGoogleVisionOcr(visionProfile, sources);
         if (shouldRunTextReconciliation(textExtractionModelProfile, body)) {
-          const derivatives = shouldReconcileLabelsWithOpenAI(textExtractionModelProfile, body)
-            ? await createOpenAITextReconciliationDerivatives({
-              buffer,
-              contentType: body.asset?.content_type || contentTypeForKey(objectKey),
-              assetId: `${storageProfile.id}:${storageProfile.bucket}/${body.asset.object_key}:openai-label-reconciliation`,
-              visionSources: sources,
-              ocrExtraction: vision.parsedResponse,
-              request: body,
-            })
-            : await createGeminiTextExtractionDerivatives({
-              buffer,
-              contentType: body.asset?.content_type || contentTypeForKey(objectKey),
-              assetId: `${storageProfile.id}:${storageProfile.bucket}/${body.asset.object_key}:gemini-label-extraction`,
-              visionSources: sources,
-              ocrExtraction: vision.parsedResponse,
-              request: body,
-            });
+          const derivatives = await createTextReconciliationDerivativesForProfile(textExtractionModelProfile, {
+            buffer,
+            contentType: body.asset?.content_type || contentTypeForKey(objectKey),
+            assetId: `${storageProfile.id}:${storageProfile.bucket}/${body.asset.object_key}`,
+            visionSources: sources,
+            ocrExtraction: vision.parsedResponse,
+            request: body,
+          });
           const augmented = await maybeAugmentGoogleVisionOcrWithTextReconciliation({
             modelProfile: textExtractionModelProfile,
             request: body,
@@ -7867,7 +8170,7 @@ async function route(req, res) {
         });
         return send(res, 200, { ...augmented, derivatives });
       } catch (error) {
-        throw new Error(`Google Cloud Vision/Gemini/OpenAI vision extraction failed for ${objectKey}: ${error.message || String(error)}`);
+        throw new Error(`Google Cloud Vision/Gemini/OpenAI/Kimi vision extraction failed for ${objectKey}: ${error.message || String(error)}`);
       }
     }
     let derivatives;

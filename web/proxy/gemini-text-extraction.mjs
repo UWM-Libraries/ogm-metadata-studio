@@ -1,16 +1,26 @@
+import crypto from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { filterRejectedMapText } from "./map-text-sanity.mjs";
 
 export const GEMINI_LABEL_EXTRACTION_CALL_ID = "call-gemini-map-label-extraction";
 export const HYBRID_GEMINI_VISION_OCR_PROVIDER = "hybrid_google_vision_gemini_text_extraction";
 export const OPENAI_LABEL_RECONCILIATION_CALL_ID = "call-openai-map-label-reconciliation";
 export const HYBRID_OPENAI_VISION_OCR_PROVIDER = "hybrid_google_vision_openai_text_reconciliation";
+export const KIMI_AGENT_SWARM_CALL_ID = "call-kimi-map-agent-swarm";
+export const HYBRID_KIMI_VISION_OCR_PROVIDER = "hybrid_google_vision_kimi_agent_swarm";
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const GEMINI_GENERATE_CONTENT_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models";
 const GEMINI_DEFAULT_MODEL = "gemini-3.5-flash";
 const GEMINI_EXHAUSTIVE_CROP_STRATEGY = "per_crop_exhaustive_map_text_v2";
 const OPENAI_RESPONSES_ENDPOINT = "https://api.openai.com/v1/responses";
 const OPENAI_TEXT_RECONCILIATION_DEFAULT_MODEL = "gpt-5.4-mini";
 const OPENAI_TEXT_RECONCILIATION_STRATEGY = "per_crop_openai_map_label_reconciliation_v1";
+const KIMI_CHAT_COMPLETIONS_ENDPOINT = "https://api.moonshot.ai/v1/chat/completions";
+const KIMI_DEFAULT_MODEL = "kimi-k2.6";
+const KIMI_AGENT_SWARM_STRATEGY = "per_crop_kimi_agent_swarm_cached_v1";
 const MAP_LABEL_ROLE_ENUM = [
   "title",
   "publication",
@@ -43,7 +53,73 @@ const EXPLICIT_WATERBODY_LABEL_RE = /\b(?:bay|canal|channel|creek|harbo[u]?r|inl
 const TOPOGRAPHIC_LANDFORM_LABEL_RE = /\b(?:arroyo|basin|bench|bluff|butte|canyon|cliff|divide|flat|flats|gap|gulch|hill|hills|mesa|mount|mountain|mt\.?|narrows|peak|peaks|range|ridge|slope|summit|valley|wash)\b/i;
 const TOPOGRAPHIC_ELEVATION_LABEL_RE = /^(?:\+|x|bm|b\.m\.|bench\s*mark|spot\s*elev(?:ation)?\.?)?\s*\d{2,5}(?:\s*(?:ft|feet|m|meters?))?$/i;
 const PROTECTED_ROLE_SET = new Set(["coordinate", "scale", "legend", "title", "publication", "publisher", "date", "grid", "marginalia"]);
-const TOPOGRAPHIC_DERIVED_PLACENAME_TYPES = new Set(["landform", "landmark", "neighborhood", "park", "railroad", "street", "waterbody"]);
+const TOPOGRAPHIC_DERIVED_PLACENAME_TYPES = new Set(["landform", "landmark", "neighborhood", "park", "railroad", "waterbody"]);
+const METADATA_GRADE_DERIVED_PLACENAME_TYPES = new Set(["landform", "landmark", "neighborhood", "park", "railroad", "waterbody"]);
+const GENERIC_SINGLE_PLACENAME_FRAGMENTS = new Set([
+  "air",
+  "airport",
+  "bay",
+  "bluff",
+  "canal",
+  "cemetery",
+  "club",
+  "cove",
+  "dock",
+  "east",
+  "ferry",
+  "field",
+  "fort",
+  "golf",
+  "green",
+  "harbor",
+  "hill",
+  "island",
+  "lake",
+  "line",
+  "links",
+  "mary",
+  "north",
+  "park",
+  "point",
+  "port",
+  "puget",
+  "railroad",
+  "reservoir",
+  "river",
+  "sound",
+  "south",
+  "station",
+  "terminal",
+  "union",
+  "waterway",
+  "west",
+]);
+const LANDMARK_FEATURE_CUE_RE = /\b(?:air\s*station|airport|bridge|cem(?:etery)?|church|club|college|dock|ferry|field|golf|hospital|light\s*house|lighthouse|links|mill|naval|park|plant|port|school|stadium|station|terminal|university|warehouse|works|yard)\b/i;
+const GENERIC_LANDMARK_LABELS = new Set([
+  "air station",
+  "golf links",
+  "light house",
+  "naval air station",
+  "yacht club",
+]);
+const KIMI_SWARM_AGENT_IDS = [
+  "map_collar_layout_segmentation",
+  "title_date_publisher_extraction",
+  "legend_symbology_subject",
+  "scale_projection_coordinates",
+  "map_body_metadata_text_split",
+  "ocr_confidence_repair",
+  "spatial_text_clustering",
+  "false_positive_suppression",
+  "coverage_extent",
+  "temporal_coverage",
+  "subject_keyword",
+  "language_script",
+  "collection_context",
+  "aardvark_validation",
+  "human_review_packet",
+  "provenance_evidence_ledger",
+];
 
 function asArray(value) {
   return Array.isArray(value) ? value : [];
@@ -51,6 +127,10 @@ function asArray(value) {
 
 function withoutUndefined(value) {
   return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined));
+}
+
+function sha256Text(value) {
+  return crypto.createHash("sha256").update(String(value || "")).digest("hex");
 }
 
 function clampedConfidence(value, fallback = undefined) {
@@ -94,6 +174,10 @@ function sanitizeOpenAIModelName(value) {
   return String(value || OPENAI_TEXT_RECONCILIATION_DEFAULT_MODEL).trim() || OPENAI_TEXT_RECONCILIATION_DEFAULT_MODEL;
 }
 
+function sanitizeKimiModelName(value) {
+  return String(value || KIMI_DEFAULT_MODEL).trim() || KIMI_DEFAULT_MODEL;
+}
+
 function extractGeminiResponseText(rawResponse) {
   const parts = [];
   for (const candidate of rawResponse?.candidates || []) {
@@ -113,6 +197,19 @@ function extractOpenAIResponseText(rawResponse) {
     }
   }
   return parts.join("\n").trim();
+}
+
+function extractKimiResponseText(rawResponse) {
+  const content = rawResponse?.choices?.[0]?.message?.content;
+  if (typeof content === "string") return content.trim();
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => typeof part?.text === "string" ? part.text : "")
+      .filter(Boolean)
+      .join("\n")
+      .trim();
+  }
+  return "";
 }
 
 function salvageLabelsFromMalformedJson(source, providerName) {
@@ -212,6 +309,10 @@ export function parseOpenAIMapLabelJson(text, rawResponse) {
   return parseMapLabelJson(text, rawResponse, "OpenAI");
 }
 
+export function parseKimiAgentSwarmJson(text, rawResponse) {
+  return parseMapLabelJson(text, rawResponse, "Kimi");
+}
+
 export const GEMINI_LABEL_EXTRACTION_SCHEMA = {
   type: "object",
   properties: {
@@ -291,6 +392,106 @@ export const GEMINI_LABEL_EXTRACTION_SCHEMA = {
 
 export const OPENAI_LABEL_RECONCILIATION_SCHEMA = GEMINI_LABEL_EXTRACTION_SCHEMA;
 
+export const KIMI_AGENT_SWARM_SCHEMA = {
+  type: "object",
+  properties: {
+    labels: GEMINI_LABEL_EXTRACTION_SCHEMA.properties.labels,
+    claims: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          agentId: {
+            type: "string",
+            enum: KIMI_SWARM_AGENT_IDS,
+          },
+          field: { type: "string" },
+          value: {},
+          confidence: { type: "number" },
+          evidence: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                type: { type: "string" },
+                text: { type: "string" },
+                sourceRegionId: { type: "string" },
+                imageRegion: {
+                  type: "array",
+                  items: { type: "number" },
+                },
+                sourceTextIndices: {
+                  type: "array",
+                  items: { type: "number" },
+                },
+                sourceTextIds: {
+                  type: "array",
+                  items: { type: "string" },
+                },
+                source: { type: "string" },
+                id: { type: "string" },
+                note: { type: "string" },
+              },
+            },
+          },
+          warnings: {
+            type: "array",
+            items: { type: "string" },
+          },
+        },
+        required: ["agentId", "field", "value", "confidence", "evidence"],
+      },
+    },
+    agents: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          id: {
+            type: "string",
+            enum: KIMI_SWARM_AGENT_IDS,
+          },
+          status: {
+            type: "string",
+            enum: ["completed", "skipped", "needs_more_evidence"],
+          },
+          confidence: { type: "number" },
+          notes: { type: "string" },
+          claimCount: { type: "number" },
+        },
+        required: ["id", "status"],
+      },
+    },
+    routing: {
+      type: "object",
+      properties: {
+        strategy: { type: "string" },
+        ranAgentIds: {
+          type: "array",
+          items: {
+            type: "string",
+            enum: KIMI_SWARM_AGENT_IDS,
+          },
+        },
+        skippedAgentIds: {
+          type: "array",
+          items: {
+            type: "string",
+            enum: KIMI_SWARM_AGENT_IDS,
+          },
+        },
+        escalationReasons: {
+          type: "array",
+          items: { type: "string" },
+        },
+        cacheKey: { type: "string" },
+      },
+    },
+    extractionStatus: GEMINI_LABEL_EXTRACTION_SCHEMA.properties.extractionStatus,
+  },
+  required: ["labels"],
+};
+
 const GEMINI_LABEL_EXTRACTION_SYSTEM_PROMPT = [
   "You are doing exhaustive OCR-like transcription of historical map crops.",
   "Extract every visible printed text instance from the supplied crop image, not just salient places or large labels.",
@@ -317,6 +518,20 @@ const OPENAI_LABEL_RECONCILIATION_SYSTEM_PROMPT = [
   "Do not invent text that is not supported by OCR evidence or visible image evidence.",
   "When the image is too low-resolution to verify a tiny label, keep the OCR-derived reading only if it is plausible and lower confidence when uncertain.",
   "Reject non-text cartographic symbols, building footprint patterns, repeated placeholder glyphs, and isolated artifacts.",
+].join(" ");
+
+const KIMI_AGENT_SWARM_SYSTEM_PROMPT = [
+  "You are a gated, evidence-sharing swarm of historical-map extraction agents.",
+  "Your job is not to debate in prose; your job is to emit comparable structured claims and OCR-like map labels.",
+  "Run only agents that have useful evidence in this crop. Mark weak or irrelevant agents as skipped instead of forcing output.",
+  "Every label or claim must be grounded in visible crop text, Google Vision OCR hints, map-level context, or explicitly named metadata context.",
+  "Never let collar text masquerade as geographic coverage, and never let legend/publisher/place-of-publication text become a covered place unless the map body also supports it.",
+  "Use the labels array for visible printed text and the claims array for field-level Aardvark-style evidence, review warnings, coverage/temporal/subject hints, and false-positive suppressions.",
+  "Keep claims compact: field, value, confidence, evidence, warnings. Prefer multiple narrow claims over one narrative summary.",
+  "Even on dense crops, reserve a small budget for 1-6 high-value claims when evidence exists: title/date/publisher, likely spatial coverage, map genre/subject, scale/projection, and false-positive suppressions.",
+  "Do not promote every street label as geographic coverage; streets should usually remain labels unless a user specifically asks for street-level gazetteering.",
+  "For cost control, do not repeat large OCR evidence in claims; cite sourceTextIndices or imageRegion when possible.",
+  "Return only JSON matching the schema.",
 ].join(" ");
 
 function sourceRegionBbox(derivative) {
@@ -793,6 +1008,108 @@ export function openAIMapLabelReconciliationRequestBody({ model, modelProfile, r
   };
 }
 
+function kimiPromptCacheKey({ request = {}, derivative, agentId = "map-agent-swarm" } = {}) {
+  const resourceId = String(request.resourceId || request.resource_id || request.resource?.id || "").trim();
+  const fileName = requestFileName(request);
+  const sourceRegionId = String(derivative?.sourceImageId || derivative?.id || "full-image").trim();
+  const stable = [resourceId, fileName, agentId, sourceRegionId].filter(Boolean).join(":");
+  if (stable) return `ogm:${sha256Text(stable).slice(0, 32)}`;
+  return `ogm:${sha256Text(`${agentId}:${sourceRegionId}`).slice(0, 32)}`;
+}
+
+function kimiAgentSwarmPrompt({ derivatives, ocrExtraction, request = {}, cacheKey }) {
+  const basePrompt = geminiLabelExtractionPrompt({ derivatives, ocrExtraction, request });
+  return [
+    "Run the map-processing swarm for this crop using a gated cascade.",
+    "Start with shared OCR evidence, then emit only the specialist claims that this crop can support.",
+    `Available agent ids: ${KIMI_SWARM_AGENT_IDS.join(", ")}.`,
+    "Return JSON with labels, claims, agents, routing, and extractionStatus.",
+    "For labels, transcribe all visible text. For claims, emit only compact high-confidence metadata/evidence claims; do not spend claim budget on routine street labels.",
+    "If output space is tight, keep all labels you can, then include the strongest few claims and mark omitted/uncertain agents as skipped or needs_more_evidence.",
+    "Claims must follow this shape:",
+    JSON.stringify({
+      agentId: "title_date_publisher_extraction",
+      field: "dct_title_s",
+      value: "Example title",
+      confidence: 0.87,
+      evidence: [{ type: "ocr", text: "EXAMPLE TITLE", sourceRegionId: "crop-001", imageRegion: [100, 120, 680, 170] }],
+      warnings: [],
+    }, null, 2),
+    cacheKey ? `Stable prompt cache key for this crop: ${cacheKey}` : "",
+    basePrompt,
+  ].filter(Boolean).join("\n\n");
+}
+
+function normalizeKimiModelParams(model, params = {}, { maxCompletionTokens, promptCacheKey } = {}) {
+  const next = { ...(params || {}) };
+  const rawMaxCompletionTokens = Number(maxCompletionTokens || next.max_completion_tokens || next.max_tokens || next.maxOutputTokens);
+  delete next.maxOutputTokens;
+  delete next.max_tokens;
+  delete next.imageDetail;
+  delete next.image_detail;
+  if (Number.isFinite(rawMaxCompletionTokens) && rawMaxCompletionTokens > 0) next.max_completion_tokens = rawMaxCompletionTokens;
+  if (!next.thinking) next.thinking = { type: "disabled" };
+  if (promptCacheKey && !next.prompt_cache_key) next.prompt_cache_key = promptCacheKey;
+
+  if (/^kimi-k2(?:\.5|\.6)?/i.test(String(model || ""))) {
+    delete next.temperature;
+    delete next.top_p;
+    delete next.n;
+    delete next.presence_penalty;
+    delete next.frequency_penalty;
+  }
+  return next;
+}
+
+export function kimiAgentSwarmRequestBody({ model, modelProfile, request = {}, derivatives, ocrExtraction, promptCacheKey }) {
+  const modelParams = request.kimiModelParams
+    || request.kimiAgentSwarmModelParams
+    || modelProfile.modelParams
+    || {};
+  const maxCompletionTokens = Number(
+    request.kimiMaxCompletionTokens
+    || request.kimiAgentSwarmMaxCompletionTokens
+    || modelParams.max_completion_tokens
+    || modelParams.max_tokens
+    || modelParams.maxOutputTokens
+    || process.env.KIMI_AGENT_SWARM_MAX_COMPLETION_TOKENS
+    || 16000,
+  );
+  const userPrompt = kimiAgentSwarmPrompt({ derivatives, ocrExtraction, request, cacheKey: promptCacheKey });
+  const userContent = [
+    { type: "text", text: userPrompt },
+    ...derivatives.flatMap((derivative, index) => {
+      if (!derivative.dataUri) return [];
+      const sourceRegionId = derivative.sourceImageId || derivative.id || `image-${index + 1}`;
+      return [
+        { type: "text", text: `sourceRegionId: ${sourceRegionId}` },
+        { type: "image_url", image_url: { url: derivative.dataUri } },
+      ];
+    }),
+  ];
+
+  return {
+    body: {
+      model,
+      messages: [
+        { role: "system", content: KIMI_AGENT_SWARM_SYSTEM_PROMPT },
+        { role: "user", content: userContent },
+      ],
+      response_format: {
+        type: "json_schema",
+        json_schema: {
+          name: "kimi_map_agent_swarm",
+          schema: KIMI_AGENT_SWARM_SCHEMA,
+          strict: false,
+        },
+      },
+      ...normalizeKimiModelParams(model, modelParams, { maxCompletionTokens, promptCacheKey }),
+    },
+    systemPrompt: KIMI_AGENT_SWARM_SYSTEM_PROMPT,
+    userPrompt,
+  };
+}
+
 export function redactGeminiRequestForPersistence(requestBody) {
   if (Array.isArray(requestBody?.cropRequests)) {
     return {
@@ -871,6 +1188,138 @@ async function postOpenAIMapLabelResponse({ apiKey, body }) {
   throw new Error("OpenAI request failed after removing unsupported parameters.");
 }
 
+function kimiResponseCacheEnabled(request = {}) {
+  if (request.kimiResponseCache === false || request.kimiAgentSwarmResponseCache === false) return false;
+  return !["0", "false", "no", "off"].includes(String(process.env.KIMI_AGENT_SWARM_RESPONSE_CACHE ?? "1").trim().toLowerCase());
+}
+
+function kimiResponseCacheDirectory() {
+  return process.env.KIMI_AGENT_SWARM_RESPONSE_CACHE_DIR
+    || path.resolve(__dirname, "../.cache/kimi-agent-swarm/responses");
+}
+
+function kimiResponseCachePath(cacheKey) {
+  return path.join(kimiResponseCacheDirectory(), `${cacheKey}.json`);
+}
+
+function kimiCacheKeyForBody(body) {
+  return sha256Text(JSON.stringify(body));
+}
+
+function readKimiCachedResponse(cacheKey) {
+  const cachePath = kimiResponseCachePath(cacheKey);
+  if (!existsSync(cachePath)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(cachePath, "utf8"));
+    return parsed?.rawResponse ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeKimiCachedResponse(cacheKey, value) {
+  try {
+    const cacheDir = kimiResponseCacheDirectory();
+    mkdirSync(cacheDir, { recursive: true });
+    writeFileSync(kimiResponseCachePath(cacheKey), JSON.stringify({
+      schemaVersion: 1,
+      cachedAt: new Date().toISOString(),
+      ...value,
+    }, null, 2));
+    return null;
+  } catch (error) {
+    return error?.message || String(error);
+  }
+}
+
+function kimiJsonObjectFallbackBody(body) {
+  return {
+    ...body,
+    response_format: { type: "json_object" },
+  };
+}
+
+async function postKimiAgentSwarmResponse({ apiKey, body, request = {} }) {
+  let currentBody = { ...body };
+  let usedJsonObjectFallback = false;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const cacheKey = kimiCacheKeyForBody(currentBody);
+    if (kimiResponseCacheEnabled(request)) {
+      const cached = readKimiCachedResponse(cacheKey);
+      if (cached) {
+        let parsedResponse = cached.parsedResponse;
+        if (cached.outputText) {
+          try {
+            parsedResponse = parseKimiAgentSwarmJson(cached.outputText, cached.rawResponse);
+          } catch {
+            parsedResponse = cached.parsedResponse;
+          }
+        }
+        return {
+          rawResponse: cached.rawResponse,
+          requestBody: currentBody,
+          outputText: cached.outputText,
+          parsedResponse,
+          cache: {
+            hit: true,
+            key: cacheKey,
+            path: kimiResponseCachePath(cacheKey),
+          },
+        };
+      }
+    }
+
+    const response = await fetch(KIMI_CHAT_COMPLETIONS_ENDPOINT, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(currentBody),
+    });
+    const rawResponse = await response.json().catch(() => ({}));
+    if (response.ok) {
+      const outputText = extractKimiResponseText(rawResponse);
+      const parsedResponse = parseKimiAgentSwarmJson(outputText, rawResponse);
+      let cacheWriteError;
+      if (kimiResponseCacheEnabled(request)) {
+        cacheWriteError = writeKimiCachedResponse(cacheKey, {
+          outputText,
+          parsedResponse,
+          rawResponse,
+        });
+      }
+      return {
+        rawResponse,
+        requestBody: currentBody,
+        outputText,
+        parsedResponse,
+        cache: {
+          hit: false,
+          key: cacheKey,
+          path: kimiResponseCacheEnabled(request) ? kimiResponseCachePath(cacheKey) : undefined,
+          writeError: cacheWriteError || undefined,
+        },
+      };
+    }
+
+    const message = rawResponse?.error?.message || `Kimi request failed: ${response.status}`;
+    const unsupported = unsupportedParameterName(message);
+    if (unsupported && Object.prototype.hasOwnProperty.call(currentBody, unsupported)) {
+      const { [unsupported]: _removed, ...withoutUnsupported } = currentBody;
+      currentBody = withoutUnsupported;
+      continue;
+    }
+    if (!usedJsonObjectFallback && /json_schema|response_format|schema/i.test(message)) {
+      currentBody = kimiJsonObjectFallbackBody(currentBody);
+      usedJsonObjectFallback = true;
+      continue;
+    }
+    throw new Error(message);
+  }
+  throw new Error("Kimi request failed after retrying supported fallbacks.");
+}
+
 function combineGeminiUsage(usages) {
   const totals = {};
   const modalityCounts = new Map();
@@ -907,6 +1356,17 @@ function combineOpenAIUsage(usages) {
     for (const [detailName, detailValue] of Object.entries(usage?.output_tokens_details || {})) {
       const key = `output_tokens_details.${detailName}`;
       const value = Number(detailValue);
+      if (Number.isFinite(value)) totals[key] = (totals[key] || 0) + value;
+    }
+  }
+  return Object.keys(totals).length > 0 ? totals : undefined;
+}
+
+function combineKimiUsage(usages) {
+  const totals = {};
+  for (const usage of usages.filter(Boolean)) {
+    for (const key of ["prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens"]) {
+      const value = Number(usage?.[key]);
       if (Number.isFinite(value)) totals[key] = (totals[key] || 0) + value;
     }
   }
@@ -1231,6 +1691,220 @@ export async function callOpenAIMapLabelReconciliation({ modelProfile, request =
       successfulCropCount: successes.length,
       failedCropCount: failures.length,
       strategy: OPENAI_TEXT_RECONCILIATION_STRATEGY,
+    },
+    confidence: averageConfidence(labels),
+  };
+}
+
+export async function callKimiMapAgentSwarm({ modelProfile, request = {}, derivatives = [], ocrExtraction, apiKey, log = () => undefined }) {
+  const readyDerivatives = derivatives.filter((derivative) => derivative?.dataUri);
+  if (readyDerivatives.length === 0) throw new Error("Kimi map-agent swarm requires at least one image derivative.");
+  const model = sanitizeKimiModelName(
+    request.kimiModel
+    || request.kimiAgentSwarmModel
+    || request.textExtractionModel
+    || modelProfile?.defaultModel,
+  );
+  const key = String(apiKey || "").trim();
+  if (!key) throw new Error("Kimi API key is not configured.");
+
+  const concurrency = Math.max(1, Math.min(8, Number(
+    request.kimiAgentSwarmConcurrency
+    || request.kimiTextExtractionConcurrency
+    || request.textExtractionConcurrency
+    || process.env.KIMI_AGENT_SWARM_CONCURRENCY
+    || 2,
+  ) || 2));
+  const cropResults = await mapWithConcurrency(readyDerivatives, concurrency, async (derivative, index) => {
+    const sourceRegionId = derivative.sourceImageId || derivative.id || `image-${index + 1}`;
+    const promptCacheKey = kimiPromptCacheKey({ request, derivative, agentId: "map-agent-swarm" });
+    const { body, systemPrompt, userPrompt } = kimiAgentSwarmRequestBody({
+      model,
+      modelProfile: modelProfile || {},
+      request,
+      derivatives: [derivative],
+      ocrExtraction,
+      promptCacheKey,
+    });
+    try {
+      log("Kimi map-agent swarm crop request started", {
+        crop: index + 1,
+        cropCount: readyDerivatives.length,
+        sourceRegionId,
+        model,
+        promptCacheKey,
+        bytes: derivative.bytes || 0,
+      });
+      const result = await postKimiAgentSwarmResponse({ apiKey: key, body, request });
+      const labels = asArray(result.parsedResponse?.labels)
+        .map((label) => labelWithFallbackSourceRegion(label, derivative, index));
+      log("Kimi map-agent swarm crop response received", {
+        crop: index + 1,
+        cropCount: readyDerivatives.length,
+        sourceRegionId,
+        labels: labels.length,
+        claims: asArray(result.parsedResponse?.claims).length,
+        cacheHit: result.cache?.hit === true,
+        cachedTokens: result.rawResponse?.usage?.cached_tokens,
+        exhaustive: result.parsedResponse?.extractionStatus?.exhaustive,
+      });
+      return {
+        sourceRegionId,
+        status: "completed",
+        systemPrompt,
+        userPrompt,
+        requestBody: result.requestBody,
+        rawResponse: result.rawResponse,
+        parsedResponse: {
+          ...(result.parsedResponse || {}),
+          labels,
+          routing: {
+            ...(result.parsedResponse?.routing || {}),
+            cacheKey: result.parsedResponse?.routing?.cacheKey || promptCacheKey,
+          },
+        },
+        usage: result.rawResponse?.usage,
+        cache: result.cache,
+        promptCacheKey,
+      };
+    } catch (error) {
+      log("Kimi map-agent swarm crop failed", {
+        crop: index + 1,
+        cropCount: readyDerivatives.length,
+        sourceRegionId,
+        error: error.message || String(error),
+      });
+      return {
+        sourceRegionId,
+        status: "failed",
+        systemPrompt,
+        userPrompt,
+        requestBody: body,
+        error: error.message || String(error),
+        promptCacheKey,
+      };
+    }
+  });
+
+  const successes = cropResults.filter((result) => result?.status === "completed");
+  const failures = cropResults.filter((result) => result?.status === "failed");
+  if (successes.length === 0) {
+    const message = failures[0]?.error || "Kimi map-agent swarm failed for every crop.";
+    throw new Error(message);
+  }
+  const firstSuccess = successes[0];
+  const labels = successes.flatMap((result) => asArray(result.parsedResponse?.labels));
+  const claims = successes.flatMap((result) => asArray(result.parsedResponse?.claims).map((claim) => withoutUndefined({
+    ...claim,
+    sourceRegionId: claim?.sourceRegionId || result.sourceRegionId,
+  })));
+  const agentsById = new Map();
+  for (const result of successes) {
+    for (const agent of asArray(result.parsedResponse?.agents)) {
+      const id = String(agent?.id || "").trim();
+      if (!id) continue;
+      const existing = agentsById.get(id);
+      const nextClaimCount = Number(agent?.claimCount || 0);
+      if (!existing) {
+        agentsById.set(id, { ...agent, claimCount: nextClaimCount });
+        continue;
+      }
+      agentsById.set(id, {
+        ...existing,
+        status: existing.status === "completed" || agent.status === "completed" ? "completed" : agent.status || existing.status,
+        confidence: Math.max(Number(existing.confidence || 0), Number(agent.confidence || 0)) || undefined,
+        claimCount: Number(existing.claimCount || 0) + nextClaimCount,
+      });
+    }
+  }
+  const cropStatuses = cropResults.map((result) => withoutUndefined({
+    sourceRegionId: result.sourceRegionId,
+    status: result.status,
+    labelCount: asArray(result.parsedResponse?.labels).length,
+    claimCount: asArray(result.parsedResponse?.claims).length,
+    agentCount: asArray(result.parsedResponse?.agents).length,
+    cacheHit: result.cache?.hit,
+    responseCacheKey: result.cache?.key,
+    promptCacheKey: result.promptCacheKey,
+    cachedTokens: result.usage?.cached_tokens,
+    exhaustive: result.parsedResponse?.extractionStatus?.exhaustive,
+    estimatedVisibleTextCount: result.parsedResponse?.extractionStatus?.estimatedVisibleTextCount,
+    error: result.error,
+  }));
+  const parsedResponse = {
+    labels,
+    claims,
+    agents: Array.from(agentsById.values()),
+    routing: {
+      strategy: KIMI_AGENT_SWARM_STRATEGY,
+      ranAgentIds: Array.from(new Set(successes.flatMap((result) => asArray(result.parsedResponse?.routing?.ranAgentIds)))),
+      skippedAgentIds: Array.from(new Set(successes.flatMap((result) => asArray(result.parsedResponse?.routing?.skippedAgentIds)))),
+      escalationReasons: Array.from(new Set(successes.flatMap((result) => asArray(result.parsedResponse?.routing?.escalationReasons)))),
+      responseCacheHitCount: successes.filter((result) => result.cache?.hit).length,
+    },
+    extractionStatus: {
+      strategy: KIMI_AGENT_SWARM_STRATEGY,
+      exhaustive: failures.length === 0 && successes.every((result) => result.parsedResponse?.extractionStatus?.exhaustive !== false),
+      cropCount: readyDerivatives.length,
+      successfulCropCount: successes.length,
+      failedCropCount: failures.length,
+      extractedLabelCount: labels.length,
+      claimCount: claims.length,
+      responseCacheHitCount: successes.filter((result) => result.cache?.hit).length,
+      omittedReason: failures.length > 0 ? `${failures.length} crop(s) failed; see cropStatuses.` : undefined,
+    },
+    cropStatuses,
+  };
+  const requestBody = {
+    strategy: KIMI_AGENT_SWARM_STRATEGY,
+    model,
+    modelParams: firstSuccess?.requestBody
+      ? Object.fromEntries(Object.entries(firstSuccess.requestBody).filter(([key]) => !["model", "messages", "response_format"].includes(key)))
+      : undefined,
+    response_format: firstSuccess?.requestBody?.response_format,
+    cropRequests: cropResults.map((result) => ({
+      sourceRegionId: result.sourceRegionId,
+      status: result.status,
+      requestBody: result.requestBody,
+      error: result.error,
+      promptCacheKey: result.promptCacheKey,
+      responseCacheKey: result.cache?.key,
+      responseCacheHit: result.cache?.hit,
+    })),
+  };
+  const rawResponse = {
+    strategy: KIMI_AGENT_SWARM_STRATEGY,
+    cropResponses: cropResults.map((result) => withoutUndefined({
+      sourceRegionId: result.sourceRegionId,
+      status: result.status,
+      rawResponse: result.rawResponse,
+      error: result.error,
+      responseCacheKey: result.cache?.key,
+      responseCacheHit: result.cache?.hit,
+    })),
+  };
+  return {
+    provider: "kimi",
+    model,
+    strategy: KIMI_AGENT_SWARM_STRATEGY,
+    systemPrompt: firstSuccess?.systemPrompt || cropResults[0]?.systemPrompt,
+    userPrompt: [
+      "Kimi K2.6 per-crop gated map-agent swarm after Google Vision OCR.",
+      "Each crop request uses a stable prompt template, prompt_cache_key, local response cache, crop-specific image metadata, and compact Google Vision OCR hints.",
+      `Crop count: ${readyDerivatives.length}. Successful crops: ${successes.length}. Failed crops: ${failures.length}. Cache hits: ${successes.filter((result) => result.cache?.hit).length}.`,
+      "See requestBody.cropRequests for rendered crop-specific prompts with inline image bytes redacted during persistence.",
+    ].join("\n"),
+    requestBody,
+    rawResponse,
+    parsedResponse,
+    derivatives: readyDerivatives.map(({ dataUri, ...derivative }) => derivative),
+    usage: {
+      ...combineKimiUsage(successes.map((result) => result.usage)),
+      cropCount: readyDerivatives.length,
+      successfulCropCount: successes.length,
+      failedCropCount: failures.length,
+      responseCacheHitCount: successes.filter((result) => result.cache?.hit).length,
+      strategy: KIMI_AGENT_SWARM_STRATEGY,
     },
     confidence: averageConfidence(labels),
   };
@@ -1619,6 +2293,45 @@ function labelShouldBecomePlacename(label, options = {}) {
   return true;
 }
 
+function labelWordTokens(value) {
+  return normalizedText(value)
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter(Boolean);
+}
+
+function isStreetLikePlacenameLabel(content, type, role) {
+  return type === "street"
+    || role === "street"
+    || role === "route"
+    || /\b(?:st|street|ave|avenue|blvd|boulevard|ct|court|dr|drive|highway|hwy|ln|lane|pkwy|parkway|pl|place|rd|road|route|st\.|way)\b\.?$/i.test(String(content || ""));
+}
+
+function labelLooksMetadataGradePlacename(label, options = {}) {
+  const content = String(label?.content || "").trim();
+  if (!content) return false;
+  const role = String(label?.role || "").toLowerCase();
+  const type = placenameTypeForLabel(label, options);
+  if (isStreetLikePlacenameLabel(content, type, role)) return false;
+  if (!METADATA_GRADE_DERIVED_PLACENAME_TYPES.has(type)) return false;
+  const confidence = Number(label?.confidence || 0);
+  if (Number.isFinite(confidence) && confidence < 0.55) return false;
+  const tokens = labelWordTokens(content);
+  if (tokens.length === 0) return false;
+  if (/^\d/.test(tokens[0])) return false;
+  if (tokens.length === 1) {
+    if (GENERIC_SINGLE_PLACENAME_FRAGMENTS.has(tokens[0])) return false;
+    return type === "neighborhood" || type === "landform" || type === "waterbody";
+  }
+  if (type === "landmark") {
+    if (GENERIC_LANDMARK_LABELS.has(normalizedText(content))) return false;
+    if (LANDMARK_FEATURE_CUE_RE.test(content)) return true;
+    return tokens.length >= 2 && confidence >= 0.78;
+  }
+  if (type === "railroad") return tokens.length >= 2 && confidence >= 0.7;
+  return true;
+}
+
 function labelIsHighRiskUnsupportedFeature(label) {
   if (label?.geometry_status === "ocr_backed") return false;
   if (label?.candidate_status === "accepted" || label?.candidateStatus === "accepted") return false;
@@ -1627,7 +2340,9 @@ function labelIsHighRiskUnsupportedFeature(label) {
 }
 
 function labelShouldBecomeDerivedPlacename(label, options = {}) {
-  return labelShouldBecomePlacename(label, options) && !labelIsHighRiskUnsupportedFeature(label);
+  return labelShouldBecomePlacename(label, options)
+    && labelLooksMetadataGradePlacename(label, options)
+    && !labelIsHighRiskUnsupportedFeature(label);
 }
 
 export function normalizeGeminiLabelsForExtraction(geminiExtraction, derivatives = [], options = {}) {
@@ -1686,6 +2401,37 @@ export function normalizeOpenAILabelsForExtraction(openAIExtraction, derivatives
       source_call_id: OPENAI_LABEL_RECONCILIATION_CALL_ID,
       extraction_source: "openai_reconciliation",
       reasoning: label?.evidence?.visualNotes || label?.visualNotes || label?.reasoning || "OpenAI reconciled this map label from OCR and image evidence.",
+      raw: { ...label, bbox1000Order },
+      uncertainty_flags: asArray(label?.uncertaintyFlags || label?.uncertainty_flags).map(String),
+    });
+  }).filter(Boolean);
+}
+
+export function normalizeKimiLabelsForExtraction(kimiExtraction, derivatives = [], options = {}) {
+  const bbox1000Order = options.bbox1000Order || "xyxy";
+  const mapReadingContext = options.mapReadingContext;
+  return asArray(kimiExtraction?.labels).map((label, index) => {
+    const content = String(label?.content || "").trim();
+    if (!content) return null;
+    const derivative = labelDerivative(label, derivatives, index);
+    const approxBbox = fullImageBboxFromBbox1000(label?.bbox1000 || label?.bbox_1000, derivative, bbox1000Order);
+    if (!approxBbox) return null;
+    const sourceRegionId = String(label?.sourceRegionId || label?.source_region_id || derivative?.sourceImageId || derivative?.id || "").trim();
+    return withoutUndefined({
+      content,
+      role: roleForGeminiLabel(label, { mapReadingContext }),
+      confidence: clampedConfidence(label?.confidence, 0.6),
+      approx_bbox: approxBbox,
+      approx_polygon: fullImagePolygonFromPolygon1000(label?.polygon1000 || label?.polygon_1000, derivative, bbox1000Order),
+      orientation_degrees: typeof label?.orientationDegrees === "number" ? label.orientationDegrees : undefined,
+      writing_mode: label?.writingMode || label?.writing_mode,
+      geometry_kind: label?.geometryKind || label?.geometry_kind,
+      source_image_id: sourceRegionId,
+      source_image_kind: derivative?.sourceImageKind || derivative?.kind,
+      source_region: derivative?.region,
+      source_call_id: KIMI_AGENT_SWARM_CALL_ID,
+      extraction_source: "kimi_agent_swarm",
+      reasoning: label?.evidence?.visualNotes || label?.visualNotes || label?.reasoning || "Kimi map-agent swarm extracted this map label from OCR and image evidence.",
       raw: { ...label, bbox1000Order },
       uncertainty_flags: asArray(label?.uncertaintyFlags || label?.uncertainty_flags).map(String),
     });
@@ -1894,6 +2640,46 @@ function upsertDerivedPlacename(next, byKey, candidate) {
   byKey.set(key, { place: upgraded, index: existing.index });
 }
 
+function placenameScore(place) {
+  const confidence = Number(place?.confidence || 0);
+  const type = String(place?.type || "").toLowerCase();
+  const typeScore = {
+    waterbody: 7,
+    park: 6,
+    neighborhood: 5,
+    landform: 5,
+    landmark: 4,
+    railroad: 3,
+  }[type] || 0;
+  return confidence + (typeScore / 10) + Math.min(labelWordTokens(place?.name).length, 4) / 100;
+}
+
+function isContiguousTokenSubset(shorter, longer) {
+  const shortTokens = labelWordTokens(shorter);
+  const longTokens = labelWordTokens(longer);
+  if (shortTokens.length === 0 || shortTokens.length >= longTokens.length) return false;
+  for (let index = 0; index <= longTokens.length - shortTokens.length; index += 1) {
+    if (shortTokens.every((token, offset) => token === longTokens[index + offset])) return true;
+  }
+  return false;
+}
+
+function pruneDerivedPlacenameFragments(places) {
+  return places.filter((place, index) => {
+    const tokens = labelWordTokens(place?.name);
+    if (tokens.length === 0 || tokens.length > 2) return true;
+    const type = String(place?.type || "").toLowerCase();
+    if (type === "neighborhood") return true;
+    return !places.some((other, otherIndex) => {
+      if (otherIndex === index) return false;
+      const otherType = String(other?.type || "").toLowerCase();
+      return otherType === type
+        && isContiguousTokenSubset(place?.name, other?.name)
+        && placenameScore(other) >= placenameScore(place);
+    });
+  });
+}
+
 function normalizeTextEntryForMapContext(entry, mapReadingContext) {
   if (!entry || !isTopographicMapContext(mapReadingContext)) return entry;
   const role = roleForGeminiLabel(entry, { mapReadingContext });
@@ -1929,7 +2715,7 @@ function addGeminiPlacenames(placenames, geminiLabels, firstGeminiTextIndex, opt
     });
     upsertDerivedPlacename(next, byKey, candidate);
   }
-  return next;
+  return pruneDerivedPlacenameFragments(next);
 }
 
 function addOpenAIPlacenames(placenames, openAILabels, firstOpenAITextIndex, options = {}) {
@@ -1956,7 +2742,34 @@ function addOpenAIPlacenames(placenames, openAILabels, firstOpenAITextIndex, opt
     });
     upsertDerivedPlacename(next, byKey, candidate);
   }
-  return next;
+  return pruneDerivedPlacenameFragments(next);
+}
+
+function addKimiPlacenames(placenames, kimiLabels, firstKimiTextIndex, options = {}) {
+  const byKey = new Map();
+  const next = [...asArray(placenames)];
+  for (const [index, place] of next.entries()) {
+    const key = normalizedText(place?.name);
+    if (key) byKey.set(key, { place, index });
+  }
+  for (const [offset, labelOrEntry] of kimiLabels.entries()) {
+    const { label, textIndex } = labelPlacenameEntry(labelOrEntry, offset, firstKimiTextIndex);
+    if (!labelShouldBecomeDerivedPlacename(label, options)) continue;
+    const key = normalizedText(label.content);
+    if (!key || key.length < 3) continue;
+    const candidate = withoutUndefined({
+      name: label.content,
+      type: placenameTypeForLabel(label, options),
+      source_text_index: textIndex,
+      source_text_indices: [textIndex],
+      approx_bbox: label.approx_bbox,
+      confidence: Math.max(0.35, Math.min(0.95, Number(label.confidence || 0.7) * 0.96)),
+      source_call_id: KIMI_AGENT_SWARM_CALL_ID,
+      reasoning: "Kimi map-agent swarm extracted this visible map label as a text-backed placename candidate before gazetteer matching.",
+    });
+    upsertDerivedPlacename(next, byKey, candidate);
+  }
+  return pruneDerivedPlacenameFragments(next);
 }
 
 export function mergeGoogleVisionWithGeminiExtraction({ ocrResult, geminiExtraction }) {
@@ -2196,5 +3009,145 @@ export function mergeGoogleVisionWithOpenAIReconciliation({ ocrResult, openAIRec
       : openAIReconciliation?.confidence ?? ocrResult?.confidence ?? null,
     ocrResult,
     openAIReconciliation,
+  };
+}
+
+export function mergeGoogleVisionWithKimiAgentSwarm({ ocrResult, kimiSwarm }) {
+  const ocr = ocrResult?.parsedResponse || {};
+  const mapReadingContext = inferMapReadingContext({ ocrExtraction: ocr });
+  const kimiBbox1000Order = detectBbox1000Order(
+    kimiSwarm?.parsedResponse?.labels,
+    kimiSwarm?.derivatives || [],
+    ocr,
+  );
+  const rawKimiLabels = normalizeKimiLabelsForExtraction(
+    kimiSwarm?.parsedResponse,
+    kimiSwarm?.derivatives || [],
+    { bbox1000Order: kimiBbox1000Order, mapReadingContext },
+  );
+  const { labels: kimiLabels, snapCount: kimiSnapCount, projectedCount: kimiProjectedCount } = snapLabelsToOcrSupport(rawKimiLabels, ocr, kimiSwarm?.derivatives || []);
+  const kimiSanity = filterRejectedMapText(kimiLabels);
+  const { labels: dedupedKimiLabels, duplicateCount: duplicateKimiLabelCount } = dedupeMapLabelCandidates(kimiSanity.accepted);
+  const textSanity = filterRejectedMapText(asArray(ocr.text));
+  const text = textSanity.accepted.map((entry) => normalizeTextEntryForMapContext(entry, mapReadingContext));
+  const addedLabels = [];
+  const placenameLabelEntries = [];
+  for (const label of dedupedKimiLabels) {
+    const duplicateTextIndex = text.findIndex((entry) => looksLikeDuplicateText(entry, label));
+    if (duplicateTextIndex >= 0) {
+      placenameLabelEntries.push({ label, textIndex: duplicateTextIndex });
+      continue;
+    }
+    addedLabels.push(label);
+    text.push(label);
+    placenameLabelEntries.push({ label, textIndex: text.length - 1 });
+  }
+  const filteredGroups = asArray(ocr.text_groups).filter((group) => !groupLooksOvermerged(group, text));
+  const filteredGroupCount = asArray(ocr.text_groups).length - filteredGroups.length;
+  const firstKimiTextIndex = text.length - addedLabels.length;
+  const placenames = addKimiPlacenames(ocr.placenames, placenameLabelEntries, firstKimiTextIndex, { mapReadingContext });
+  const claims = asArray(kimiSwarm?.parsedResponse?.claims);
+  const agents = asArray(kimiSwarm?.parsedResponse?.agents);
+  const parsedResponse = withoutUndefined({
+    ...ocr,
+    map_reading_context: mapReadingContext,
+    text,
+    text_groups: filteredGroups,
+    text_grouping_summary: {
+      ...(ocr.text_grouping_summary || {}),
+      kimi_swarm_label_count: kimiLabels.length,
+      kimi_swarm_added_text_count: addedLabels.length,
+      kimi_swarm_rejected_symbol_label_count: kimiSanity.rejected.length,
+      rejected_symbol_text_count: textSanity.rejected.length + kimiSanity.rejected.length,
+      kimi_swarm_filtered_overmerged_group_count: filteredGroupCount,
+      kimi_swarm_claim_count: claims.length,
+      kimi_swarm_agent_count: agents.length,
+    },
+    rejected_text: [
+      ...asArray(ocr.rejected_text),
+      ...textSanity.rejected,
+      ...kimiSanity.rejected,
+    ],
+    placenames,
+    label_candidates: [
+      ...asArray(ocr.label_candidates),
+      ...dedupedKimiLabels.map((label, index) => withoutUndefined({
+        id: `kimi-label-${String(index + 1).padStart(4, "0")}`,
+        ...label,
+      })),
+    ],
+    text_extraction_runs: [
+      ...asArray(ocr.text_extraction_runs),
+      {
+        id: KIMI_AGENT_SWARM_CALL_ID,
+        provider: "kimi",
+        model: kimiSwarm?.model,
+        strategy: kimiSwarm?.strategy || KIMI_AGENT_SWARM_STRATEGY,
+        sourceImageCount: asArray(kimiSwarm?.derivatives).length,
+        successfulCropCount: kimiSwarm?.parsedResponse?.extractionStatus?.successfulCropCount,
+        failedCropCount: kimiSwarm?.parsedResponse?.extractionStatus?.failedCropCount,
+        responseCacheHitCount: kimiSwarm?.parsedResponse?.extractionStatus?.responseCacheHitCount,
+        cachedTokens: kimiSwarm?.usage?.cached_tokens,
+      },
+    ],
+    kimi_swarm: {
+      strategy: kimiSwarm?.strategy || KIMI_AGENT_SWARM_STRATEGY,
+      claims,
+      agents,
+      routing: kimiSwarm?.parsedResponse?.routing,
+      cropStatuses: kimiSwarm?.parsedResponse?.cropStatuses,
+      usage: kimiSwarm?.usage,
+      responseCacheHitCount: kimiSwarm?.parsedResponse?.extractionStatus?.responseCacheHitCount,
+      promptCacheKeys: Array.from(new Set(asArray(kimiSwarm?.parsedResponse?.cropStatuses).map((status) => status?.promptCacheKey).filter(Boolean))),
+    },
+    description: ocr.description
+      ? `${ocr.description} Kimi map-agent swarm added ${addedLabels.length} map label candidate(s), emitted ${claims.length} structured claim(s), and filtered ${filteredGroupCount} over-merged OCR group(s).`
+      : `Kimi map-agent swarm added ${addedLabels.length} map label candidate(s) and ${claims.length} structured claim(s).`,
+    debug: {
+      ...(ocr.debug || {}),
+      kimi_agent_swarm_strategy: KIMI_AGENT_SWARM_STRATEGY,
+      map_reading_context: mapReadingContext,
+      kimi_agent_swarm_counts: {
+        label_count: kimiLabels.length,
+        deduped_label_count: dedupedKimiLabels.length,
+        duplicate_label_count: duplicateKimiLabelCount,
+        added_text_count: addedLabels.length,
+        snapped_to_ocr_text_count: kimiSnapCount,
+        accepted_projected_geometry_count: kimiProjectedCount,
+        rejected_symbol_label_count: kimiSanity.rejected.length,
+        rejected_symbol_text_count: textSanity.rejected.length + kimiSanity.rejected.length,
+        filtered_overmerged_group_count: filteredGroupCount,
+        claim_count: claims.length,
+        agent_count: agents.length,
+        failed_crop_count: kimiSwarm?.parsedResponse?.extractionStatus?.failedCropCount || 0,
+        response_cache_hit_count: kimiSwarm?.parsedResponse?.extractionStatus?.responseCacheHitCount || 0,
+        cached_tokens: kimiSwarm?.usage?.cached_tokens,
+      },
+      kimi_label_bbox1000_order: kimiBbox1000Order,
+      text_sanity_strategy: "reject_repeated_building_placeholder_glyphs_v1",
+      kimi_agent_swarm_limitations: "Kimi labels and claims are OCR/image-grounded candidates and should be reviewed; gazetteer matching remains a later deterministic layer.",
+    },
+  });
+  return {
+    parsedResponse,
+    rawResponse: {
+      google_cloud_vision: ocrResult?.rawResponse,
+      kimi_agent_swarm: kimiSwarm?.rawResponse,
+    },
+    requestBody: {
+      google_cloud_vision: ocrResult?.requestBody,
+      kimi_agent_swarm: kimiSwarm?.requestBody,
+    },
+    provider: HYBRID_KIMI_VISION_OCR_PROVIDER,
+    usage: {
+      provider: HYBRID_KIMI_VISION_OCR_PROVIDER,
+      google_cloud_vision: ocrResult?.usage,
+      kimi_agent_swarm: kimiSwarm?.usage,
+    },
+    confidence: parsedResponse.text.length > 0
+      ? parsedResponse.text.reduce((sum, entry) => sum + Number(entry.confidence || 0), 0) / parsedResponse.text.length
+      : kimiSwarm?.confidence ?? ocrResult?.confidence ?? null,
+    ocrResult,
+    kimiSwarm,
   };
 }

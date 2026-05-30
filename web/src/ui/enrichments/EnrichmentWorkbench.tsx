@@ -155,6 +155,15 @@ const blankGeminiModelProfile = (): ProxyModelProfile => ({
     modelParams: {},
 });
 
+const blankKimiModelProfile = (): ProxyModelProfile => ({
+    id: `kimi-${crypto.randomUUID()}`,
+    name: "Kimi K2.6 cached map-agent swarm",
+    provider: "kimi",
+    apiKeyEnv: "MOONSHOT_API_KEY",
+    defaultModel: "kimi-k2.6",
+    modelParams: { thinking: { type: "disabled" } },
+});
+
 const blankOpenAIReconciliationProfile = (): ProxyModelProfile => ({
     id: `openai-reconcile-${crypto.randomUUID()}`,
     name: "OpenAI mini label reconciliation",
@@ -177,6 +186,7 @@ const blankVisionProfile = (): ProxyVisionProfile => ({
 const defaultTextReconciliationProfileId = (profiles: ProxyModelProfile[]) => (
     profiles.find((profile) => (profile.provider || "openai") === "openai" && /mini|nano|reconciliation/i.test(`${profile.name} ${profile.defaultModel}`))?.id
     || profiles.find((profile) => profile.provider === "gemini")?.id
+    || profiles.find((profile) => profile.provider === "kimi")?.id
     || ""
 );
 
@@ -673,14 +683,14 @@ export const EnrichmentWorkbench: React.FC = () => {
     const textReconciliationModelProfiles = useMemo(
         () => config.modelProfiles.filter((profile) => {
             const provider = profile.provider || "openai";
-            return provider === "openai" || provider === "gemini";
+            return provider === "openai" || provider === "gemini" || provider === "kimi";
         }),
         [config.modelProfiles],
     );
     const selectedTextExtractionModelProfile = useMemo(
         () => config.modelProfiles.find((profile) => {
             const provider = profile.provider || "openai";
-            return profile.id === selectedTextExtractionModelId && (provider === "openai" || provider === "gemini");
+            return profile.id === selectedTextExtractionModelId && (provider === "openai" || provider === "gemini" || provider === "kimi");
         }),
         [config.modelProfiles, selectedTextExtractionModelId],
     );
@@ -1272,8 +1282,9 @@ export const EnrichmentWorkbench: React.FC = () => {
             const outputSchema = historicalMapPrompt ? JSON.parse(historicalMapPrompt.definition.output_schema_json) : {};
             const modelParams = normalizeModelParams(selectedModelProfile.defaultModel, selectedModelProfile.modelParams ?? {});
             const batchDefaults = defaultBatchDefaultsPayload();
+            const textProvider = selectedTextExtractionModelProfile?.provider || "openai";
             const textExtractorLabel = selectedTextExtractionModelProfile
-                ? ` + ${(selectedTextExtractionModelProfile.provider || "openai") === "gemini" ? "Gemini" : "OpenAI"} ${selectedTextExtractionModelProfile.defaultModel} label reconciliation`
+                ? ` + ${textProvider === "gemini" ? "Gemini" : textProvider === "kimi" ? "Kimi" : "OpenAI"} ${selectedTextExtractionModelProfile.defaultModel} label reconciliation`
                 : "";
             const ocrEngineLabel = selectedVisionProfile
                 ? `Google Cloud Vision ${selectedVisionProfile.featureType || "DOCUMENT_TEXT_DETECTION"}${textExtractorLabel || " + OpenAI vision augmentation"}`
@@ -1982,7 +1993,7 @@ export const EnrichmentWorkbench: React.FC = () => {
             modelDraft,
         ];
         if (await saveProxyConfig({ ...config, modelProfiles: nextProfiles })) {
-            if (modelDraft.provider === "gemini" || /mini|nano|reconciliation/i.test(`${modelDraft.name} ${modelDraft.defaultModel}`)) {
+            if (modelDraft.provider === "gemini" || modelDraft.provider === "kimi" || /mini|nano|reconciliation/i.test(`${modelDraft.name} ${modelDraft.defaultModel}`)) {
                 setSelectedTextExtractionModelId(modelDraft.id);
             } else {
                 setSelectedModelId(modelDraft.id);
@@ -2187,7 +2198,8 @@ export const EnrichmentWorkbench: React.FC = () => {
                                 <select value={selectedTextExtractionModelId} onChange={(e) => setSelectedTextExtractionModelId(e.target.value)} disabled={!selectedVisionId} className="rounded border border-gray-300 bg-white px-2 py-1.5 text-sm disabled:opacity-50 dark:border-slate-700 dark:bg-slate-950">
                                     <option value="">Label reconciliation: off</option>
                                     {textReconciliationModelProfiles.map((profile) => {
-                                        const provider = (profile.provider || "openai") === "gemini" ? "Gemini" : "OpenAI";
+                                        const rawProvider = profile.provider || "openai";
+                                        const provider = rawProvider === "gemini" ? "Gemini" : rawProvider === "kimi" ? "Kimi" : "OpenAI";
                                         return <option key={profile.id} value={profile.id}>{provider} labels: {profile.name} - {profile.defaultModel}</option>;
                                     })}
                                 </select>
@@ -2469,6 +2481,7 @@ export const EnrichmentWorkbench: React.FC = () => {
                                 <button type="button" className="rounded bg-slate-100 px-2 py-1 text-xs dark:bg-slate-800" onClick={() => setModelDraft(blankModelProfile())}>New OpenAI</button>
                                 <button type="button" className="rounded bg-slate-100 px-2 py-1 text-xs dark:bg-slate-800" onClick={() => setModelDraft(blankOpenAIReconciliationProfile())}>New Mini</button>
                                 <button type="button" className="rounded bg-slate-100 px-2 py-1 text-xs dark:bg-slate-800" onClick={() => setModelDraft(blankGeminiModelProfile())}>New Gemini</button>
+                                <button type="button" className="rounded bg-slate-100 px-2 py-1 text-xs dark:bg-slate-800" onClick={() => setModelDraft(blankKimiModelProfile())}>New Kimi</button>
                             </div>
                         </div>
                         <select className="mb-3 w-full rounded border border-gray-300 bg-white px-2 py-1 text-sm dark:border-slate-700 dark:bg-slate-950" value={selectedModelId} onChange={(e) => setSelectedModelId(e.target.value)}>
@@ -2485,20 +2498,24 @@ export const EnrichmentWorkbench: React.FC = () => {
                                     setModelDraft({
                                         ...modelDraft,
                                         provider,
-                                        apiKeyEnv: provider === "gemini" ? "GEMINI_API_KEY" : "OPENAI_API_KEY",
+                                        apiKeyEnv: provider === "gemini" ? "GEMINI_API_KEY" : provider === "kimi" ? "MOONSHOT_API_KEY" : "OPENAI_API_KEY",
                                         defaultModel: provider === "gemini"
                                             ? "gemini-3.5-flash"
-                                            : modelDraft.provider === "openai" ? modelDraft.defaultModel || "gpt-5.5" : "gpt-5.5",
+                                            : provider === "kimi"
+                                                ? "kimi-k2.6"
+                                                : modelDraft.provider === "openai" ? modelDraft.defaultModel || "gpt-5.5" : "gpt-5.5",
+                                        modelParams: provider === "kimi" ? { thinking: { type: "disabled" } } : modelDraft.modelParams || {},
                                     });
                                 }}
                             >
                                 <option value="openai">OpenAI</option>
                                 <option value="gemini">Gemini</option>
+                                <option value="kimi">Kimi</option>
                             </select>
                             <p className="rounded-md bg-amber-50 px-2 py-1.5 text-[11px] text-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
                                 Env var name only. Put the API key value in web/.env or the shell, then reference it here.
                             </p>
-                            <input className="rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950" value={modelDraft.apiKeyEnv} onChange={(e) => setModelDraft({ ...modelDraft, apiKeyEnv: e.target.value })} placeholder={modelDraft.provider === "gemini" ? "GEMINI_API_KEY" : "OPENAI_API_KEY"} aria-label="AI model API key environment variable name" />
+                            <input className="rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950" value={modelDraft.apiKeyEnv} onChange={(e) => setModelDraft({ ...modelDraft, apiKeyEnv: e.target.value })} placeholder={modelDraft.provider === "gemini" ? "GEMINI_API_KEY" : modelDraft.provider === "kimi" ? "MOONSHOT_API_KEY" : "OPENAI_API_KEY"} aria-label="AI model API key environment variable name" />
                             <input className="rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950" value={modelDraft.defaultModel} onChange={(e) => setModelDraft({ ...modelDraft, defaultModel: e.target.value })} placeholder="Default model" />
                             <textarea className="h-28 rounded border px-2 py-1 font-mono text-xs dark:border-slate-700 dark:bg-slate-950" value={pretty(modelDraft.modelParams ?? {})} onChange={(e) => setModelDraft({ ...modelDraft, modelParams: parseJsonField(e.target.value, {}) })} />
                         </div>

@@ -40,7 +40,7 @@ export interface ProxyStorageProfile {
 export interface ProxyModelProfile {
     id: string;
     name: string;
-    provider: "openai" | "gemini";
+    provider: "openai" | "gemini" | "kimi";
     apiKeyEnv: string;
     defaultModel: string;
     modelParams?: Record<string, unknown>;
