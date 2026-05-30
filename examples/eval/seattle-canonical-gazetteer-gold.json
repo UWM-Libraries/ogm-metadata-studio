@@ -1,0 +1,178 @@
+{
+  "name": "Seattle canonical gazetteer gold v1",
+  "description": "Small deterministic evaluation set for canonical gazetteer matching: direct source concordance, whole-map spatial scoping, and per-label projected position.",
+  "canonicalPlaces": [
+    {
+      "ogmPlaceId": "ogm:place:whosonfirst:101730401",
+      "name": "Seattle",
+      "normalizedName": "seattle",
+      "displayName": "Seattle, King County, Washington, United States",
+      "names": [
+        { "value": "Seattle", "normalized": "seattle", "source": "canonical:name", "weight": 1 }
+      ],
+      "centroid": { "lon": -122.3321, "lat": 47.6062 },
+      "bbox": [-122.44, 47.49, -122.23, 47.74],
+      "featureCategory": "administrative",
+      "featureClass": "wof",
+      "featureCode": "locality",
+      "country": "US",
+      "region": "WA",
+      "sourceCount": 3,
+      "sources": [
+        { "authority": "whosonfirst", "authorityId": "101730401", "name": "Seattle" },
+        { "authority": "geonames", "authorityId": "5809844", "name": "Seattle" },
+        { "authority": "openstreetmap", "authorityId": "relation/237385", "name": "Seattle" }
+      ],
+      "concordances": {
+        "whosonfirst": ["101730401"],
+        "geonames": ["5809844"],
+        "openstreetmap": ["relation/237385"],
+        "wikidata": ["Q5083"]
+      }
+    },
+    {
+      "ogmPlaceId": "ogm:place:synthetic:union-seattle",
+      "name": "Union",
+      "normalizedName": "union",
+      "displayName": "Union, Seattle, Washington",
+      "names": [
+        { "value": "Union", "normalized": "union", "source": "canonical:name", "weight": 1 }
+      ],
+      "centroid": { "lon": -122.32, "lat": 47.56 },
+      "bbox": [-122.33, 47.55, -122.31, 47.57],
+      "featureCategory": "populated place",
+      "featureClass": "P",
+      "featureCode": "PPL",
+      "country": "US",
+      "region": "WA",
+      "sourceCount": 1,
+      "sources": [
+        { "authority": "geonames", "authorityId": "1001", "name": "Union" }
+      ],
+      "concordances": {
+        "geonames": ["1001"]
+      }
+    },
+    {
+      "ogmPlaceId": "ogm:place:synthetic:union-oregon",
+      "name": "Union",
+      "normalizedName": "union",
+      "displayName": "Union, Oregon",
+      "names": [
+        { "value": "Union", "normalized": "union", "source": "canonical:name", "weight": 1 }
+      ],
+      "centroid": { "lon": -123.02, "lat": 45.21 },
+      "bbox": [-123.03, 45.2, -123.01, 45.22],
+      "featureCategory": "populated place",
+      "featureClass": "P",
+      "featureCode": "PPL",
+      "country": "US",
+      "region": "OR",
+      "sourceCount": 1,
+      "sources": [
+        { "authority": "geonames", "authorityId": "1002", "name": "Union" }
+      ],
+      "concordances": {
+        "geonames": ["1002"]
+      }
+    },
+    {
+      "ogmPlaceId": "ogm:place:synthetic:north-point-west",
+      "name": "North Point",
+      "normalizedName": "north point",
+      "displayName": "North Point, west side",
+      "names": [
+        { "value": "North Point", "normalized": "north point", "source": "canonical:name", "weight": 1 }
+      ],
+      "centroid": { "lon": -122.42, "lat": 47.62 },
+      "bbox": [-122.421, 47.619, -122.419, 47.621],
+      "featureCategory": "landform",
+      "featureClass": "natural",
+      "featureCode": "point",
+      "country": "US",
+      "region": "WA",
+      "sourceCount": 1,
+      "sources": [
+        { "authority": "openstreetmap", "authorityId": "node/1", "name": "North Point" }
+      ],
+      "concordances": {
+        "openstreetmap": ["node/1"]
+      }
+    },
+    {
+      "ogmPlaceId": "ogm:place:synthetic:north-point-east",
+      "name": "North Point",
+      "normalizedName": "north point",
+      "displayName": "North Point, east side",
+      "names": [
+        { "value": "North Point", "normalized": "north point", "source": "canonical:name", "weight": 1 }
+      ],
+      "centroid": { "lon": -122.25, "lat": 47.62 },
+      "bbox": [-122.251, 47.619, -122.249, 47.621],
+      "featureCategory": "landform",
+      "featureClass": "natural",
+      "featureCode": "point",
+      "country": "US",
+      "region": "WA",
+      "sourceCount": 1,
+      "sources": [
+        { "authority": "openstreetmap", "authorityId": "node/2", "name": "North Point" }
+      ],
+      "concordances": {
+        "openstreetmap": ["node/2"]
+      }
+    }
+  ],
+  "cases": [
+    {
+      "id": "direct-seattle-source-id",
+      "description": "Existing WOF source match should resolve directly to the Seattle canonical cluster.",
+      "mapExtent": { "west": -122.45, "south": 47.48, "east": -122.22, "north": 47.75, "confidence": 0.8 },
+      "placenames": [
+        {
+          "id": "place-0001",
+          "name": "Seattle (Wash.)",
+          "authority": "whosonfirst",
+          "authorityId": "101730401",
+          "gazetteerMatches": [
+            { "provider": "whosonfirst", "authorityId": "101730401", "name": "Seattle" }
+          ]
+        }
+      ],
+      "textSegments": [
+        { "id": "text-0001", "content": "Seattle", "role": "label", "confidence": 0.96, "legacyIndex": 1 }
+      ],
+      "expected": [
+        { "placenameId": "place-0001", "ogmPlaceId": "ogm:place:whosonfirst:101730401" }
+      ]
+    },
+    {
+      "id": "spatial-union-seattle",
+      "description": "Whole-map extent should remove the Oregon same-name candidate before fuzzy matching.",
+      "mapExtent": { "west": -122.45, "south": 47.48, "east": -122.22, "north": 47.75, "confidence": 0.8 },
+      "placenames": [
+        { "id": "place-0001", "name": "Union", "confidence": 0.9, "status": "candidate" }
+      ],
+      "textSegments": [
+        { "id": "text-0001", "content": "Union", "role": "label", "confidence": 0.96, "legacyIndex": 1 }
+      ],
+      "expected": [
+        { "placenameId": "place-0001", "ogmPlaceId": "ogm:place:synthetic:union-seattle" }
+      ]
+    },
+    {
+      "id": "projected-north-point-east",
+      "description": "Projected OCR label position should choose the east in-bounds North Point candidate.",
+      "mapExtent": { "west": -122.45, "south": 47.5, "east": -122.22, "north": 47.74, "confidence": 0.9 },
+      "placenames": [
+        { "id": "place-0001", "name": "North Point", "confidence": 0.94, "approxBbox": [0.86, 0.48, 0.9, 0.52], "status": "candidate" }
+      ],
+      "textSegments": [
+        { "id": "text-0001", "content": "North Point", "role": "label", "confidence": 0.96, "legacyIndex": 1, "approxBbox": [0.86, 0.48, 0.9, 0.52] }
+      ],
+      "expected": [
+        { "placenameId": "place-0001", "ogmPlaceId": "ogm:place:synthetic:north-point-east" }
+      ]
+    }
+  ]
+}

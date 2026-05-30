@@ -11,6 +11,25 @@ import { pipeline } from "node:stream/promises";
 import { buildWofConcordanceLayer } from "./wof-concordance.mjs";
 import { buildOsmConcordanceLayer } from "./osm-concordance.mjs";
 import { refreshWofConcordanceInAiEnrichments } from "./ai-enrichments-wof-refresh.mjs";
+import { filterRejectedMapText } from "./map-text-sanity.mjs";
+import {
+  compactExtractionForVisionAugmentation,
+  GOOGLE_VISION_OCR_CALL_ID,
+  HYBRID_VISION_OCR_PROVIDER,
+  mergeVisionAugmentedExtraction,
+  OPENAI_VISION_AUGMENTATION_CALL_ID,
+} from "./vision-extraction-augmentation.mjs";
+import {
+  callGeminiMapLabelExtraction,
+  callOpenAIMapLabelReconciliation,
+  GEMINI_LABEL_EXTRACTION_CALL_ID,
+  HYBRID_GEMINI_VISION_OCR_PROVIDER,
+  HYBRID_OPENAI_VISION_OCR_PROVIDER,
+  OPENAI_LABEL_RECONCILIATION_CALL_ID,
+  mergeGoogleVisionWithGeminiExtraction,
+  mergeGoogleVisionWithOpenAIReconciliation,
+  redactGeminiRequestForPersistence,
+} from "./gemini-text-extraction.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const execFileAsync = promisify(execFile);
@@ -78,6 +97,18 @@ const GOOGLE_VISION_TILE_SIZE = Number(process.env.GOOGLE_VISION_TILE_SIZE || 30
 const GOOGLE_VISION_TILE_OVERLAP = Number(process.env.GOOGLE_VISION_TILE_OVERLAP || 320);
 const GOOGLE_VISION_TILE_MAX_COUNT = Number(process.env.GOOGLE_VISION_TILE_MAX_COUNT || 12);
 const GOOGLE_VISION_TILE_JPEG_QUALITY = Number(process.env.GOOGLE_VISION_TILE_JPEG_QUALITY || 88);
+const OPENAI_VISION_AUGMENT_OCR_ENABLED = process.env.OPENAI_VISION_AUGMENT_OCR_ENABLED !== "false";
+const OPENAI_VISION_AUGMENT_USE_OCR_SOURCES = process.env.OPENAI_VISION_AUGMENT_USE_OCR_SOURCES !== "false";
+const OPENAI_VISION_AUGMENT_MAX_DIMENSION = Number(process.env.OPENAI_VISION_AUGMENT_MAX_DIMENSION || 1800);
+const OPENAI_VISION_AUGMENT_JPEG_QUALITY = Number(process.env.OPENAI_VISION_AUGMENT_JPEG_QUALITY || 84);
+const OPENAI_VISION_AUGMENT_MAX_IMAGES = Math.max(1, Number(process.env.OPENAI_VISION_AUGMENT_MAX_IMAGES || GOOGLE_VISION_TILE_MAX_COUNT + 1));
+const GEMINI_TEXT_EXTRACT_USE_SMALL_CROPS = process.env.GEMINI_TEXT_EXTRACT_USE_SMALL_CROPS !== "false";
+const GEMINI_TEXT_EXTRACT_CROP_SIZE = Math.max(700, Number(process.env.GEMINI_TEXT_EXTRACT_CROP_SIZE || 1800));
+const GEMINI_TEXT_EXTRACT_CROP_OVERLAP = Math.max(0, Number(process.env.GEMINI_TEXT_EXTRACT_CROP_OVERLAP || 320));
+const GEMINI_TEXT_EXTRACT_MAX_CROPS = Math.max(1, Number(process.env.GEMINI_TEXT_EXTRACT_MAX_CROPS || 64));
+const GEMINI_TEXT_EXTRACT_TARGET_CROPS = Math.max(0, Number(process.env.GEMINI_TEXT_EXTRACT_TARGET_CROPS || 0));
+const GEMINI_TEXT_EXTRACT_JPEG_QUALITY = Math.max(50, Math.min(95, Number(process.env.GEMINI_TEXT_EXTRACT_JPEG_QUALITY || 88)));
+const AI_ENRICHMENTS_CONCORDANCE_PLACENAME_LIMIT = Math.max(0, Number(process.env.AI_ENRICHMENTS_CONCORDANCE_PLACENAME_LIMIT || 400));
 const METADATA_WRITER_TEXT_LIMIT = Math.max(0, Number(process.env.ENRICHMENT_PROXY_METADATA_WRITER_TEXT_LIMIT || 320));
 const METADATA_WRITER_TEXT_GROUP_LIMIT = Math.max(0, Number(process.env.ENRICHMENT_PROXY_METADATA_WRITER_TEXT_GROUP_LIMIT || 180));
 const METADATA_WRITER_PLACENAME_LIMIT = Math.max(0, Number(process.env.ENRICHMENT_PROXY_METADATA_WRITER_PLACENAME_LIMIT || 160));
@@ -124,6 +155,22 @@ const DEFAULT_CONFIG = {
       defaultModel: "gpt-5.5",
       modelParams: {},
     },
+    {
+      id: "openai-mini-reconciliation",
+      name: "OpenAI mini label reconciliation",
+      provider: "openai",
+      apiKeyEnv: "OPENAI_API_KEY",
+      defaultModel: "gpt-5.4-mini",
+      modelParams: {},
+    },
+    {
+      id: "gemini-default",
+      name: "Gemini label extraction",
+      provider: "gemini",
+      apiKeyEnv: "GEMINI_API_KEY",
+      defaultModel: "gemini-3.5-flash",
+      modelParams: {},
+    },
   ],
 };
 
@@ -134,14 +181,24 @@ async function loadConfig() {
   try {
     const text = await readFile(CONFIG_PATH, "utf8");
     const parsed = JSON.parse(text);
+    const modelProfiles = Array.isArray(parsed.modelProfiles) ? parsed.modelProfiles : DEFAULT_CONFIG.modelProfiles;
     return {
       storageProfiles: Array.isArray(parsed.storageProfiles) ? parsed.storageProfiles : [],
       visionProfiles: Array.isArray(parsed.visionProfiles) ? parsed.visionProfiles : [],
-      modelProfiles: Array.isArray(parsed.modelProfiles) ? parsed.modelProfiles : DEFAULT_CONFIG.modelProfiles,
+      modelProfiles: mergeDefaultModelProfiles(modelProfiles),
     };
   } catch {
     return DEFAULT_CONFIG;
   }
+}
+
+function mergeDefaultModelProfiles(profiles) {
+  const list = Array.isArray(profiles) ? profiles : [];
+  const ids = new Set(list.map((profile) => profile?.id).filter(Boolean));
+  return [
+    ...list,
+    ...DEFAULT_CONFIG.modelProfiles.filter((profile) => !ids.has(profile.id)),
+  ];
 }
 
 async function saveConfig(config) {
@@ -210,7 +267,8 @@ function validateConfigEnvReferences(config) {
     validateEnvReference(profile.sessionTokenEnv, "S3 session token");
   }
   for (const profile of config.modelProfiles) {
-    validateEnvReference(profile.apiKeyEnv, "OpenAI API key");
+    const provider = String(profile.provider || "openai").toLowerCase();
+    validateEnvReference(profile.apiKeyEnv, provider === "gemini" ? "Gemini API key" : "OpenAI API key");
   }
   for (const profile of config.visionProfiles || []) {
     validateEnvReference(profile.apiKeyEnv, "Google Cloud Vision API key");
@@ -1171,6 +1229,350 @@ async function createAnalysisDerivativesFromBuffer(buffer, contentType, assetId)
   return derivatives;
 }
 
+async function createVisionAugmentationDerivativeFromOcrSource(source, assetId, sequence) {
+  const sharp = await loadSharp();
+  let data = source.buffer;
+  let width = source.width || 0;
+  let height = source.height || 0;
+  let mimeType = source.mimeType || "image/jpeg";
+
+  if (sharp && data && Math.max(width, height) > OPENAI_VISION_AUGMENT_MAX_DIMENSION) {
+    const rendered = await sharp(data, { limitInputPixels: false })
+      .rotate()
+      .resize({
+        width: OPENAI_VISION_AUGMENT_MAX_DIMENSION,
+        height: OPENAI_VISION_AUGMENT_MAX_DIMENSION,
+        fit: "inside",
+        withoutEnlargement: true,
+      })
+      .toColorspace("srgb")
+      .jpeg({ quality: Math.max(50, Math.min(95, OPENAI_VISION_AUGMENT_JPEG_QUALITY)), mozjpeg: true })
+      .toBuffer({ resolveWithObject: true });
+    data = rendered.data;
+    width = rendered.info.width || width;
+    height = rendered.info.height || height;
+    mimeType = "image/jpeg";
+  }
+
+  return withoutUndefined({
+    id: `${assetId}:${source.sourceId || `ocr-source-${sequence + 1}`}`,
+    kind: source.sourceKind === "tile" ? "ocr_tile" : "ocr_full",
+    dataUri: data ? `data:${mimeType};base64,${data.toString("base64")}` : undefined,
+    width,
+    height,
+    mimeType,
+    bytes: data?.length || source.normalizedBytes || source.buffer?.length || 0,
+    status: "ready",
+    sourceImageId: source.sourceId || `ocr-source-${sequence + 1}`,
+    sourceImageKind: source.sourceKind || "full",
+    region: source.region,
+    coordinateWidth: source.coordinateWidth,
+    coordinateHeight: source.coordinateHeight,
+    notes: source.sourceKind === "tile"
+      ? "OpenAI vision augmentation image generated from the same OCR tile region submitted to Google Cloud Vision."
+      : "OpenAI vision augmentation image generated from the same normalized full-image source submitted to Google Cloud Vision.",
+  });
+}
+
+async function createVisionAugmentationDerivatives({ buffer, contentType, assetId, visionSources }) {
+  const sources = Array.isArray(visionSources?.sources) ? visionSources.sources : [];
+  if (!OPENAI_VISION_AUGMENT_USE_OCR_SOURCES || sources.length === 0) {
+    return createAnalysisDerivativesFromBuffer(buffer, contentType, assetId);
+  }
+  const selectedSources = sources.slice(0, OPENAI_VISION_AUGMENT_MAX_IMAGES);
+  return Promise.all(selectedSources.map((source, index) => createVisionAugmentationDerivativeFromOcrSource(source, assetId, index)));
+}
+
+function buildGeminiTextExtractionTiles(width, height) {
+  if (!GEMINI_TEXT_EXTRACT_USE_SMALL_CROPS || width <= 0 || height <= 0) return [];
+  let tileSize = GEMINI_TEXT_EXTRACT_CROP_SIZE;
+  const maxCrops = GEMINI_TEXT_EXTRACT_MAX_CROPS;
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const overlap = Math.max(0, Math.min(GEMINI_TEXT_EXTRACT_CROP_OVERLAP, tileSize - 1));
+    const step = Math.max(1, tileSize - overlap);
+    const tiles = [];
+    for (let top = 0; top < height;) {
+      const bottom = Math.min(height, top + tileSize);
+      const actualTop = Math.max(0, bottom - tileSize);
+      for (let left = 0; left < width;) {
+        const right = Math.min(width, left + tileSize);
+        const actualLeft = Math.max(0, right - tileSize);
+        const tile = {
+          left: Math.round(actualLeft),
+          top: Math.round(actualTop),
+          width: Math.round(right - actualLeft),
+          height: Math.round(bottom - actualTop),
+        };
+        if (!tiles.some((existing) => existing.left === tile.left && existing.top === tile.top)) tiles.push(tile);
+        if (right >= width) break;
+        left += step;
+      }
+      if (bottom >= height) break;
+      top += step;
+    }
+    if (tiles.length <= maxCrops || attempt === 7) return tiles;
+    tileSize = Math.ceil(tileSize * 1.18);
+  }
+  return [];
+}
+
+function normalizedBoxFromValue(value) {
+  if (!Array.isArray(value) || value.length < 4) return null;
+  const numbers = value.slice(0, 4).map(Number);
+  if (!numbers.every(Number.isFinite)) return null;
+  const x1 = Math.max(0, Math.min(1, Math.min(numbers[0], numbers[2])));
+  const y1 = Math.max(0, Math.min(1, Math.min(numbers[1], numbers[3])));
+  const x2 = Math.max(0, Math.min(1, Math.max(numbers[0], numbers[2])));
+  const y2 = Math.max(0, Math.min(1, Math.max(numbers[1], numbers[3])));
+  return x2 > x1 && y2 > y1 ? [x1, y1, x2, y2] : null;
+}
+
+function normalizedTileBbox(tile, coordinateWidth, coordinateHeight) {
+  const width = Number(coordinateWidth || 0);
+  const height = Number(coordinateHeight || 0);
+  if (width <= 0 || height <= 0) return null;
+  return normalizedBoxFromValue([
+    Number(tile?.left || 0) / width,
+    Number(tile?.top || 0) / height,
+    (Number(tile?.left || 0) + Number(tile?.width || 0)) / width,
+    (Number(tile?.top || 0) + Number(tile?.height || 0)) / height,
+  ]);
+}
+
+function normalizedBoxIntersectionArea(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== 4 || b.length !== 4) return 0;
+  const x1 = Math.max(Number(a[0]), Number(b[0]));
+  const y1 = Math.max(Number(a[1]), Number(b[1]));
+  const x2 = Math.min(Number(a[2]), Number(b[2]));
+  const y2 = Math.min(Number(a[3]), Number(b[3]));
+  return Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+}
+
+function normalizedBoxCenterInside(box, container) {
+  if (!Array.isArray(box) || !Array.isArray(container) || box.length !== 4 || container.length !== 4) return false;
+  const x = (Number(box[0]) + Number(box[2])) / 2;
+  const y = (Number(box[1]) + Number(box[3])) / 2;
+  return x >= container[0] && x <= container[2] && y >= container[1] && y <= container[3];
+}
+
+function textReconciliationTargetCrops(request = {}, provider = "gemini") {
+  const providerSpecific = provider === "openai"
+    ? request.openaiTextReconciliationTargetCrops ?? request.openaiTextExtractionTargetCrops
+    : request.geminiTextExtractionTargetCrops;
+  const value = Number(
+    providerSpecific
+    ?? request.textExtractionTargetCrops
+    ?? request.mapLabelReconciliationTargetCrops
+    ?? GEMINI_TEXT_EXTRACT_TARGET_CROPS,
+  );
+  return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
+}
+
+function ocrEvidenceForTextReconciliationTiles(ocrExtraction) {
+  return [
+    ...asArray(ocrExtraction?.text).map((entry, index) => ({ entry, index, kind: "text", weight: 1 })),
+    ...asArray(ocrExtraction?.text_groups).map((entry, index) => ({ entry, index, kind: "text_group", weight: 1.35 })),
+  ].map(({ entry, index, kind, weight }) => {
+    const content = String(entry?.content || "").trim();
+    const bbox = normalizedBoxFromValue(entry?.approx_bbox || entry?.approxBbox);
+    if (!content || !bbox) return null;
+    return {
+      content,
+      bbox,
+      kind,
+      index,
+      role: String(entry?.role || "other").toLowerCase(),
+      confidence: Math.max(0, Math.min(1, Number(entry?.confidence ?? 0.8))),
+      weight,
+    };
+  }).filter(Boolean);
+}
+
+function mapTextSelectionBonus(content, role) {
+  const normalized = normalizedContentKey(content);
+  if (!normalized) return 0;
+  let score = 0;
+  if (["waterbody", "park", "landmark", "neighborhood", "railroad", "ferry"].includes(role)) score += 1.1;
+  if (["street", "route"].includes(role)) score += 0.45;
+  if (/\b(?:park|lake|bay|sound|waterway|canal|harbor|harbour|point|beach|cemetery|golf|club|field|terminal|dock|ferry|station|railway|railroad|district)\b/i.test(content)) score += 0.85;
+  if (/\b(?:st|street|ave|avenue|blvd|boulevard|way|road|rd|pl|place|ct|court)\b\.?$/i.test(content)) score += 0.25;
+  if (/^\d+$/.test(normalized)) score -= 0.25;
+  return score;
+}
+
+function scoreTextReconciliationTile(tile, { coordinateWidth, coordinateHeight, ocrEvidence }) {
+  const tileBbox = normalizedTileBbox(tile, coordinateWidth, coordinateHeight);
+  if (!tileBbox) return { score: 0, evidenceCount: 0, lowConfidenceCount: 0, featureHintCount: 0 };
+
+  let score = 0;
+  let evidenceCount = 0;
+  let lowConfidenceCount = 0;
+  let featureHintCount = 0;
+  for (const evidence of ocrEvidence) {
+    const intersection = normalizedBoxIntersectionArea(evidence.bbox, tileBbox);
+    const centerInside = normalizedBoxCenterInside(evidence.bbox, tileBbox);
+    if (!centerInside && intersection <= 0) continue;
+    const overlapWeight = centerInside
+      ? 1
+      : Math.min(0.65, intersection / Math.max(normalizedBoxArea(evidence.bbox), 0.000001));
+    const lowConfidenceBonus = evidence.confidence < 0.78 ? (0.78 - evidence.confidence) * 3 : 0;
+    const featureBonus = mapTextSelectionBonus(evidence.content, evidence.role);
+    const lengthBonus = Math.min(0.9, normalizedContentKey(evidence.content).length / 28);
+    score += Math.max(0.15, evidence.weight + lowConfidenceBonus + featureBonus + lengthBonus) * overlapWeight;
+    evidenceCount += 1;
+    if (lowConfidenceBonus > 0) lowConfidenceCount += 1;
+    if (featureBonus >= 0.5) featureHintCount += 1;
+  }
+  return {
+    score: Number(score.toFixed(4)),
+    evidenceCount,
+    lowConfidenceCount,
+    featureHintCount,
+  };
+}
+
+function evenlySelectedTileIndices(totalCount, targetCount) {
+  const selected = new Set();
+  if (targetCount <= 0 || targetCount >= totalCount) {
+    for (let index = 0; index < totalCount; index += 1) selected.add(index);
+    return selected;
+  }
+  const stride = totalCount / targetCount;
+  for (let index = 0; index < targetCount; index += 1) {
+    selected.add(Math.min(totalCount - 1, Math.floor((index + 0.5) * stride)));
+  }
+  for (let index = 0; selected.size < targetCount && index < totalCount; index += 1) {
+    selected.add(index);
+  }
+  return selected;
+}
+
+function selectTextReconciliationTiles(tiles, { coordinateWidth, coordinateHeight, ocrExtraction, targetCrops } = {}) {
+  const tileList = Array.isArray(tiles) ? tiles : [];
+  const target = Math.max(0, Math.floor(Number(targetCrops) || 0));
+  const ocrEvidence = ocrEvidenceForTextReconciliationTiles(ocrExtraction);
+  const scored = tileList.map((tile, originalIndex) => {
+    const metrics = scoreTextReconciliationTile(tile, { coordinateWidth, coordinateHeight, ocrEvidence });
+    return { tile, originalIndex, ...metrics };
+  });
+
+  if (target <= 0 || target >= scored.length) {
+    return scored.map((item) => ({
+      ...item.tile,
+      selection: {
+        strategy: "all_crops",
+        originalIndex: item.originalIndex,
+        selectionCandidateCount: scored.length,
+        selectionTargetCount: target,
+        selectionScore: item.score,
+        ocrEvidenceCount: ocrEvidence.length,
+        tileEvidenceCount: item.evidenceCount,
+        lowConfidenceCount: item.lowConfidenceCount,
+        featureHintCount: item.featureHintCount,
+      },
+    }));
+  }
+
+  const ranked = [...scored].sort((a, b) => b.score - a.score || a.originalIndex - b.originalIndex);
+  const hasPositiveEvidenceScore = ranked.some((item) => item.score > 0);
+  const selectedIndices = hasPositiveEvidenceScore
+    ? new Set(ranked.slice(0, target).map((item) => item.originalIndex))
+    : evenlySelectedTileIndices(scored.length, target);
+  const rankByIndex = new Map(ranked.map((item, index) => [item.originalIndex, index + 1]));
+  const strategy = hasPositiveEvidenceScore ? "ocr_evidence_budget_v1" : "even_grid_budget_v1";
+
+  return scored
+    .filter((item) => selectedIndices.has(item.originalIndex))
+    .map((item) => ({
+      ...item.tile,
+      selection: {
+        strategy,
+        originalIndex: item.originalIndex,
+        selectionRank: rankByIndex.get(item.originalIndex),
+        selectionCandidateCount: scored.length,
+        selectionTargetCount: target,
+        selectionScore: item.score,
+        ocrEvidenceCount: ocrEvidence.length,
+        tileEvidenceCount: item.evidenceCount,
+        lowConfidenceCount: item.lowConfidenceCount,
+        featureHintCount: item.featureHintCount,
+      },
+    }));
+}
+
+async function createTextReconciliationDerivatives({ buffer, contentType, assetId, visionSources, provider = "gemini", ocrExtraction, request = {} }) {
+  if (!GEMINI_TEXT_EXTRACT_USE_SMALL_CROPS) {
+    return createVisionAugmentationDerivatives({ buffer, contentType, assetId, visionSources });
+  }
+  const sharp = await loadSharp();
+  if (!sharp) {
+    return createVisionAugmentationDerivatives({ buffer, contentType, assetId, visionSources });
+  }
+  const metadata = await sharp(buffer, { limitInputPixels: false }).metadata();
+  const coordinateWidth = Number(visionSources?.summary?.coordinateWidth || metadata.width || 0);
+  const coordinateHeight = Number(visionSources?.summary?.coordinateHeight || metadata.height || 0);
+  const tiles = buildGeminiTextExtractionTiles(coordinateWidth, coordinateHeight);
+  if (tiles.length === 0) {
+    return createVisionAugmentationDerivatives({ buffer, contentType, assetId, visionSources });
+  }
+  const targetCrops = textReconciliationTargetCrops(request, provider);
+  const selectedTiles = selectTextReconciliationTiles(tiles, {
+    coordinateWidth,
+    coordinateHeight,
+    ocrExtraction,
+    targetCrops,
+  });
+
+  const derivatives = [];
+  const isOpenAI = provider === "openai";
+  const cropPrefix = isOpenAI ? "openai-reconcile-crop" : "gemini-crop";
+  const cropKind = isOpenAI ? "openai_text_reconciliation_crop" : "gemini_text_crop";
+  for (const [index, tile] of selectedTiles.entries()) {
+    const cropNumber = Number.isInteger(tile.selection?.originalIndex) ? tile.selection.originalIndex + 1 : index + 1;
+    const cropId = `${cropPrefix}-${String(cropNumber).padStart(3, "0")}`;
+    const tileRegion = {
+      left: tile.left,
+      top: tile.top,
+      width: tile.width,
+      height: tile.height,
+    };
+    const rendered = await sharp(buffer, { limitInputPixels: false })
+      .rotate()
+      .extract(tileRegion)
+      .toColorspace("srgb")
+      .jpeg({ quality: GEMINI_TEXT_EXTRACT_JPEG_QUALITY, mozjpeg: true })
+      .toBuffer({ resolveWithObject: true });
+    derivatives.push({
+      id: `${assetId}:${cropId}`,
+      kind: cropKind,
+      dataUri: `data:image/jpeg;base64,${rendered.data.toString("base64")}`,
+      width: rendered.info.width || tile.width,
+      height: rendered.info.height || tile.height,
+      mimeType: "image/jpeg",
+      bytes: rendered.data.length,
+      status: "ready",
+      sourceImageId: cropId,
+      sourceImageKind: cropKind,
+      region: tileRegion,
+      coordinateWidth,
+      coordinateHeight,
+      tileSelection: tile.selection,
+      notes: isOpenAI
+        ? "OpenAI map-label reconciliation crop rendered from the original image at map-coordinate resolution."
+        : "Gemini exhaustive text extraction crop rendered from the original image at map-coordinate resolution.",
+    });
+  }
+  return derivatives;
+}
+
+async function createGeminiTextExtractionDerivatives(args) {
+  return createTextReconciliationDerivatives({ ...args, provider: "gemini" });
+}
+
+async function createOpenAITextReconciliationDerivatives(args) {
+  return createTextReconciliationDerivatives({ ...args, provider: "openai" });
+}
+
 function formatBytes(bytes) {
   const value = Number(bytes || 0);
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)} MB`;
@@ -1589,7 +1991,7 @@ function normalizedMergedBox(items, pageWidth, pageHeight) {
   ];
 }
 
-const OCR_TEXT_GROUPING_STRATEGY = "deterministic_collinear_bbox_clustering_v1";
+const OCR_TEXT_GROUPING_STRATEGY = "deterministic_collinear_bbox_clustering_v2";
 
 function isGroupableOcrText(entry) {
   const content = String(entry?.content || "").trim();
@@ -1678,8 +2080,9 @@ const MAP_LABEL_STOPWORDS = new Set([
 ]);
 
 const MAP_LABEL_FEATURE_SUFFIXES = {
+  park: new Set(["park", "parks"]),
   waterbody: new Set(["bay", "canal", "channel", "creek", "harbor", "lake", "river", "sound", "waterway"]),
-  landmark: new Set(["airport", "cem", "cemetery", "club", "college", "dock", "field", "fort", "hospital", "island", "park", "point", "university"]),
+  landmark: new Set(["airport", "cem", "cemetery", "club", "college", "dock", "field", "fort", "hospital", "island", "point", "university"]),
   region: new Set(["addition", "district", "heights", "hill", "hills", "junction", "valley"]),
 };
 
@@ -1924,12 +2327,133 @@ function textGroupLooksUseful(content) {
     .map((token) => token.replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, ""))
     .filter(Boolean);
   if (tokens.length === 2 && looksLikeMapPlacename(content)) return true;
+  if (tokens.length === 2) {
+    const lowerTokens = tokens.map((token) => token.toLowerCase().replace(/\.$/, ""));
+    const alphaTokens = lowerTokens.filter((token) => /[a-z]/.test(token));
+    if (alphaTokens.length === 0) return false;
+    if (lowerTokens.every((token) => MAP_LABEL_STOPWORDS.has(token))) return false;
+    if (tokens.every((token) => token.length <= 2)) return false;
+    return alphaTokens.some((token) => token.length >= 3);
+  }
   if (tokens.length < 3) return false;
   const shortTokenRatio = tokens.filter((token) => token.length <= 2).length / tokens.length;
   if (shortTokenRatio > 0.5) return false;
   const uniqueTokenRatio = new Set(tokens.map((token) => token.toLowerCase())).size / tokens.length;
   if (uniqueTokenRatio < 0.6) return false;
   return true;
+}
+
+function normalizedMapLabelToken(token) {
+  return String(token || "").toLowerCase().replace(/\.$/, "");
+}
+
+function specificNameTokensForFeatureGroup(item) {
+  return mapLabelTokens(item?.content)
+    .filter((token) => /[A-Za-z]/.test(token))
+    .filter((token) => {
+      const normalized = normalizedMapLabelToken(token);
+      return normalized.length >= 3
+        && !MAP_LABEL_STOPWORDS.has(normalized)
+        && !MAP_LABEL_FEATURE_WORDS.has(normalized);
+    })
+    .slice(0, 4);
+}
+
+function featureSuffixTokenForGroup(item) {
+  const tokens = mapLabelTokens(item?.content);
+  const lowerTokens = tokens.map(normalizedMapLabelToken);
+  const alphaTokens = lowerTokens.filter((token) => /[a-z]/.test(token));
+  if (alphaTokens.length === 0 || alphaTokens.length > 2) return "";
+  if (alphaTokens.some((token) => !MAP_LABEL_FEATURE_WORDS.has(token) && !MAP_LABEL_STOPWORDS.has(token))) return "";
+  return alphaTokens.find((token) => MAP_LABEL_FEATURE_WORDS.has(token)) || "";
+}
+
+function textBoxOverlapRatio(a, b) {
+  const overlap = Math.max(0, Math.min(a.box.x2, b.box.x2) - Math.max(a.box.x1, b.box.x1));
+  return overlap / Math.max(1, Math.min(a.box.width, b.box.width));
+}
+
+function featureLabelItemsLookAdjacent(nameItem, suffixItem, medianHeight) {
+  const indexGap = Math.abs(Number(nameItem.index) - Number(suffixItem.index));
+  if (!Number.isFinite(indexGap) || indexGap > 10) return false;
+  const scale = Math.max(medianHeight, nameItem.box.height, suffixItem.box.height, 1);
+  const verticalGap = suffixItem.box.cy - nameItem.box.cy;
+  const leftAligned = Math.abs(nameItem.box.x1 - suffixItem.box.x1) <= scale * 1.6;
+  const centerAligned = Math.abs(nameItem.box.cx - suffixItem.box.cx) <= scale * 2.2;
+  const overlaps = textBoxOverlapRatio(nameItem, suffixItem) >= 0.2;
+  const stacked = verticalGap >= -scale * 0.2
+    && verticalGap <= scale * 3.2
+    && (leftAligned || centerAligned || overlaps);
+  const inlineGap = suffixItem.box.x1 - nameItem.box.x2;
+  const inline = Math.abs(suffixItem.box.cy - nameItem.box.cy) <= scale * 0.8
+    && inlineGap >= -scale * 0.35
+    && inlineGap <= scale * 3;
+  return stacked || inline;
+}
+
+function featureLabelGroupContent(nameItem, suffixItem) {
+  const nameTokens = specificNameTokensForFeatureGroup(nameItem);
+  const suffixToken = featureSuffixTokenForGroup(suffixItem);
+  if (nameTokens.length === 0 || !suffixToken) return "";
+  const normalized = normalizeMapLabel([...nameTokens, suffixToken].join(" "));
+  if (!shouldEmitPlacenameCandidate(normalized)) return "";
+  return titleizeMapLabel(normalized);
+}
+
+function adjacentTextLabelGroupContent(firstItem, secondItem) {
+  const tokens = [
+    ...mapLabelTokens(firstItem?.content),
+    ...mapLabelTokens(secondItem?.content),
+  ].filter((token) => /[A-Za-z0-9]/.test(token));
+  if (tokens.length < 2 || tokens.length > 5) return "";
+  if (!tokens.some((token) => /[A-Za-z]/.test(token))) return "";
+  const content = tokens.join(" ").replace(/\s+/g, " ").trim();
+  if (!textGroupLooksUseful(content)) return "";
+  return titleizeMapLabel(content);
+}
+
+function supplementalFeatureLabelGroups(items, used, pageWidth, pageHeight, medianHeight, existingGroups) {
+  const existingKeys = new Set((existingGroups || []).map((group) => normalizeMapLabel(group.content).toLowerCase()).filter(Boolean));
+  const byKey = new Map();
+
+  for (const nameItem of items) {
+    if (used.has(nameItem.index)) continue;
+    for (const suffixItem of items) {
+      if (nameItem.index === suffixItem.index || used.has(suffixItem.index)) continue;
+      if (!featureLabelItemsLookAdjacent(nameItem, suffixItem, medianHeight)) continue;
+      const featureContent = featureLabelGroupContent(nameItem, suffixItem);
+      const content = featureContent || adjacentTextLabelGroupContent(nameItem, suffixItem);
+      const key = normalizeMapLabel(content).toLowerCase();
+      if (!key || existingKeys.has(key) || !textGroupLooksUseful(content)) continue;
+      const ordered = [nameItem, suffixItem];
+      const confidence = ordered.reduce((sum, item) => sum + Math.max(0, Math.min(1, item.confidence)), 0) / ordered.length;
+      const scale = Math.max(medianHeight, nameItem.box.height, suffixItem.box.height, 1);
+      const distance = Math.hypot(nameItem.box.cx - suffixItem.box.cx, nameItem.box.cy - suffixItem.box.cy) / scale;
+      const score = confidence * 100 - distance;
+      const sourceIndices = ordered.map((item) => item.index);
+      const first = ordered[0].box;
+      const last = ordered[ordered.length - 1].box;
+      const angle = Math.atan2(last.cy - first.cy, last.cx - first.cx) * 180 / Math.PI;
+      const candidate = {
+        content,
+        source_text_indices: sourceIndices,
+        source_text_count: ordered.length,
+        approx_bbox: normalizedBoxFromTextItems(ordered, pageWidth, pageHeight),
+        confidence: Math.max(0.35, Math.min(0.95, confidence * 0.96)),
+        role: "label",
+        orientation_degrees: Math.round(angle * 10) / 10,
+        reasoning: featureContent
+          ? "Supplemental OCR grouping paired nearby specific-name text with a feature suffix label while ignoring numeric-only clutter."
+          : "Supplemental OCR grouping paired nearby text fragments as a map label before any gazetteer lookup.",
+      };
+      const existing = byKey.get(key);
+      if (!existing || score > existing.score) byKey.set(key, { group: candidate, score });
+    }
+  }
+
+  return Array.from(byKey.values())
+    .sort((a, b) => b.score - a.score)
+    .map((entry) => entry.group);
 }
 
 function consolidateOcrTextEntries(entries, pageWidth, pageHeight) {
@@ -1940,24 +2464,26 @@ function consolidateOcrTextEntries(entries, pageWidth, pageHeight) {
   const items = entries
     .map((entry, index) => pixelItemFromTextEntry(entry, index, pageWidth, pageHeight))
     .filter(Boolean);
-  if (items.length < 3) {
+  if (items.length === 0) {
     return { groups: [], summary: { strategy: OCR_TEXT_GROUPING_STRATEGY, input_text_count: entries.length, group_count: 0, grouped_text_count: 0 } };
   }
 
   const medianHeight = Math.max(1, median(items.map((item) => item.box.height)));
   const proposalsByKey = new Map();
-  for (const seed of items) {
-    const nearby = items
-      .filter((item) => item.index !== seed.index && textItemsCompatible(seed, item, medianHeight))
-      .sort((a, b) => Math.hypot(a.box.cx - seed.box.cx, a.box.cy - seed.box.cy) - Math.hypot(b.box.cx - seed.box.cx, b.box.cy - seed.box.cy))
-      .slice(0, 10);
-    for (const second of nearby) {
-      const proposal = textLineProposal(seed, second, items, medianHeight);
-      if (!proposal) continue;
-      const key = proposal.map((item) => item.index).sort((a, b) => a - b).join(",");
-      const score = textGroupScore(proposal, medianHeight);
-      const existing = proposalsByKey.get(key);
-      if (!existing || score > existing.score) proposalsByKey.set(key, { items: proposal, score });
+  if (items.length >= 3) {
+    for (const seed of items) {
+      const nearby = items
+        .filter((item) => item.index !== seed.index && textItemsCompatible(seed, item, medianHeight))
+        .sort((a, b) => Math.hypot(a.box.cx - seed.box.cx, a.box.cy - seed.box.cy) - Math.hypot(b.box.cx - seed.box.cx, b.box.cy - seed.box.cy))
+        .slice(0, 10);
+      for (const second of nearby) {
+        const proposal = textLineProposal(seed, second, items, medianHeight);
+        if (!proposal) continue;
+        const key = proposal.map((item) => item.index).sort((a, b) => a - b).join(",");
+        const score = textGroupScore(proposal, medianHeight);
+        const existing = proposalsByKey.get(key);
+        if (!existing || score > existing.score) proposalsByKey.set(key, { items: proposal, score });
+      }
     }
   }
 
@@ -1989,6 +2515,14 @@ function consolidateOcrTextEntries(entries, pageWidth, pageHeight) {
       reasoning: "Deterministic secondary OCR pass grouped adjacent boxes with similar size along a shared text baseline.",
     });
   }
+  const supplementalGroups = supplementalFeatureLabelGroups(items, used, pageWidth, pageHeight, medianHeight, groups);
+  let supplementalAddedCount = 0;
+  for (const group of supplementalGroups) {
+    if (group.source_text_indices.some((index) => used.has(index))) continue;
+    for (const index of group.source_text_indices) used.add(index);
+    groups.push(group);
+    supplementalAddedCount += 1;
+  }
 
   groups.sort((a, b) => Math.min(...a.source_text_indices) - Math.min(...b.source_text_indices));
   return {
@@ -1999,6 +2533,8 @@ function consolidateOcrTextEntries(entries, pageWidth, pageHeight) {
       candidate_text_count: items.length,
       group_count: groups.length,
       grouped_text_count: used.size,
+      supplemental_map_label_group_count: supplementalAddedCount,
+      supplemental_feature_label_group_count: supplementalAddedCount,
     },
   };
 }
@@ -2367,10 +2903,11 @@ async function callGoogleVisionOcr(visionProfile, sourceOrSources) {
 
   const allEntries = sourceResults.flatMap((result) => result.entries);
   const deduped = dedupeOcrEntries(allEntries);
+  const sanity = filterRejectedMapText(deduped.entries);
   const coordinateWidth = sourceSummary.coordinateWidth || sources[0]?.coordinateWidth || sources[0]?.width || 0;
   const coordinateHeight = sourceSummary.coordinateHeight || sources[0]?.coordinateHeight || sources[0]?.height || 0;
-  const consolidated = consolidateOcrTextEntries(deduped.entries, coordinateWidth, coordinateHeight);
-  const placenames = deriveMapLabelPlacenames(deduped.entries, consolidated.groups);
+  const consolidated = consolidateOcrTextEntries(sanity.accepted, coordinateWidth, coordinateHeight);
+  const placenames = deriveMapLabelPlacenames(sanity.accepted, consolidated.groups);
   const fullText = sourceResults.map((result) => result.fullText).filter(Boolean).join("\n\n");
   const rawResponse = sourceResults.length === 1
     ? sourceResults[0].body
@@ -2385,7 +2922,7 @@ async function callGoogleVisionOcr(visionProfile, sourceOrSources) {
     };
   return {
     parsedResponse: {
-      text: deduped.entries,
+      text: sanity.accepted,
       text_groups: consolidated.groups,
       text_grouping_summary: {
         ...consolidated.summary,
@@ -2395,8 +2932,10 @@ async function callGoogleVisionOcr(visionProfile, sourceOrSources) {
         failed_source_count: sourceErrors.length,
         pre_dedupe_text_count: allEntries.length,
         duplicate_text_count: deduped.duplicatesRemoved,
+        rejected_symbol_text_count: sanity.rejected.length,
         tile_count: sourceSummary.tileCount || 0,
       },
+      rejected_text: sanity.rejected,
       placenames,
       map_bbox_estimate: {
         west: 0,
@@ -2417,6 +2956,8 @@ async function callGoogleVisionOcr(visionProfile, sourceOrSources) {
         bbox_inference_strategy: "not_inferred_from_ocr",
         ocr_source_strategy: sourceSummary,
         ocr_source_errors: sourceErrors,
+        text_sanity_strategy: "reject_repeated_building_placeholder_glyphs_v1",
+        rejected_symbol_text_count: sanity.rejected.length,
         limitations: "OCR boxes are generated by Google Cloud Vision. Large maps may be OCRed with a MapKurator-inspired tile/stitch pass. Placename candidates use deterministic map-label cleanup inspired by MapKurator post-OCR/entity-linking stages, but no external gazetteer is queried.",
       },
     },
@@ -2681,10 +3222,21 @@ function uniqueStrings(values) {
   return Array.from(new Set((values || []).map((value) => String(value || "").trim()).filter(Boolean)));
 }
 
+function asArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
 function asStringArray(value) {
   if (Array.isArray(value)) return uniqueStrings(value);
   if (value === undefined || value === null || value === "") return [];
   return uniqueStrings([value]);
+}
+
+function asNumberArray(value) {
+  const values = Array.isArray(value) ? value : value === undefined || value === null || value === "" ? [] : [value];
+  return Array.from(new Set(values
+    .map((item) => Number(item))
+    .filter((item) => Number.isInteger(item) && item >= 0)));
 }
 
 function extractionEvidenceText(extraction) {
@@ -3149,10 +3701,32 @@ function redactOpenAIRequestForPersistence(value) {
 
 function textRoleForAiEnrichments(entry) {
   const content = normalizedText(entry?.content);
-  const role = String(entry?.role || "other");
+  const role = String(entry?.role || "other").toLowerCase();
   if (/\b(?:st|street|ave|avenue|blvd|boulevard|way|road|rd|place|pl)\b\.?$/i.test(content)) return "street";
   if (/\b(?:1[5-9]\d{2}|20\d{2})\b/.test(content)) return "date";
-  return ["title", "coordinate", "label", "scale", "legend", "other"].includes(role) ? role : "other";
+  return [
+    "title",
+    "publication",
+    "publisher",
+    "date",
+    "coordinate",
+    "label",
+    "street",
+    "route",
+    "waterbody",
+    "landform",
+    "elevation",
+    "park",
+    "landmark",
+    "neighborhood",
+    "railroad",
+    "ferry",
+    "scale",
+    "legend",
+    "grid",
+    "marginalia",
+    "other",
+  ].includes(role) ? role : "other";
 }
 
 function textSegmentId(index) {
@@ -3168,7 +3742,7 @@ function extractionTextSegments(extraction, sourceCallId) {
       role: textRoleForAiEnrichments(entry),
       approxBbox: entry?.approx_bbox,
       confidence: typeof entry?.confidence === "number" ? Math.max(0, Math.min(1, entry.confidence)) : undefined,
-      sourceCallId,
+      sourceCallId: entry?.source_call_id || entry?.sourceCallId || sourceCallId,
       sourceResponsePath: `/text/${index}`,
       sourceAssetIds: ["source-original-image"],
       legacyIndex: index,
@@ -3197,7 +3771,7 @@ function extractionTextGroups(extraction, textSegments, sourceCallId) {
         .map((sourceIndex) => textSegments[sourceIndex]?.id)
         .filter(Boolean),
       sourceTextIndices: Array.isArray(entry?.source_text_indices) ? entry.source_text_indices : undefined,
-      sourceCallId,
+      sourceCallId: entry?.source_call_id || entry?.sourceCallId || sourceCallId,
       reasoning: entry?.reasoning || "Deterministically consolidated from adjacent OCR text segments.",
       extensions: optionalExtensions({
         sourceTextCount: entry?.source_text_count,
@@ -3223,6 +3797,8 @@ function derivedPlacenamesForAiEnrichments(extraction, resource, textSegments, e
     const sourceIndices = Array.isArray(place?.source_text_indices)
       ? place.source_text_indices
       : Number.isInteger(Number(place?.source_text_index)) ? [Number(place.source_text_index)] : [];
+    const placeSourceCallId = place?.source_call_id || place?.sourceCallId || extractionCallId;
+    const placeSourceCallIds = asStringArray(place?.source_call_ids);
     places.push(withoutUndefined({
       id: `place-${String(index + 1).padStart(4, "0")}`,
       name,
@@ -3233,8 +3809,11 @@ function derivedPlacenamesForAiEnrichments(extraction, resource, textSegments, e
       approxBbox: Array.isArray(place?.approx_bbox) ? place.approx_bbox : undefined,
       confidence: typeof place?.confidence === "number" ? Math.max(0, Math.min(1, place.confidence)) : undefined,
       status: "candidate",
-      sourceCallId: extractionCallId,
+      sourceCallId: placeSourceCallId,
       reasoning: place?.reasoning,
+      extensions: optionalExtensions({
+        sourceCallIds: placeSourceCallIds.length > 0 ? placeSourceCallIds : undefined,
+      }),
     }));
   }
 
@@ -3291,6 +3870,18 @@ function openAiPromptRecord({ id, label, purpose, call }) {
   });
 }
 
+function openAiModelParamsForCall(call) {
+  const body = call?.requestBody;
+  if (!body) return undefined;
+  if (Array.isArray(body.cropRequests)) {
+    return withoutUndefined({
+      strategy: body.strategy,
+      ...(body.modelParams || {}),
+    });
+  }
+  return Object.fromEntries(Object.entries(body).filter(([key]) => !["model", "input", "text"].includes(key)));
+}
+
 function openAiApiCallRecord({ id, sequence, purpose, call, parsedResponse, sourceAssetIds = [] }) {
   if (!call?.requestBody && !call?.rawResponse) return null;
   return withoutUndefined({
@@ -3302,8 +3893,7 @@ function openAiApiCallRecord({ id, sequence, purpose, call, parsedResponse, sour
     method: "POST",
     purpose,
     model: call.model || call.requestBody?.model,
-    modelParams: call.requestBody ? Object.fromEntries(Object.entries(call.requestBody)
-      .filter(([key]) => !["model", "input", "text"].includes(key))) : undefined,
+    modelParams: openAiModelParamsForCall(call),
     promptIds: call.promptId ? [call.promptId] : undefined,
     sourceAssetIds,
     completedAt: safeDateTime(call.completedAt) || new Date().toISOString(),
@@ -3323,6 +3913,73 @@ function openAiApiCallRecord({ id, sequence, purpose, call, parsedResponse, sour
         redactionNotes: "Image bytes and credentials are not persisted; rendered text prompts are preserved exactly.",
       },
       redactions: ["api_key", "input_image_bytes"],
+    },
+    response: {
+      raw: call.rawResponse ? { rawJson: call.rawResponse, redacted: false } : undefined,
+      parsed: parsedResponse ? { rawJson: parsedResponse, redacted: false } : undefined,
+      usage: call.usage,
+      error: call.error,
+    },
+    error: call.error,
+  });
+}
+
+function geminiPromptRecord({ id, label, purpose, call }) {
+  if (!call?.systemPrompt && !call?.userPrompt) return null;
+  return withoutUndefined({
+    id,
+    label,
+    purpose,
+    provider: "gemini",
+    model: call.model,
+    renderedAt: safeDateTime(call.completedAt) || new Date().toISOString(),
+    systemPrompt: call.systemPrompt,
+    userPrompt: call.userPrompt,
+    messages: [
+      call.systemPrompt ? { role: "system", content: call.systemPrompt } : null,
+      call.userPrompt ? { role: "user", content: call.userPrompt } : null,
+    ].filter(Boolean),
+    outputSchema: call.requestBody?.generationConfig?.responseSchema,
+    variables: call.variables,
+    sourceCallId: call.id,
+    checksum: {
+      algorithm: "SHA-256",
+      value: promptChecksum(call.systemPrompt, call.userPrompt),
+      purpose: "Checksum of the exact rendered Gemini prompt text persisted in this AI Enrichments record.",
+    },
+  });
+}
+
+function geminiApiCallRecord({ id, sequence, purpose, call, parsedResponse, sourceAssetIds = [] }) {
+  if (!call?.requestBody && !call?.rawResponse) return null;
+  return withoutUndefined({
+    id,
+    sequence,
+    provider: "gemini",
+    service: "generateContent",
+    endpoint: call.model ? `https://generativelanguage.googleapis.com/v1beta/models/${call.model}:generateContent` : undefined,
+    method: "POST",
+    purpose,
+    model: call.model,
+    modelParams: call.requestBody?.generationConfig
+      ? Object.fromEntries(Object.entries(call.requestBody.generationConfig)
+        .filter(([key]) => !["responseMimeType", "responseSchema"].includes(key)))
+      : undefined,
+    promptIds: call.promptId ? [call.promptId] : undefined,
+    sourceAssetIds,
+    completedAt: safeDateTime(call.completedAt) || new Date().toISOString(),
+    status: call.error ? "failed" : "completed",
+    request: {
+      promptIds: call.promptId ? [call.promptId] : undefined,
+      systemPrompt: call.systemPrompt,
+      userPrompt: call.userPrompt,
+      outputSchema: call.requestBody?.generationConfig?.responseSchema,
+      payload: {
+        rawJson: call.requestBody ? redactGeminiRequestForPersistence(call.requestBody) : undefined,
+        redacted: true,
+        redactionNotes: "Inline image bytes and credentials are not persisted; rendered text prompts are preserved exactly.",
+      },
+      redactions: ["api_key", "inline_image_bytes"],
     },
     response: {
       raw: call.rawResponse ? { rawJson: call.rawResponse, redacted: false } : undefined,
@@ -3366,6 +4023,10 @@ function ocrApiCallRecord({ result, completedAt }) {
 
 function mapExtentForAiEnrichments(extraction, sourceCallId) {
   const bbox = extraction?.map_bbox_estimate || {};
+  const bboxSourceCallIds = Array.from(new Set([
+    ...asStringArray(bbox.source_call_ids),
+    bbox.source_call_id,
+  ].filter(Boolean)));
   return withoutUndefined({
     west: Number(bbox.west || 0),
     south: Number(bbox.south || 0),
@@ -3374,7 +4035,7 @@ function mapExtentForAiEnrichments(extraction, sourceCallId) {
     confidence: typeof bbox.confidence === "number" ? Math.max(0, Math.min(1, bbox.confidence)) : 0,
     method: bbox.method || "not_inferred",
     reasoning: bbox.reasoning || "No geographic map extent was inferred.",
-    sourceCallIds: [sourceCallId].filter(Boolean),
+    sourceCallIds: bboxSourceCallIds.length > 0 ? bboxSourceCallIds : [sourceCallId].filter(Boolean),
   });
 }
 
@@ -3395,6 +4056,35 @@ function distributionsWithAiEnrichments(resource, aiEnrichmentsUrl) {
   }));
 }
 
+function labelCandidatesForAiEnrichments(extraction) {
+  return (Array.isArray(extraction?.label_candidates) ? extraction.label_candidates : [])
+    .map((entry, index) => withoutUndefined({
+      id: entry?.id || `label-candidate-${String(index + 1).padStart(4, "0")}`,
+      content: String(entry?.content || ""),
+      role: textRoleForAiEnrichments(entry),
+      approxBbox: entry?.approx_bbox || entry?.approxBbox,
+      approxPolygon: entry?.approx_polygon || entry?.approxPolygon,
+      confidence: typeof entry?.confidence === "number" ? Math.max(0, Math.min(1, entry.confidence)) : undefined,
+      sourceCallId: entry?.source_call_id || entry?.sourceCallId,
+      sourceTextIndices: asNumberArray(entry?.source_text_indices || entry?.sourceTextIndices),
+      geometryStatus: entry?.geometry_status || entry?.geometryStatus,
+      candidateStatus: entry?.candidate_status || entry?.candidateStatus,
+      bboxSupport: entry?.bbox_support || entry?.bboxSupport,
+      orientationDegrees: entry?.orientation_degrees ?? entry?.orientationDegrees,
+      writingMode: entry?.writing_mode || entry?.writingMode,
+      geometryKind: entry?.geometry_kind || entry?.geometryKind,
+      reasoning: entry?.reasoning,
+      raw: entry?.raw,
+      extensions: optionalExtensions({
+        sourceImageId: entry?.source_image_id,
+        sourceImageKind: entry?.source_image_kind,
+        sourceRegion: entry?.source_region,
+        uncertaintyFlags: entry?.uncertainty_flags,
+      }),
+    }))
+    .filter((entry) => entry.content.trim());
+}
+
 function buildAiEnrichmentsForImage(args) {
   const {
     resourceId,
@@ -3413,7 +4103,18 @@ function buildAiEnrichmentsForImage(args) {
   } = args;
   const createdAt = safeDateTime(archivalSupplement?.processingDate) || safeDateTime(resource?.gbl_mdModified_dt) || new Date().toISOString();
   const extraction = extractionResult?.parsedResponse || {};
-  const extractionCallId = extractionResult?.provider === "openai" ? "call-openai-historical-map-extraction" : "call-google-vision-ocr";
+  const isOpenAiExtraction = extractionResult?.provider === "openai";
+  const isHybridVisionOcr = extractionResult?.provider === HYBRID_VISION_OCR_PROVIDER;
+  const isGeminiHybridVisionOcr = extractionResult?.provider === HYBRID_GEMINI_VISION_OCR_PROVIDER;
+  const isOpenAIHybridVisionOcr = extractionResult?.provider === HYBRID_OPENAI_VISION_OCR_PROVIDER;
+  const ocrExtractionResult = (isHybridVisionOcr || isGeminiHybridVisionOcr || isOpenAIHybridVisionOcr) ? extractionResult?.ocrResult : extractionResult?.provider === "google_cloud_vision" ? extractionResult : null;
+  const extractionCallId = isOpenAiExtraction
+    ? "call-openai-historical-map-extraction"
+    : isGeminiHybridVisionOcr
+      ? GEMINI_LABEL_EXTRACTION_CALL_ID
+      : isOpenAIHybridVisionOcr
+        ? OPENAI_LABEL_RECONCILIATION_CALL_ID
+        : GOOGLE_VISION_OCR_CALL_ID;
   const textSegments = extractionTextSegments(extraction, extractionCallId);
   const textGroups = extractionTextGroups(extraction, textSegments, extractionCallId);
   const metadataCall = metadataWriter ? {
@@ -3436,28 +4137,88 @@ function buildAiEnrichmentsForImage(args) {
     completedAt: createdAt,
     variables: { resourceId, fileName, checksum, artifactUrls: artifacts },
   } : null;
+  const visionAugmentationCall = extractionResult?.visionAugmentation ? {
+    ...extractionResult.visionAugmentation,
+    id: OPENAI_VISION_AUGMENTATION_CALL_ID,
+    promptId: "prompt-openai-vision-text-augmentation",
+    completedAt: createdAt,
+    variables: {
+      resourceId,
+      fileName,
+      checksum,
+      artifactUrls: artifacts,
+      ocrTextCount: extractionResult.ocrResult?.parsedResponse?.text?.length || 0,
+      ocrTextGroupCount: extractionResult.ocrResult?.parsedResponse?.text_groups?.length || 0,
+      ocrPlacenameCount: extractionResult.ocrResult?.parsedResponse?.placenames?.length || 0,
+    },
+  } : null;
+  const geminiLabelExtractionCall = extractionResult?.geminiExtraction ? {
+    ...extractionResult.geminiExtraction,
+    id: GEMINI_LABEL_EXTRACTION_CALL_ID,
+    promptId: "prompt-gemini-map-label-extraction",
+    completedAt: createdAt,
+    variables: {
+      resourceId,
+      fileName,
+      checksum,
+      artifactUrls: artifacts,
+      ocrTextCount: extractionResult.ocrResult?.parsedResponse?.text?.length || 0,
+      ocrTextGroupCount: extractionResult.ocrResult?.parsedResponse?.text_groups?.length || 0,
+      ocrPlacenameCount: extractionResult.ocrResult?.parsedResponse?.placenames?.length || 0,
+    },
+  } : null;
+  const openAIReconciliationCall = extractionResult?.openAIReconciliation ? {
+    ...extractionResult.openAIReconciliation,
+    id: OPENAI_LABEL_RECONCILIATION_CALL_ID,
+    promptId: "prompt-openai-map-label-reconciliation",
+    completedAt: createdAt,
+    variables: {
+      resourceId,
+      fileName,
+      checksum,
+      artifactUrls: artifacts,
+      ocrTextCount: extractionResult.ocrResult?.parsedResponse?.text?.length || 0,
+      ocrTextGroupCount: extractionResult.ocrResult?.parsedResponse?.text_groups?.length || 0,
+      ocrPlacenameCount: extractionResult.ocrResult?.parsedResponse?.placenames?.length || 0,
+    },
+  } : null;
+  const metadataSequence = (visionAugmentationCall || geminiLabelExtractionCall || openAIReconciliationCall) ? 3 : 2;
   const mapExtent = mapExtentForAiEnrichments(extraction, extractionCallId);
   const basePlacenames = derivedPlacenamesForAiEnrichments(extraction, resource, textSegments, extractionCallId, "call-openai-aardvark-metadata-writer");
-  const wofConcordance = buildWofConcordanceLayer({
-    placenames: basePlacenames,
-    textGroups,
-    textSegments,
-    extraction,
-    resource,
-    mapExtent,
-  });
-  const osmConcordance = buildOsmConcordanceLayer({
-    placenames: wofConcordance.placenames,
-    textGroups,
-    textSegments,
-    extraction,
-    resource,
-    mapExtent,
-    boundary: wofConcordance.extension?.boundary,
-  });
+  const skipConcordance = AI_ENRICHMENTS_CONCORDANCE_PLACENAME_LIMIT > 0
+    && basePlacenames.length > AI_ENRICHMENTS_CONCORDANCE_PLACENAME_LIMIT;
+  const skippedConcordanceExtension = skipConcordance
+    ? {
+      status: "skipped",
+      reason: `Skipped concordance during AI Enrichments assembly because ${basePlacenames.length} placename candidates exceeds AI_ENRICHMENTS_CONCORDANCE_PLACENAME_LIMIT=${AI_ENRICHMENTS_CONCORDANCE_PLACENAME_LIMIT}. Text extraction should be reviewed before gazetteer matching at this scale.`,
+      placenameCount: basePlacenames.length,
+      limit: AI_ENRICHMENTS_CONCORDANCE_PLACENAME_LIMIT,
+    }
+    : null;
+  const wofConcordance = skipConcordance
+    ? { placenames: basePlacenames, extension: skippedConcordanceExtension }
+    : buildWofConcordanceLayer({
+      placenames: basePlacenames,
+      textGroups,
+      textSegments,
+      extraction,
+      resource,
+      mapExtent,
+    });
+  const osmConcordance = skipConcordance
+    ? { placenames: wofConcordance.placenames, extension: skippedConcordanceExtension }
+    : buildOsmConcordanceLayer({
+      placenames: wofConcordance.placenames,
+      textGroups,
+      textSegments,
+      extraction,
+      resource,
+      mapExtent,
+      boundary: wofConcordance.extension?.boundary,
+    });
   const placenames = osmConcordance.placenames;
   const apiCalls = [
-    extractionResult?.provider === "google_cloud_vision" ? ocrApiCallRecord({ result: extractionResult, completedAt: createdAt }) : null,
+    ocrExtractionResult ? ocrApiCallRecord({ result: ocrExtractionResult, completedAt: createdAt }) : null,
     extractionOpenAiCall ? openAiApiCallRecord({
       id: "call-openai-historical-map-extraction",
       sequence: 1,
@@ -3466,9 +4227,33 @@ function buildAiEnrichmentsForImage(args) {
       parsedResponse: extraction,
       sourceAssetIds: ["source-original-image", ...derivativeSummaries.map((derivative) => derivative.id).filter(Boolean)],
     }) : null,
+    visionAugmentationCall ? openAiApiCallRecord({
+      id: OPENAI_VISION_AUGMENTATION_CALL_ID,
+      sequence: 2,
+      purpose: "map_text_extraction",
+      call: visionAugmentationCall,
+      parsedResponse: visionAugmentationCall.parsedResponse,
+      sourceAssetIds: ["source-original-image", ...derivativeSummaries.map((derivative) => derivative.id).filter(Boolean)],
+    }) : null,
+    geminiLabelExtractionCall ? geminiApiCallRecord({
+      id: GEMINI_LABEL_EXTRACTION_CALL_ID,
+      sequence: 2,
+      purpose: "map_text_extraction",
+      call: geminiLabelExtractionCall,
+      parsedResponse: geminiLabelExtractionCall.parsedResponse,
+      sourceAssetIds: ["source-original-image", ...derivativeSummaries.map((derivative) => derivative.id).filter(Boolean)],
+    }) : null,
+    openAIReconciliationCall ? openAiApiCallRecord({
+      id: OPENAI_LABEL_RECONCILIATION_CALL_ID,
+      sequence: 2,
+      purpose: "map_text_extraction",
+      call: openAIReconciliationCall,
+      parsedResponse: openAIReconciliationCall.parsedResponse,
+      sourceAssetIds: ["source-original-image", ...derivativeSummaries.map((derivative) => derivative.id).filter(Boolean)],
+    }) : null,
     metadataCall ? openAiApiCallRecord({
       id: "call-openai-aardvark-metadata-writer",
-      sequence: 2,
+      sequence: metadataSequence,
       purpose: "metadata_generation",
       call: metadataCall,
       parsedResponse: { resource: metadataWriter?.resource || resource, evidence: metadataWriter?.evidence || [] },
@@ -3481,6 +4266,24 @@ function buildAiEnrichmentsForImage(args) {
       label: "Historical map text extraction",
       purpose: "map_text_extraction",
       call: extractionOpenAiCall,
+    }) : null,
+    visionAugmentationCall ? openAiPromptRecord({
+      id: "prompt-openai-vision-text-augmentation",
+      label: "OpenAI vision map-text augmentation after OCR",
+      purpose: "map_text_extraction",
+      call: visionAugmentationCall,
+    }) : null,
+    geminiLabelExtractionCall ? geminiPromptRecord({
+      id: "prompt-gemini-map-label-extraction",
+      label: "Gemini map-label extraction after OCR",
+      purpose: "map_text_extraction",
+      call: geminiLabelExtractionCall,
+    }) : null,
+    openAIReconciliationCall ? openAiPromptRecord({
+      id: "prompt-openai-map-label-reconciliation",
+      label: "OpenAI map-label reconciliation after OCR",
+      purpose: "map_text_extraction",
+      call: openAIReconciliationCall,
     }) : null,
     metadataCall ? openAiPromptRecord({
       id: "prompt-openai-aardvark-metadata-writer",
@@ -3524,7 +4327,14 @@ function buildAiEnrichmentsForImage(args) {
         byteSize: derivative.bytes,
         width: derivative.width,
         height: derivative.height,
-        notes: `OpenAI analysis derivative: ${derivative.kind || "image"}.`,
+        notes: `Vision/text extraction analysis derivative: ${derivative.kind || "image"}.`,
+        extensions: optionalExtensions({
+          sourceImageId: derivative.sourceImageId,
+          sourceImageKind: derivative.sourceImageKind,
+          sourceRegion: derivative.region,
+          coordinateWidth: derivative.coordinateWidth,
+          coordinateHeight: derivative.coordinateHeight,
+        }),
       })),
       { id: "derivative-iiif-image-service", role: "iiif_image", url: artifacts.iiifInfoUrl, mediaType: "application/json" },
       { id: "derivative-thumbnail", role: "thumbnail", url: artifacts.thumbnailUrl, mediaType: "image/jpeg" },
@@ -3548,6 +4358,8 @@ function buildAiEnrichmentsForImage(args) {
     apiCalls,
     prompts,
     extractedMapText: textSegments,
+    textExtractionRuns: extraction?.text_extraction_runs,
+    labelCandidates: labelCandidatesForAiEnrichments(extraction),
     textGroups,
     derivedPlacenames: placenames,
     mapExtent,
@@ -3596,6 +4408,10 @@ function buildAiEnrichmentsForImage(args) {
     extensions: optionalExtensions({
       wofConcordance: wofConcordance.extension,
       osmConcordance: osmConcordance.extension,
+      textExtractionGraph: (Array.isArray(extraction?.text_extraction_runs) || Array.isArray(extraction?.label_candidates)) ? withoutUndefined({
+        textExtractionRuns: extraction?.text_extraction_runs,
+        labelCandidates: extraction?.label_candidates,
+      }) : undefined,
     }),
   });
 }
@@ -5764,6 +6580,7 @@ async function processUploadedImage(config, body) {
   const storageProfile = findProfile(config, "storage", body.storageProfileId);
   const modelProfile = findProfile(config, "model", body.modelProfileId);
   const visionProfile = body.visionProfileId ? findProfile(config, "vision", body.visionProfileId) : null;
+  const textExtractionModelProfile = body.textExtractionModelProfileId ? findProfile(config, "model", body.textExtractionModelProfileId) : null;
   const contentType = file.type || contentTypeForKey(fileName);
   const base64 = String(file.base64 || "").replace(/^data:[^;]+;base64,/, "");
   if (!base64) throw new Error("Upload request is missing file data.");
@@ -5875,8 +6692,50 @@ async function processUploadedImage(config, body) {
     const visionImage = visionSources.primary;
     log("Google Cloud Vision OCR request started", { featureType: visionProfile.featureType || "DOCUMENT_TEXT_DETECTION", width: visionImage.width, height: visionImage.height, originalBytes: visionImage.originalBytes, normalizedBytes: visionImage.normalizedBytes, quality: visionImage.quality ?? null, maxDimension: visionImage.maxDimension ?? null, sourceCount: visionSources.sources.length, tileCount: visionSources.summary.tileCount });
     extractionPromise = callGoogleVisionOcr(visionProfile, visionSources)
-      .then((result) => {
+      .then(async (result) => {
         log("Google Cloud Vision OCR response received", { textSegments: result.parsedResponse?.text?.length || 0, textGroups: result.parsedResponse?.text_groups?.length || 0, placenames: result.parsedResponse?.placenames?.length || 0, sources: result.usage?.sourceCount || 0, tiles: result.usage?.tileCount || 0, confidence: result.confidence ?? null });
+        if (shouldRunTextReconciliation(textExtractionModelProfile, body)) {
+          const providerLabel = textReconciliationProviderLabel(textExtractionModelProfile);
+          log(`${providerLabel} map-label reconciliation crop generation started`);
+          const derivatives = shouldReconcileLabelsWithOpenAI(textExtractionModelProfile, body)
+            ? await createOpenAITextReconciliationDerivatives({
+              buffer,
+              contentType,
+              assetId: `${storageProfile.id}:${storageProfile.bucket}/${keys.original}:openai-label-reconciliation`,
+              visionSources,
+              ocrExtraction: result.parsedResponse,
+              request: body,
+            })
+            : await createGeminiTextExtractionDerivatives({
+              buffer,
+              contentType,
+              assetId: `${storageProfile.id}:${storageProfile.bucket}/${keys.original}:gemini-label-extraction`,
+              visionSources,
+              ocrExtraction: result.parsedResponse,
+              request: body,
+            });
+          log(`${providerLabel} map-label reconciliation derivatives ready`, { count: derivatives.length, bytes: derivatives.reduce((sum, derivative) => sum + Number(derivative.bytes || 0), 0) });
+          const augmented = await maybeAugmentGoogleVisionOcrWithTextReconciliation({ modelProfile: textExtractionModelProfile, request: body, derivatives, ocrResult: result, log });
+          if ([HYBRID_GEMINI_VISION_OCR_PROVIDER, HYBRID_OPENAI_VISION_OCR_PROVIDER].includes(augmented.provider)) {
+            derivativeSummaries = derivatives.map(({ dataUri, ...derivative }) => derivative);
+          }
+          return augmented;
+        }
+        if (shouldAugmentOcrWithOpenAIVision(modelProfile, body)) {
+          log("OpenAI vision augmentation OCR-source image generation started");
+          const derivatives = await createVisionAugmentationDerivatives({
+            buffer,
+            contentType,
+            assetId: `${storageProfile.id}:${storageProfile.bucket}/${keys.original}:vision-augmentation`,
+            visionSources,
+          });
+          log("OpenAI vision augmentation derivatives ready", { count: derivatives.length, bytes: derivatives.reduce((sum, derivative) => sum + Number(derivative.bytes || 0), 0) });
+          const augmented = await maybeAugmentGoogleVisionOcrResult({ modelProfile, request: body, derivatives, ocrResult: result, log });
+          if (augmented.provider === HYBRID_VISION_OCR_PROVIDER) {
+            derivativeSummaries = derivatives.map(({ dataUri, ...derivative }) => derivative);
+          }
+          return augmented;
+        }
         return result;
       });
   } else {
@@ -6142,6 +7001,7 @@ async function refreshOcrForS3ImageResource(config, body) {
   const storageProfile = findProfile(config, "storage", body.storageProfileId);
   const modelProfile = body.modelProfileId ? findProfile(config, "model", body.modelProfileId) : null;
   const visionProfile = findProfile(config, "vision", body.visionProfileId);
+  const textExtractionModelProfile = body.textExtractionModelProfileId ? findProfile(config, "model", body.textExtractionModelProfileId) : null;
   const root = String(requested.root || (requested.resourceId ? `${uploadBasePrefix(storageProfile)}/${requested.resourceId}` : "")).replace(/\/+$/g, "");
   if (!root) throw new Error("OCR refresh request is missing the S3 resource root.");
   if (!modelProfile && body.skipMetadataWriter !== true) throw new Error("OCR refresh requires a model profile unless skipMetadataWriter is true.");
@@ -6182,7 +7042,7 @@ async function refreshOcrForS3ImageResource(config, body) {
     sourceCount: visionSources.sources.length,
     tileCount: visionSources.summary.tileCount,
   });
-  const extractionResult = await callGoogleVisionOcr(visionProfile, visionSources);
+  let extractionResult = await callGoogleVisionOcr(visionProfile, visionSources);
   log("Google Cloud Vision OCR response received", {
     textSegments: extractionResult.parsedResponse?.text?.length || 0,
     textGroups: extractionResult.parsedResponse?.text_groups?.length || 0,
@@ -6191,6 +7051,46 @@ async function refreshOcrForS3ImageResource(config, body) {
     tiles: extractionResult.usage?.tileCount || 0,
     confidence: extractionResult.confidence ?? null,
   });
+  let derivativeSummaries = [];
+  if (shouldRunTextReconciliation(textExtractionModelProfile, body)) {
+    const providerLabel = textReconciliationProviderLabel(textExtractionModelProfile);
+    log(`${providerLabel} map-label reconciliation crop generation started`);
+    const derivatives = shouldReconcileLabelsWithOpenAI(textExtractionModelProfile, body)
+      ? await createOpenAITextReconciliationDerivatives({
+        buffer,
+        contentType,
+        assetId: `${storageProfile.id}:${storageProfile.bucket}/${keys.original}:openai-label-reconciliation`,
+        visionSources,
+        ocrExtraction: extractionResult.parsedResponse,
+        request: body,
+      })
+      : await createGeminiTextExtractionDerivatives({
+        buffer,
+        contentType,
+        assetId: `${storageProfile.id}:${storageProfile.bucket}/${keys.original}:gemini-label-extraction`,
+        visionSources,
+        ocrExtraction: extractionResult.parsedResponse,
+        request: body,
+      });
+    log(`${providerLabel} map-label reconciliation derivatives ready`, { count: derivatives.length, bytes: derivatives.reduce((sum, derivative) => sum + Number(derivative.bytes || 0), 0) });
+    extractionResult = await maybeAugmentGoogleVisionOcrWithTextReconciliation({ modelProfile: textExtractionModelProfile, request: body, derivatives, ocrResult: extractionResult, log });
+    if ([HYBRID_GEMINI_VISION_OCR_PROVIDER, HYBRID_OPENAI_VISION_OCR_PROVIDER].includes(extractionResult.provider)) {
+      derivativeSummaries = derivatives.map(({ dataUri, ...derivative }) => derivative);
+    }
+  } else if (shouldAugmentOcrWithOpenAIVision(modelProfile, body)) {
+    log("OpenAI vision augmentation OCR-source image generation started");
+    const derivatives = await createVisionAugmentationDerivatives({
+      buffer,
+      contentType,
+      assetId: `${storageProfile.id}:${storageProfile.bucket}/${keys.original}:vision-augmentation`,
+      visionSources,
+    });
+    log("OpenAI vision augmentation derivatives ready", { count: derivatives.length, bytes: derivatives.reduce((sum, derivative) => sum + Number(derivative.bytes || 0), 0) });
+    extractionResult = await maybeAugmentGoogleVisionOcrResult({ modelProfile, request: body, derivatives, ocrResult: extractionResult, log });
+    if (extractionResult.provider === HYBRID_VISION_OCR_PROVIDER) {
+      derivativeSummaries = derivatives.map(({ dataUri, ...derivative }) => derivative);
+    }
+  }
 
   const storedMetadataDocuments = await readMetadataDocumentsFromS3(storageProfile, keys, log);
   const suppliedMetadataDocuments = normalizeMetadataDocuments(body.metadataDocuments);
@@ -6274,7 +7174,7 @@ async function refreshOcrForS3ImageResource(config, body) {
     resource,
     archivalSupplement,
     metadataSourceUrls,
-    derivativeSummaries: [],
+    derivativeSummaries,
   });
   if (metadataWriterError) {
     aiEnrichments.debug = {
@@ -6525,10 +7425,269 @@ async function postOpenAIResponse(apiKey, body) {
   throw new Error("OpenAI request failed after removing unsupported parameters.");
 }
 
+function hasUsableExtractionSchema(schema) {
+  return Boolean(schema && typeof schema === "object" && !Array.isArray(schema) && Object.keys(schema).length > 0);
+}
+
+function shouldAugmentOcrWithOpenAIVision(modelProfile, request) {
+  return Boolean(
+    OPENAI_VISION_AUGMENT_OCR_ENABLED &&
+    modelProfile &&
+    request?.augmentOcrWithOpenAIVision !== false &&
+    request?.openaiVisionAugmentation !== false &&
+    hasUsableExtractionSchema(request?.outputSchema),
+  );
+}
+
+const OPENAI_VISION_AUGMENTATION_SYSTEM_PROMPT = [
+  "You are a historical-map vision extraction specialist.",
+  "Inspect the map image derivatives directly and return strict JSON matching the provided schema.",
+  "Analyze each supplied OCR source image, including individual tiles, as visual evidence paired with the Google Cloud Vision OCR fragments for that source image.",
+  "Use OCR evidence as fragments, not final truth. Correct OCR misreadings, merge split labels, ignore numeric or contour/street clutter when it is not part of the label, and add visible text that OCR missed.",
+  "Read the map first. Return correct printed map-text labels and groupings even when they are unlikely to appear in a modern gazetteer; gazetteer matching is a later annotation step.",
+  "Prioritize curved, rotated, faint, stylized, hydrographic, park, landmark, title, date, publisher, legend, and coordinate labels.",
+  "Do not invent text that is not visually supported. Mark uncertain readings with lower confidence and explain the visual evidence in reasoning fields.",
+].join(" ");
+
+function openAIVisionAugmentationUserPrompt(request, compactOcr) {
+  const originalPrompt = String(request?.userPrompt || "").trim();
+  return [
+    "Google Cloud Vision OCR has already processed this map. Now inspect the supplied OCR source images as images, not as OCR text, and produce an augmented historical-map extraction.",
+    "The image inputs are listed in existing OCR evidence JSON under source_images. Analyze every listed full image and tile. Preserve labels visible in only one tile, and reconcile duplicate tile/full-image readings.",
+    "Prefer exact spellings as printed on the map. Include approximate normalized 0-1 full-image boxes when the text is visible. When OCR and image evidence disagree, trust the image and explain the correction.",
+    "Do not filter labels because they seem modern-gazetteer-unmatchable. The goal of this pass is faithful map reading and label grouping; authority matching happens after this response.",
+    "When two or more OCR fragments form one label, return the consolidated label and preserve the original OCR source_text_index values in source_text_indices when the schema allows it. For example, a specific-name fragment near a feature suffix may become a park, lake, bay, cemetery, or other feature label while nearby numbers are ignored.",
+    originalPrompt ? `Original extraction task:\n${originalPrompt}` : "",
+    `Existing OCR evidence JSON:\n${safeJsonStringify(compactOcr, 2)}`,
+  ].filter(Boolean).join("\n\n");
+}
+
+function openAIVisionAugmentationRequest(request, compactOcr) {
+  return {
+    ...request,
+    model: request?.visionAugmentationModel || request?.model,
+    systemPrompt: OPENAI_VISION_AUGMENTATION_SYSTEM_PROMPT,
+    userPrompt: openAIVisionAugmentationUserPrompt(request, compactOcr),
+    outputSchema: request?.outputSchema,
+  };
+}
+
+async function callOpenAIVisionTextAugmentation(modelProfile, request, derivatives, ocrExtraction) {
+  const compactOcr = compactExtractionForVisionAugmentation(ocrExtraction, { imageInputs: derivatives });
+  const augmentationRequest = openAIVisionAugmentationRequest(request, compactOcr);
+  const result = await callOpenAI(modelProfile, augmentationRequest, derivatives);
+  return {
+    ...result,
+    provider: "openai",
+    purpose: "vision_text_augmentation",
+    compactOcrContext: compactOcr,
+  };
+}
+
+function confidenceFromText(extraction) {
+  const confidences = (Array.isArray(extraction?.text) ? extraction.text : [])
+    .map((entry) => Number(entry?.confidence))
+    .filter((value) => Number.isFinite(value));
+  return confidences.length > 0
+    ? confidences.reduce((sum, value) => sum + value, 0) / confidences.length
+    : null;
+}
+
+function mergeGoogleVisionWithOpenAIAugmentation(ocrResult, visionAugmentation) {
+  const parsedResponse = mergeVisionAugmentedExtraction({
+    ocrExtraction: ocrResult?.parsedResponse,
+    visionExtraction: visionAugmentation?.parsedResponse,
+    ocrCallId: GOOGLE_VISION_OCR_CALL_ID,
+    visionCallId: OPENAI_VISION_AUGMENTATION_CALL_ID,
+  });
+  return {
+    parsedResponse,
+    rawResponse: {
+      google_cloud_vision: ocrResult?.rawResponse,
+      openai_vision_augmentation: visionAugmentation?.rawResponse,
+    },
+    requestBody: {
+      google_cloud_vision: ocrResult?.requestBody,
+      openai_vision_augmentation: visionAugmentation?.requestBody,
+    },
+    provider: HYBRID_VISION_OCR_PROVIDER,
+    usage: {
+      provider: HYBRID_VISION_OCR_PROVIDER,
+      google_cloud_vision: ocrResult?.usage,
+      openai_vision_augmentation: visionAugmentation?.usage,
+    },
+    confidence: confidenceFromText(parsedResponse) ?? ocrResult?.confidence ?? visionAugmentation?.confidence ?? null,
+    ocrResult,
+    visionAugmentation,
+  };
+}
+
+async function maybeAugmentGoogleVisionOcrResult({ modelProfile, request, derivatives, ocrResult, log = () => undefined }) {
+  if (!shouldAugmentOcrWithOpenAIVision(modelProfile, request)) return ocrResult;
+  try {
+    log("OpenAI vision augmentation request started", { model: request?.visionAugmentationModel || request?.model || modelProfile.defaultModel, derivatives: derivatives.length });
+    const visionAugmentation = await callOpenAIVisionTextAugmentation(modelProfile, request, derivatives, ocrResult.parsedResponse);
+    const hybrid = mergeGoogleVisionWithOpenAIAugmentation(ocrResult, visionAugmentation);
+    log("OpenAI vision augmentation response received", {
+      addedTextSegments: hybrid.parsedResponse?.text_grouping_summary?.vision_augmented_text_count || 0,
+      addedTextGroups: hybrid.parsedResponse?.text_grouping_summary?.vision_augmented_text_group_count || 0,
+      addedPlacenames: hybrid.parsedResponse?.text_grouping_summary?.vision_augmented_placename_count || 0,
+    });
+    return hybrid;
+  } catch (error) {
+    const message = error.message || String(error);
+    log("OpenAI vision augmentation failed; preserving Google Vision OCR", { error: message });
+    return {
+      ...ocrResult,
+      parsedResponse: {
+        ...(ocrResult?.parsedResponse || {}),
+        debug: {
+          ...(ocrResult?.parsedResponse?.debug || {}),
+          vision_augmentation_error: message,
+        },
+      },
+    };
+  }
+}
+
+function shouldExtractLabelsWithGemini(modelProfile, request) {
+  return Boolean(
+    modelProfile
+    && String(modelProfile.provider || "").toLowerCase() === "gemini"
+    && request?.geminiTextExtraction !== false
+    && request?.textExtractionModelProfileId,
+  );
+}
+
+function shouldReconcileLabelsWithOpenAI(modelProfile, request) {
+  return Boolean(
+    modelProfile
+    && String(modelProfile.provider || "openai").toLowerCase() === "openai"
+    && request?.openaiTextReconciliation !== false
+    && request?.textExtractionModelProfileId,
+  );
+}
+
+function shouldRunTextReconciliation(modelProfile, request) {
+  return shouldExtractLabelsWithGemini(modelProfile, request)
+    || shouldReconcileLabelsWithOpenAI(modelProfile, request);
+}
+
+function resolveGeminiApiKey(modelProfile) {
+  const primary = resolveOptionalEnv(modelProfile?.apiKeyEnv, "Gemini API key");
+  if (primary) return primary;
+  for (const fallbackName of ["GEMINI_API_KEY", "GOOGLE_GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_API_KEY"]) {
+    if (fallbackName === modelProfile?.apiKeyEnv) continue;
+    const fallback = resolveOptionalEnv(fallbackName, "Gemini API key");
+    if (fallback) return fallback;
+  }
+  return resolveEnv(modelProfile?.apiKeyEnv || "GEMINI_API_KEY", "Gemini API key");
+}
+
+function textReconciliationProviderLabel(modelProfile) {
+  return String(modelProfile?.provider || "openai").toLowerCase() === "gemini" ? "Gemini" : "OpenAI";
+}
+
+async function maybeAugmentGoogleVisionOcrWithGemini({ modelProfile, request, derivatives, ocrResult, log = () => undefined }) {
+  if (!shouldExtractLabelsWithGemini(modelProfile, request)) return ocrResult;
+  try {
+    log("Gemini map-label extraction request started", { model: request?.geminiModel || request?.textExtractionModel || modelProfile.defaultModel, derivatives: derivatives.length });
+    const apiKey = resolveGeminiApiKey(modelProfile);
+    const geminiExtraction = await callGeminiMapLabelExtraction({
+      modelProfile,
+      request,
+      derivatives,
+      ocrExtraction: ocrResult?.parsedResponse,
+      apiKey,
+      log,
+    });
+    const hybrid = mergeGoogleVisionWithGeminiExtraction({ ocrResult, geminiExtraction });
+    log("Gemini map-label extraction response received", {
+      labels: geminiExtraction.parsedResponse?.labels?.length || 0,
+      addedTextSegments: hybrid.parsedResponse?.text_grouping_summary?.gemini_added_text_count || 0,
+      filteredOvermergedGroups: hybrid.parsedResponse?.text_grouping_summary?.gemini_filtered_overmerged_group_count || 0,
+    });
+    return hybrid;
+  } catch (error) {
+    const message = error.message || String(error);
+    log("Gemini map-label extraction failed; preserving Google Vision OCR", { error: message });
+    return {
+      ...ocrResult,
+      parsedResponse: {
+        ...(ocrResult?.parsedResponse || {}),
+        debug: {
+          ...(ocrResult?.parsedResponse?.debug || {}),
+          gemini_label_extraction_error: message,
+        },
+      },
+    };
+  }
+}
+
+async function maybeReconcileGoogleVisionOcrWithOpenAI({ modelProfile, request, derivatives, ocrResult, log = () => undefined }) {
+  if (!shouldReconcileLabelsWithOpenAI(modelProfile, request)) return ocrResult;
+  try {
+    log("OpenAI map-label reconciliation request started", { model: request?.openaiTextReconciliationModel || request?.textExtractionModel || modelProfile.defaultModel, derivatives: derivatives.length });
+    const apiKey = resolveEnv(modelProfile?.apiKeyEnv || "OPENAI_API_KEY", "OpenAI API key");
+    const openAIReconciliation = await callOpenAIMapLabelReconciliation({
+      modelProfile,
+      request,
+      derivatives,
+      ocrExtraction: ocrResult?.parsedResponse,
+      apiKey,
+      log,
+    });
+    const hybrid = mergeGoogleVisionWithOpenAIReconciliation({ ocrResult, openAIReconciliation });
+    log("OpenAI map-label reconciliation response received", {
+      labels: openAIReconciliation.parsedResponse?.labels?.length || 0,
+      addedTextSegments: hybrid.parsedResponse?.text_grouping_summary?.openai_reconciled_added_text_count || 0,
+      filteredOvermergedGroups: hybrid.parsedResponse?.text_grouping_summary?.openai_reconciled_filtered_overmerged_group_count || 0,
+    });
+    return hybrid;
+  } catch (error) {
+    const message = error.message || String(error);
+    log("OpenAI map-label reconciliation failed; preserving Google Vision OCR", { error: message });
+    return {
+      ...ocrResult,
+      parsedResponse: {
+        ...(ocrResult?.parsedResponse || {}),
+        debug: {
+          ...(ocrResult?.parsedResponse?.debug || {}),
+          openai_label_reconciliation_error: message,
+        },
+      },
+    };
+  }
+}
+
+async function maybeAugmentGoogleVisionOcrWithTextReconciliation(args) {
+  if (shouldExtractLabelsWithGemini(args.modelProfile, args.request)) {
+    return maybeAugmentGoogleVisionOcrWithGemini(args);
+  }
+  if (shouldReconcileLabelsWithOpenAI(args.modelProfile, args.request)) {
+    return maybeReconcileGoogleVisionOcrWithOpenAI(args);
+  }
+  return args.ocrResult;
+}
+
 async function callOpenAI(modelProfile, request, derivatives) {
+  if (String(modelProfile?.provider || "openai").toLowerCase() !== "openai") {
+    throw new Error(`OpenAI request requires an OpenAI model profile; '${modelProfile?.name || modelProfile?.id || "selected profile"}' is configured for ${modelProfile?.provider || "unknown"}.`);
+  }
   if (process.env.ENRICHMENT_PROXY_MOCK_OPENAI === "1") {
     const parsedResponse = mockExtraction();
-    return { parsedResponse, rawResponse: parsedResponse, requestBody: { mock: true }, provider: "openai", usage: { mock: true }, confidence: 0 };
+    const model = request.model || modelProfile.defaultModel;
+    return {
+      parsedResponse,
+      rawResponse: parsedResponse,
+      requestBody: { mock: true },
+      provider: "openai",
+      systemPrompt: request.systemPrompt,
+      userPrompt: request.userPrompt,
+      model,
+      usage: { mock: true },
+      confidence: 0,
+    };
   }
   const apiKey = resolveEnv(modelProfile.apiKeyEnv, "OpenAI API key");
   const model = request.model || modelProfile.defaultModel;
@@ -6604,8 +7763,10 @@ async function route(req, res) {
   if (req.method === "POST" && url.pathname === "/api/config/test-model") {
     const body = await readJson(req);
     const profile = findProfile(config, "model", body.profileId);
-    resolveEnv(profile.apiKeyEnv, "OpenAI API key");
-    return send(res, 200, { ok: true, message: `OpenAI profile '${profile.name}' can resolve ${profile.apiKeyEnv}.` });
+    const provider = String(profile.provider || "openai").toLowerCase();
+    if (provider === "gemini") resolveGeminiApiKey(profile);
+    else resolveEnv(profile.apiKeyEnv, "OpenAI API key");
+    return send(res, 200, { ok: true, message: provider === "gemini" ? `Gemini profile '${profile.name}' can resolve Gemini API credentials.` : `OpenAI profile '${profile.name}' can resolve ${profile.apiKeyEnv}.` });
   }
   if (req.method === "POST" && url.pathname === "/api/config/test-vision") {
     const body = await readJson(req);
@@ -6651,6 +7812,7 @@ async function route(req, res) {
     const storageProfile = findProfile(config, "storage", body.storageProfileId);
     const modelProfile = findProfile(config, "model", body.modelProfileId);
     const visionProfile = body.visionProfileId ? findProfile(config, "vision", body.visionProfileId) : null;
+    const textExtractionModelProfile = body.textExtractionModelProfileId ? findProfile(config, "model", body.textExtractionModelProfileId) : null;
     const objectKey = body.asset?.object_key || body.asset?.id || "selected asset";
     if (visionProfile) {
       let buffer;
@@ -6662,9 +7824,50 @@ async function route(req, res) {
       try {
         const sources = await createVisionOcrSources(buffer, body.asset?.content_type || contentTypeForKey(objectKey));
         const vision = await callGoogleVisionOcr(visionProfile, sources);
-        return send(res, 200, { ...vision, derivatives: [] });
+        if (shouldRunTextReconciliation(textExtractionModelProfile, body)) {
+          const derivatives = shouldReconcileLabelsWithOpenAI(textExtractionModelProfile, body)
+            ? await createOpenAITextReconciliationDerivatives({
+              buffer,
+              contentType: body.asset?.content_type || contentTypeForKey(objectKey),
+              assetId: `${storageProfile.id}:${storageProfile.bucket}/${body.asset.object_key}:openai-label-reconciliation`,
+              visionSources: sources,
+              ocrExtraction: vision.parsedResponse,
+              request: body,
+            })
+            : await createGeminiTextExtractionDerivatives({
+              buffer,
+              contentType: body.asset?.content_type || contentTypeForKey(objectKey),
+              assetId: `${storageProfile.id}:${storageProfile.bucket}/${body.asset.object_key}:gemini-label-extraction`,
+              visionSources: sources,
+              ocrExtraction: vision.parsedResponse,
+              request: body,
+            });
+          const augmented = await maybeAugmentGoogleVisionOcrWithTextReconciliation({
+            modelProfile: textExtractionModelProfile,
+            request: body,
+            derivatives,
+            ocrResult: vision,
+          });
+          return send(res, 200, { ...augmented, derivatives });
+        }
+        if (!shouldAugmentOcrWithOpenAIVision(modelProfile, body)) {
+          return send(res, 200, { ...vision, derivatives: [] });
+        }
+        const derivatives = await createVisionAugmentationDerivatives({
+          buffer,
+          contentType: body.asset?.content_type || contentTypeForKey(objectKey),
+          assetId: `${storageProfile.id}:${storageProfile.bucket}/${body.asset.object_key}:vision-augmentation`,
+          visionSources: sources,
+        });
+        const augmented = await maybeAugmentGoogleVisionOcrResult({
+          modelProfile,
+          request: body,
+          derivatives,
+          ocrResult: vision,
+        });
+        return send(res, 200, { ...augmented, derivatives });
       } catch (error) {
-        throw new Error(`Google Cloud Vision extraction failed for ${objectKey}: ${error.message || String(error)}`);
+        throw new Error(`Google Cloud Vision/Gemini/OpenAI vision extraction failed for ${objectKey}: ${error.message || String(error)}`);
       }
     }
     let derivatives;
@@ -6716,7 +7919,15 @@ const server = http.createServer((req, res) => {
   });
 });
 
-server.listen(PORT, "127.0.0.1", () => {
-  console.log(`Enrichment proxy listening on http://localhost:${PORT}`);
-  console.log(`Config: ${CONFIG_PATH}`);
-});
+if (fileURLToPath(import.meta.url) === path.resolve(process.argv[1] || "")) {
+  server.listen(PORT, "127.0.0.1", () => {
+    console.log(`Enrichment proxy listening on http://localhost:${PORT}`);
+    console.log(`Config: ${CONFIG_PATH}`);
+  });
+}
+
+export {
+  consolidateOcrTextEntries,
+  deriveMapLabelPlacenames,
+  selectTextReconciliationTiles,
+};

@@ -42,7 +42,7 @@ const FIXTURE_RES: Resource = {
     gbl_indexYear_im: 2020,
     dct_creator_sm: ['Creator A'],
     dct_publisher_sm: ['Publisher B']
-};
+} as Resource;
 
 describe('ResourceHeader', () => {
     const mockOnNavigate = vi.fn();

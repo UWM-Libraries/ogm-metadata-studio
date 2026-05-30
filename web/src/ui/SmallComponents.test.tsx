@@ -83,7 +83,7 @@ describe('Small UI Components', () => {
         it('renders and handles input', async () => {
             const onChange = vi.fn();
             const onSearch = vi.fn();
-            vi.mocked(duckdb.suggest).mockResolvedValue([{ text: 'suggestion', type: 'type', score: 1 }]);
+            vi.mocked(duckdb.suggest).mockResolvedValue([{ text: 'suggestion', type: 'type' }]);
 
             const { rerender } = render(<AutosuggestInput value="" onChange={onChange} onSearch={onSearch} />);
 

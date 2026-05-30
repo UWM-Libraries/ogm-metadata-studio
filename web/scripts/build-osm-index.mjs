@@ -20,6 +20,7 @@ const DEFAULT_ADDRESS = {
 
 const FEATURE_QUERIES = [
   'nwr["name"]["place"~"^(city|town|village|hamlet|suburb|quarter|neighbourhood|neighborhood|locality|island|islet|square)$"]',
+  'way["name"]["highway"~"^(motorway|trunk|primary|secondary|tertiary|unclassified|residential|living_street|service|pedestrian|road)$"]',
   'nwr["name"]["natural"]',
   'nwr["name"]["waterway"]',
   'nwr["name"]["water"]',
@@ -39,6 +40,7 @@ const FEATURE_QUERIES = [
 
 const FEATURE_PRIORITY = [
   "place",
+  "highway",
   "natural",
   "waterway",
   "water",

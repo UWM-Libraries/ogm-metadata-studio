@@ -40,7 +40,7 @@ export interface ProxyStorageProfile {
 export interface ProxyModelProfile {
     id: string;
     name: string;
-    provider: "openai";
+    provider: "openai" | "gemini";
     apiKeyEnv: string;
     defaultModel: string;
     modelParams?: Record<string, unknown>;
@@ -140,7 +140,7 @@ function defaultHistoricalMapModelParams(): Record<string, unknown> {
 export const HISTORICAL_MAP_EXTRACTION_SCHEMA = {
     type: "object",
     additionalProperties: false,
-    required: ["text", "placenames", "map_bbox_estimate", "description", "debug"],
+    required: ["text", "text_groups", "placenames", "map_bbox_estimate", "description", "debug"],
     properties: {
         text: {
             type: "array",
@@ -157,7 +157,31 @@ export const HISTORICAL_MAP_EXTRACTION_SCHEMA = {
                         items: { type: "number", minimum: 0, maximum: 1 },
                     },
                     confidence: { type: "number", minimum: 0, maximum: 1 },
-                    role: { type: "string", enum: ["title", "coordinate", "label", "scale", "legend", "other"] },
+                    role: { type: "string", enum: ["title", "publication", "publisher", "date", "coordinate", "label", "street", "route", "waterbody", "park", "landmark", "neighborhood", "railroad", "ferry", "scale", "legend", "grid", "marginalia", "other"] },
+                    reasoning: { type: "string" },
+                },
+            },
+        },
+        text_groups: {
+            type: "array",
+            items: {
+                type: "object",
+                additionalProperties: false,
+                required: ["content", "approx_bbox", "confidence", "role", "source_text_indices", "reasoning"],
+                properties: {
+                    content: { type: "string" },
+                    approx_bbox: {
+                        type: "array",
+                        minItems: 4,
+                        maxItems: 4,
+                        items: { type: "number", minimum: 0, maximum: 1 },
+                    },
+                    confidence: { type: "number", minimum: 0, maximum: 1 },
+                    role: { type: "string", enum: ["title", "publication", "publisher", "date", "coordinate", "label", "street", "route", "waterbody", "park", "landmark", "neighborhood", "railroad", "ferry", "scale", "legend", "grid", "marginalia", "other"] },
+                    source_text_indices: {
+                        type: "array",
+                        items: { type: "integer", minimum: 0 },
+                    },
                     reasoning: { type: "string" },
                 },
             },
@@ -167,14 +191,24 @@ export const HISTORICAL_MAP_EXTRACTION_SCHEMA = {
             items: {
                 type: "object",
                 additionalProperties: false,
-                required: ["name", "type", "source_text_index", "confidence", "reasoning"],
+                required: ["name", "type", "source_text_index", "source_text_indices", "approx_bbox", "confidence", "reasoning"],
                 properties: {
                     name: { type: "string" },
                     type: {
                         type: "string",
-                        enum: ["city", "town", "village", "county", "state_province", "region", "waterbody", "mountain", "landmark", "other"],
+                        enum: ["city", "town", "village", "county", "state_province", "country", "region", "neighborhood", "street", "railroad", "waterbody", "mountain", "landmark", "building", "park", "administrative_area", "other"],
                     },
                     source_text_index: { type: "integer", minimum: 0 },
+                    source_text_indices: {
+                        type: "array",
+                        items: { type: "integer", minimum: 0 },
+                    },
+                    approx_bbox: {
+                        type: "array",
+                        minItems: 4,
+                        maxItems: 4,
+                        items: { type: "number", minimum: 0, maximum: 1 },
+                    },
                     confidence: { type: "number", minimum: 0, maximum: 1 },
                     reasoning: { type: "string" },
                 },

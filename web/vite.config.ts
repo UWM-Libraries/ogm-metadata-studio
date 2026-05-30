@@ -54,7 +54,7 @@ export default defineConfig({
   server: {
     headers: {
       "Cross-Origin-Embedder-Policy": "credentialless",
-      "Cross-Origin-Opener-Policy": "same-origin",
+      "Cross-Origin-Opener-Policy": "same-origin-allow-popups",
     },
     fs: {
       // Allow serving files from outside the project root
@@ -89,7 +89,6 @@ export default defineConfig({
     },
   },
 } as any);
-
 
 
 

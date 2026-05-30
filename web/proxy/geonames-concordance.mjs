@@ -2,6 +2,17 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import Fuse from "fuse.js";
+import {
+  buildGazetteerSpatialFilter,
+  gazetteerSpatialFilterSummary,
+  recordMatchesGazetteerSpatialFilter,
+} from "./gazetteer-spatial-scope.mjs";
+import {
+  buildMapTextEvidenceIndex,
+  matchEligibleMapTextEntry,
+  textBackedPlacenameEvidence,
+  withMapTextEvidence,
+} from "./map-text-evidence.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_INDEX_PATH = path.resolve(__dirname, "../.cache/gazetteers/geonames/index.ndjson");
@@ -147,6 +158,24 @@ function tokenOverlapScore(a, b) {
   let overlap = 0;
   for (const token of aTokens) if (bTokens.has(token)) overlap += 1;
   return overlap / Math.max(aTokens.size, bTokens.size);
+}
+
+const GENERIC_FEATURE_TOKENS = new Set([...FEATURE_CUE_TOKENS, "country"]);
+
+function distinctiveTokenSet(value) {
+  return new Set(normalizedTokens(value).filter((token) => token.length >= 3 && !GENERIC_FEATURE_TOKENS.has(token)));
+}
+
+function distinctiveTokenAlignment(evidence, candidate) {
+  if (candidate.exact || candidate.lexical >= 0.99) return { supported: true, missing: [], extra: [] };
+  const evidenceTokens = distinctiveTokenSet(evidence.normalized || evidence.label);
+  const candidateTokens = distinctiveTokenSet(candidate.variant?.normalized || candidate.record?.name);
+  if (evidenceTokens.size === 0 || candidateTokens.size === 0) {
+    return { supported: false, missing: Array.from(evidenceTokens), extra: Array.from(candidateTokens) };
+  }
+  const missing = Array.from(evidenceTokens).filter((token) => !candidateTokens.has(token));
+  const extra = Array.from(candidateTokens).filter((token) => !evidenceTokens.has(token));
+  return { supported: missing.length === 0 && extra.length === 0, missing, extra };
 }
 
 function levenshteinDistance(a, b) {
@@ -305,6 +334,42 @@ function loadMatcher() {
   return cachedMatcher;
 }
 
+function scopedGeoNamesMatcher(matcher, filter) {
+  if (!filter?.bbox || !matcher.available) return { matcher, summary: undefined };
+  const records = matcher.records.filter((record) => recordMatchesGazetteerSpatialFilter(record, filter));
+  const summary = gazetteerSpatialFilterSummary(filter, matcher.recordCount || matcher.records.length, records.length);
+  if (records.length === 0 || records.length === matcher.records.length) return { matcher, summary };
+  const byNormalized = new Map();
+  for (const record of records) {
+    for (const variant of record.normalizedNames || []) {
+      if (!variant.normalized) continue;
+      const entries = byNormalized.get(variant.normalized) || [];
+      entries.push(record);
+      byNormalized.set(variant.normalized, entries);
+    }
+  }
+  return {
+    matcher: {
+      ...matcher,
+      records,
+      byNormalized,
+      fuse: new Fuse(records, {
+        includeScore: true,
+        threshold: 0.35,
+        ignoreLocation: true,
+        minMatchCharLength: 3,
+        keys: [
+          { name: "name", weight: 0.5 },
+          { name: "asciiName", weight: 0.15 },
+          { name: "normalizedNames.value", weight: 0.25 },
+          { name: "normalizedNames.normalized", weight: 0.1 },
+        ],
+      }),
+    },
+    summary,
+  };
+}
+
 function stringsFromResource(resource) {
   const record = asRecord(resource) || {};
   return [
@@ -424,16 +489,67 @@ function addNormalizedNameVariant(target, value) {
   if (normalizedWithoutParenthetical) target.add(normalizedWithoutParenthetical);
 }
 
+function selectedGazetteerEvidence(value) {
+  const status = String(value || "").trim().toLowerCase();
+  return !status || status === "matched" || status === "overlap" || status === "exact" || status === "exact_contextual" || status === "fuzzy_contextual" || status === "concordance_id";
+}
+
+function selectedGeocodingEvidence(place) {
+  const status = String(place?.extensions?.wofConcordance?.status || place?.geocoding?.matchType || "").trim().toLowerCase();
+  return !status || !["ambiguous", "unmatched", "text_unsupported"].includes(status);
+}
+
+function exactSameNameGeoNamesMatch(place, match) {
+  const selected = match?.selected;
+  if (!selected || !(selected.exact || match.matchType === "exact_contextual")) return false;
+  const placeName = normalizeGeoNamesText(place?.name || place?.normalizedName);
+  const recordName = normalizeGeoNamesText(selected.record?.name || selected.details?.name);
+  return Boolean(placeName && recordName && placeName === recordName);
+}
+
+function existingPrimaryMatchIsStrong(place) {
+  const placeName = normalizeGeoNamesText(place?.name || place?.normalizedName);
+  const matchType = String(place?.geocoding?.matchType || place?.extensions?.wofConcordance?.matchType || "").toLowerCase();
+  const status = String(place?.extensions?.wofConcordance?.status || "").toLowerCase();
+  const exactish = ["exact", "exact_contextual", "concordance_id", "source_concordance"].includes(matchType)
+    || ["exact", "exact_contextual"].includes(status);
+  const matchedNames = [
+    place?.extensions?.wofConcordance?.matchedName,
+    place?.geocoding?.candidates?.[0]?.matchedName,
+    place?.geocoding?.candidates?.[0]?.name,
+  ].map(normalizeGeoNamesText).filter(Boolean);
+  return Boolean(exactish && placeName && matchedNames.includes(placeName));
+}
+
+function existingPrimaryMatchIsWeakFuzzy(place) {
+  const placeName = normalizeGeoNamesText(place?.name || place?.normalizedName);
+  const matchType = String(place?.geocoding?.matchType || place?.extensions?.wofConcordance?.matchType || "").toLowerCase();
+  if (!["fuzzy", "fuzzy_contextual", "matched"].includes(matchType)) return false;
+  const matchedNames = [
+    place?.extensions?.wofConcordance?.matchedName,
+    place?.geocoding?.candidates?.[0]?.matchedName,
+    place?.geocoding?.candidates?.[0]?.name,
+  ].map(normalizeGeoNamesText).filter(Boolean);
+  return Boolean(placeName && matchedNames.some((name) => name && name !== placeName));
+}
+
+function shouldPromoteExactGeoNamesMatch(place, match) {
+  return exactSameNameGeoNamesMatch(place, match) && existingPrimaryMatchIsWeakFuzzy(place) && !existingPrimaryMatchIsStrong(place);
+}
+
 function addExistingNameVariants(target, place) {
   addNormalizedNameVariant(target, place?.name);
   addNormalizedNameVariant(target, place?.normalizedName);
   for (const match of place?.gazetteerMatches || []) {
+    if (!selectedGazetteerEvidence(match?.status || match?.matchType)) continue;
     addNormalizedNameVariant(target, match?.matchedName);
     addNormalizedNameVariant(target, match?.name);
   }
-  for (const candidate of asArray(place?.geocoding?.candidates)) {
-    addNormalizedNameVariant(target, candidate?.name);
-    addNormalizedNameVariant(target, candidate?.matchedName);
+  if (selectedGeocodingEvidence(place)) {
+    for (const candidate of asArray(place?.geocoding?.candidates)) {
+      addNormalizedNameVariant(target, candidate?.name);
+      addNormalizedNameVariant(target, candidate?.matchedName);
+    }
   }
 }
 
@@ -446,16 +562,19 @@ function placenameLabelCandidates(place) {
     const withoutParenthetical = label.replace(/\s*\([^)]*\)\s*/g, " ").replace(/\s+/g, " ").trim();
     if (withoutParenthetical && withoutParenthetical !== label) labels.push(withoutParenthetical);
   };
+  add(place?.name);
+  add(place?.normalizedName);
   for (const match of place?.gazetteerMatches || []) {
+    if (!selectedGazetteerEvidence(match?.status || match?.matchType)) continue;
     add(match?.matchedName);
     add(match?.name);
   }
-  for (const candidate of asArray(place?.geocoding?.candidates)) {
-    add(candidate?.matchedName);
-    add(candidate?.name);
+  if (selectedGeocodingEvidence(place)) {
+    for (const candidate of asArray(place?.geocoding?.candidates)) {
+      add(candidate?.matchedName);
+      add(candidate?.name);
+    }
   }
-  add(place?.normalizedName);
-  add(place?.name);
   return Array.from(new Map(labels.map((label) => [normalizeGeoNamesText(label), label])).values())
     .filter((label) => normalizeGeoNamesText(label));
 }
@@ -463,11 +582,14 @@ function placenameLabelCandidates(place) {
 function geonamesIdFromPlace(place) {
   const candidates = [];
   for (const match of place?.gazetteerMatches || []) {
+    if (!selectedGazetteerEvidence(match?.status || match?.matchType)) continue;
+    if (["geonames", "geoname", "gn", "ogm", "canonical", "canonical-ogm", "opengeometadata"].includes(String(match?.provider || match?.authority || "").trim().toLowerCase())) continue;
     const concordances = asRecord(match?.concordances);
     candidates.push(concordances?.["gn:id"], concordances?.geonames, concordances?.geonames_id, match?.geonameId);
   }
-  candidates.push(place?.extensions?.wofConcordance?.concordances?.["gn:id"]);
-  candidates.push(place?.extensions?.geonamesConcordance?.authorityId);
+  if (selectedGazetteerEvidence(place?.extensions?.wofConcordance?.status)) {
+    candidates.push(place?.extensions?.wofConcordance?.concordances?.["gn:id"]);
+  }
   for (const candidate of candidates.flatMap(asArray)) {
     const id = String(candidate || "").trim();
     if (/^\d+$/.test(id)) return id;
@@ -475,21 +597,17 @@ function geonamesIdFromPlace(place) {
   return null;
 }
 
-function evidenceFromPlacename(place) {
+function evidenceFromPlacename(place, textEvidenceIndex) {
   const label = placenameLabelCandidates(place)[0] || "";
   const normalized = normalizeGeoNamesText(label);
   if (!label || !normalized) return null;
-  return {
-    label,
-    normalized,
+  return textBackedPlacenameEvidence(place, {
+    normalize: normalizeGeoNamesText,
+    labelCandidates: placenameLabelCandidates(place),
+    textEvidenceIndex,
     type: place?.type,
     confidence: Number.isFinite(Number(place?.confidence)) ? Number(place.confidence) : 0.7,
-    sourceKind: "derived_placename",
-    sourceTextIds: Array.isArray(place?.sourceTextIds) ? place.sourceTextIds : [],
-    sourceTextIndices: Array.isArray(place?.sourceTextIndices) ? place.sourceTextIndices : [],
-    approxBbox: place?.approxBbox,
-    sourceCallId: place?.sourceCallId,
-  };
+  });
 }
 
 function usefulEvidenceContent(label, role) {
@@ -508,7 +626,7 @@ function evidenceFromTextGroup(group) {
   const label = String(group?.content || "").trim();
   const role = String(group?.role || "other").toLowerCase();
   const confidence = Number.isFinite(Number(group?.confidence)) ? Number(group.confidence) : 0.75;
-  if (confidence < 0.74 || !usefulEvidenceContent(label, role)) return null;
+  if (!matchEligibleMapTextEntry(group, { kind: "text_group", minConfidence: 0.74 }) || confidence < 0.74 || !usefulEvidenceContent(label, role)) return null;
   return {
     label,
     normalized: normalizeGeoNamesText(label),
@@ -526,7 +644,8 @@ function evidenceFromTextSegment(text) {
   const label = String(text?.content || "").replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, " ").replace(/\s+/g, " ").trim();
   const role = String(text?.role || "other").toLowerCase();
   const confidence = Number.isFinite(Number(text?.confidence)) ? Number(text.confidence) : 0.5;
-  if (confidence < envNumber("ENRICHMENT_PROXY_GEONAMES_TEXT_CONFIDENCE", DEFAULT_TEXT_CONFIDENCE) || !usefulEvidenceContent(label, role)) return null;
+  const minConfidence = envNumber("ENRICHMENT_PROXY_GEONAMES_TEXT_CONFIDENCE", DEFAULT_TEXT_CONFIDENCE);
+  if (!matchEligibleMapTextEntry(text, { kind: "text_segment", minConfidence }) || confidence < minConfidence || !usefulEvidenceContent(label, role)) return null;
   return {
     label,
     normalized: normalizeGeoNamesText(label),
@@ -540,14 +659,19 @@ function evidenceFromTextSegment(text) {
   };
 }
 
-function supplementalEvidence({ textGroups, textSegments, existingNames }) {
+function supplementalEvidence({ textGroups, textSegments, existingNames, textEvidenceIndex }) {
+  const indexedGroupIds = new Set((textEvidenceIndex?.groups || []).map((entry) => String(entry.id || "")).filter(Boolean));
+  const eligibleGroupIds = new Set((textEvidenceIndex?.matchGroups || []).map((entry) => String(entry.id || "")).filter(Boolean));
   const byNormalized = new Map();
   const addEvidence = (evidence) => {
     if (!evidence || !evidence.normalized || existingNames.has(evidence.normalized)) return;
     const existing = byNormalized.get(evidence.normalized);
     if (!existing || evidence.confidence > existing.confidence) byNormalized.set(evidence.normalized, evidence);
   };
-  for (const group of textGroups) addEvidence(evidenceFromTextGroup(group));
+  for (const group of textGroups) {
+    if (group?.id && indexedGroupIds.has(String(group.id)) && !eligibleGroupIds.has(String(group.id))) continue;
+    addEvidence(evidenceFromTextGroup(group));
+  }
   for (const text of textSegments) addEvidence(evidenceFromTextSegment(text));
   return Array.from(byNormalized.values())
     .sort((a, b) => b.confidence - a.confidence || a.label.localeCompare(b.label))
@@ -591,6 +715,12 @@ function candidateFromRecord(record, evidence, context, mapExtent, boundary, { d
     exact: lexical.exact,
     score,
     lexical: lexical.lexical,
+    distinctiveTokenAlignment: distinctiveTokenAlignment(evidence, {
+      record,
+      variant: lexical.variant,
+      exact: lexical.exact,
+      lexical: lexical.lexical,
+    }),
     feature,
     details: withoutUndefined({
       authority: "geonames",
@@ -637,12 +767,13 @@ function matchEvidence(matcher, evidence, context, mapExtent, boundary, options 
   const limited = candidates.slice(0, limit);
   const selected = limited[0] || null;
   const second = limited[1] || null;
+  const distinctiveAllowed = Boolean(options.expectedGeonameId || !selected || selected.distinctiveTokenAlignment?.supported);
   const threshold = envNumber("ENRICHMENT_PROXY_GEONAMES_MATCH_THRESHOLD", DEFAULT_MATCH_THRESHOLD);
   const ambiguousThreshold = envNumber("ENRICHMENT_PROXY_GEONAMES_AMBIGUOUS_THRESHOLD", DEFAULT_AMBIGUOUS_THRESHOLD);
   const directIdLexicalThreshold = envNumber("ENRICHMENT_PROXY_GEONAMES_DIRECT_ID_LEXICAL_THRESHOLD", 0.56);
   const directIdAllowed = !options.expectedGeonameId || Boolean(selected && selected.lexical >= directIdLexicalThreshold && selected.feature >= 0.35);
   const ambiguous = Boolean(selected && second && (selected.score - second.score) < 0.04 && !selected.exact && !options.expectedGeonameId);
-  const status = selected && directIdAllowed && (options.expectedGeonameId || (selected.score >= threshold && !ambiguous))
+  const status = selected && directIdAllowed && distinctiveAllowed && (options.expectedGeonameId || (selected.score >= threshold && !ambiguous))
     ? "matched"
     : selected && directIdAllowed && selected.score >= ambiguousThreshold
       ? "ambiguous"
@@ -678,6 +809,22 @@ function removeGeoNamesOverlapFromPlacename(place) {
   if (extensions.geonamesConcordance?.status !== "overlap") return cleanedPlace;
   delete extensions.geonamesConcordance;
   return withoutUndefined({ ...cleanedPlace, extensions });
+}
+
+function withoutGeoNamesConcordance(place) {
+  const cleanedPlace = withoutGazetteerProvider(place, "geonames");
+  const extensions = { ...(cleanedPlace.extensions || {}) };
+  delete extensions.geonamesConcordance;
+  const next = { ...cleanedPlace, extensions };
+  const authority = String(next.authority || "").toLowerCase();
+  if (authority === "geonames" || authority === "gn" || authority === "geoname") {
+    delete next.authority;
+    delete next.authorityId;
+    delete next.uri;
+    delete next.coordinates;
+    delete next.geocoding;
+  }
+  return withoutUndefined(next);
 }
 
 function matchPayload(record, match, status) {
@@ -749,7 +896,7 @@ function applyMatchToPlacename(place, match) {
 
 function supplementalPlacename(evidence, match, index) {
   const record = match.selected?.record;
-  const displayName = record?.name || titleizeLabel(evidence.label);
+  const displayName = titleizeLabel(normalizeGeoNamesText(evidence.label) || evidence.label);
   const base = {
     id: `place-${String(index + 1).padStart(4, "0")}`,
     name: displayName,
@@ -776,6 +923,7 @@ function summaryFromCounts(matcher, counts, extra = {}) {
     matched: counts.matched,
     ambiguous: counts.ambiguous,
     unmatched: counts.unmatched,
+    textUnsupportedPlacenames: counts.textUnsupported,
     overlapPlacenames: counts.overlap,
     supplementalPlacenames: counts.supplemental,
     directConcordancePlacenames: counts.direct,
@@ -800,17 +948,21 @@ export function buildGeoNamesConcordanceLayer({
   resource = {},
   mapExtent = {},
   boundary = null,
+  includeSupplemental = true,
 } = {}) {
   const matcher = loadMatcher();
   if (!matcher.available) {
     return {
       placenames,
-      extension: summaryFromCounts(matcher, { matched: 0, ambiguous: 0, unmatched: 0, supplemental: 0, overlap: 0, direct: 0 }, matcher.error ? { error: matcher.error } : {}),
+      extension: summaryFromCounts(matcher, { matched: 0, ambiguous: 0, unmatched: 0, textUnsupported: 0, supplemental: 0, overlap: 0, direct: 0 }, matcher.error ? { error: matcher.error } : {}),
     };
   }
 
+  const scoped = scopedGeoNamesMatcher(matcher, buildGazetteerSpatialFilter({ mapExtent, resource, boundary }));
+  const activeMatcher = scoped.matcher;
   const context = buildContext({ resource, extraction, textGroups, textSegments });
-  const counts = { matched: 0, ambiguous: 0, unmatched: 0, supplemental: 0, overlap: 0, direct: 0 };
+  const textEvidenceIndex = buildMapTextEvidenceIndex({ textGroups, textSegments, normalize: normalizeGeoNamesText });
+  const counts = { matched: 0, ambiguous: 0, unmatched: 0, textUnsupported: 0, supplemental: 0, overlap: 0, direct: 0 };
   const existingNames = new Set();
   const existingAuthorityIds = new Set();
   const enriched = [];
@@ -821,53 +973,71 @@ export function buildGeoNamesConcordanceLayer({
     for (const match of place?.gazetteerMatches || []) {
       if (match?.authorityId) existingAuthorityIds.add(String(match.authorityId));
     }
-    const evidence = evidenceFromPlacename(place);
+    const evidence = evidenceFromPlacename(place, textEvidenceIndex);
     if (!evidence) {
-      enriched.push(place);
+      counts.textUnsupported += 1;
+      const normalizedAuthority = String(place?.authority || "").toLowerCase();
+      enriched.push(["geonames", "gn", "geoname"].includes(normalizedAuthority) ? withoutGeoNamesConcordance(place) : removeGeoNamesOverlapFromPlacename(place));
       continue;
     }
     const expectedGeonameId = geonamesIdFromPlace(place);
     if (authority && authority !== "geonames") {
-      const match = matchEvidence(matcher, evidence, context, mapExtent, boundary, { expectedGeonameId });
+      const match = matchEvidence(activeMatcher, evidence, context, mapExtent, boundary, { expectedGeonameId });
+      if (shouldPromoteExactGeoNamesMatch(place, match)) {
+        counts.matched += 1;
+        const enrichedPlace = applyMatchToPlacename(withMapTextEvidence(withoutGeoNamesConcordance(place), evidence), match);
+        if (enrichedPlace.authority === "geonames" && enrichedPlace.authorityId) existingAuthorityIds.add(enrichedPlace.authorityId);
+        enriched.push(enrichedPlace);
+        continue;
+      }
       if (match.selected?.record?.geonameId && strongAuthorityOverlap(match)) {
         counts.overlap += 1;
         if (expectedGeonameId) counts.direct += 1;
         existingAuthorityIds.add(match.selected.record.geonameId);
-        enriched.push(applyGeoNamesOverlapToPlacename(place, match));
+        enriched.push(applyGeoNamesOverlapToPlacename(withMapTextEvidence(place, evidence), match));
         continue;
       }
       enriched.push(removeGeoNamesOverlapFromPlacename(place));
       continue;
     }
-    if (authority === "geonames") {
-      enriched.push(place);
+    if (["geonames", "gn", "geoname"].includes(authority)) {
+      const match = matchEvidence(activeMatcher, evidence, context, mapExtent, boundary, { expectedGeonameId });
+      counts[match.status] += 1;
+      const enrichedPlace = applyMatchToPlacename(withMapTextEvidence(withoutGeoNamesConcordance(place), evidence), match);
+      if (enrichedPlace.authority === "geonames" && enrichedPlace.authorityId) existingAuthorityIds.add(enrichedPlace.authorityId);
+      enriched.push(enrichedPlace);
       continue;
     }
-    const match = matchEvidence(matcher, evidence, context, mapExtent, boundary, { expectedGeonameId });
+    const match = matchEvidence(activeMatcher, evidence, context, mapExtent, boundary, { expectedGeonameId });
     counts[match.status] += 1;
-    const enrichedPlace = applyMatchToPlacename(place, match);
+    const enrichedPlace = applyMatchToPlacename(withMapTextEvidence(place, evidence), match);
     if (enrichedPlace.authority === "geonames" && enrichedPlace.authorityId) existingAuthorityIds.add(enrichedPlace.authorityId);
     enriched.push(enrichedPlace);
   }
 
-  const boundaryBox = normalizedBox(boundary?.bbox);
-  for (const evidence of supplementalEvidence({ textGroups, textSegments, existingNames })) {
-    const match = matchEvidence(matcher, evidence, context, mapExtent, boundary);
-    if (!match.selected?.record?.geonameId) continue;
-    if (!match.selected.exact && match.selected.lexical < 0.93) continue;
-    if (boundaryBox && !pointInsideBox(match.selected.record.centroid, boundaryBox)) continue;
-    const authorityId = match.selected.record.geonameId;
-    if (existingAuthorityIds.has(authorityId)) continue;
-    counts.matched += 1;
-    counts.supplemental += 1;
-    existingNames.add(evidence.normalized);
-    existingAuthorityIds.add(authorityId);
-    enriched.push(supplementalPlacename(evidence, match, enriched.length));
+  if (includeSupplemental) {
+    const boundaryBox = normalizedBox(boundary?.bbox);
+    for (const evidence of supplementalEvidence({ textGroups, textSegments, existingNames, textEvidenceIndex })) {
+      const match = matchEvidence(activeMatcher, evidence, context, mapExtent, boundary);
+      if (!match.selected?.record?.geonameId) continue;
+      if (!match.selected.exact && match.selected.lexical < 0.93) continue;
+      if (boundaryBox && !pointInsideBox(match.selected.record.centroid, boundaryBox)) continue;
+      const authorityId = match.selected.record.geonameId;
+      if (existingAuthorityIds.has(authorityId)) continue;
+      counts.matched += 1;
+      counts.supplemental += 1;
+      existingNames.add(evidence.normalized);
+      existingAuthorityIds.add(authorityId);
+      enriched.push(supplementalPlacename(evidence, match, enriched.length));
+    }
   }
 
   return {
     placenames: enriched,
-    extension: summaryFromCounts(matcher, counts, boundary ? { boundary } : {}),
+    extension: summaryFromCounts(matcher, counts, withoutUndefined({
+      boundary,
+      spatialFilter: scoped.summary,
+    })),
   };
 }
 

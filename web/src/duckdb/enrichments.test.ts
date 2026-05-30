@@ -71,7 +71,7 @@ const ASSET: StagedAsset = {
 
 describe("enrichment schema and draft mapping", () => {
     it("keeps the Reno extraction response shape as the canonical schema contract", () => {
-        expect(HISTORICAL_MAP_EXTRACTION_SCHEMA.required).toEqual(["text", "placenames", "map_bbox_estimate", "description", "debug"]);
+        expect(HISTORICAL_MAP_EXTRACTION_SCHEMA.required).toEqual(["text", "text_groups", "placenames", "map_bbox_estimate", "description", "debug"]);
         const bboxItems = (HISTORICAL_MAP_EXTRACTION_SCHEMA.properties.text.items.properties.approx_bbox as any).items;
         expect(bboxItems.minimum).toBe(0);
         expect(bboxItems.maximum).toBe(1);
@@ -82,6 +82,9 @@ describe("enrichment schema and draft mapping", () => {
             "bbox_inference_strategy",
             "limitations",
         ]);
+        expect(HISTORICAL_MAP_EXTRACTION_SCHEMA.properties.text_groups.items.properties.source_text_indices.items.minimum).toBe(0);
+        expect(HISTORICAL_MAP_EXTRACTION_SCHEMA.properties.placenames.items.properties.type.enum).toContain("park");
+        expect(HISTORICAL_MAP_EXTRACTION_SCHEMA.properties.placenames.items.properties.source_text_indices.items.minimum).toBe(0);
         expect(RENO_EXTRACTION_SAMPLE.text[0].approx_bbox).toHaveLength(4);
     });
 

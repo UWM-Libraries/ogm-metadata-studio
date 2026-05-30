@@ -48,17 +48,17 @@ describe('StaticMapService', () => {
     });
 
     it('returns null if no geometry', async () => {
-        const res: Resource = { id: '1', dct_title_s: 'T' };
+        const res = { id: '1', dct_title_s: 'T' } as Resource;
         const svc = new StaticMapService(res);
         const blob = await svc.generate();
         expect(blob).toBeNull();
     });
 
     it('parses ENVELOPE and generates map', async () => {
-        const res: Resource = {
+        const res = {
             id: '1', dct_title_s: 'T',
             dcat_bbox: 'ENVELOPE(-10, 10, 20, -20)' // W, E, N, S
-        };
+        } as Resource;
         const svc = new StaticMapService(res);
 
         const blob = await svc.generate(200, 200);
@@ -75,10 +75,10 @@ describe('StaticMapService', () => {
     });
 
     it('parses CSV bbox and generates map', async () => {
-        const res: Resource = {
+        const res = {
             id: '1', dct_title_s: 'T',
             dcat_bbox: '-10, -20, 10, 20' // minX, minY, maxX, maxY
-        };
+        } as Resource;
         const svc = new StaticMapService(res);
         const blob = await svc.generate();
 
@@ -87,9 +87,9 @@ describe('StaticMapService', () => {
     });
 
     it('handles image load failure gracefully', async () => {
-        const res: Resource = {
+        const res = {
             id: '1', dct_title_s: 'T', dcat_bbox: '-10,-10,10,10'
-        };
+        } as Resource;
         (global.fetch as any).mockRejectedValue(new Error('Net error'));
 
         const svc = new StaticMapService(res);

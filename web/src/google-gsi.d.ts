@@ -8,7 +8,7 @@ declare global {
       accounts: {
         id: {
           initialize(config: IdConfiguration): void;
-          prompt(): void;
+          prompt(callback?: (notification: PromptMomentNotification) => void): void;
           renderButton(
             parent: HTMLElement,
             options: {
@@ -16,9 +16,13 @@ declare global {
               size?: "large" | "medium" | "small";
               type?: "standard" | "icon";
               text?: "signin_with" | "signup_with" | "continue_with" | "signin";
-              callback?: (credential: CredentialResponse) => void;
+              shape?: "rectangular" | "pill" | "circle" | "square";
+              logo_alignment?: "left" | "center";
+              width?: number | string;
+              click_listener?: () => void;
             }
           ): void;
+          disableAutoSelect(): void;
         };
       };
     };
@@ -37,6 +41,17 @@ export interface IdConfiguration {
   auto_select?: boolean;
   ux_mode?: "popup" | "redirect";
   cancel_on_tap_outside?: boolean;
+}
+
+export interface PromptMomentNotification {
+  isDisplayMoment(): boolean;
+  isDisplayed(): boolean;
+  isNotDisplayed(): boolean;
+  getNotDisplayedReason(): string;
+  isSkippedMoment(): boolean;
+  getSkippedReason(): string;
+  isDismissedMoment(): boolean;
+  getDismissedReason(): string;
 }
 
 export {};

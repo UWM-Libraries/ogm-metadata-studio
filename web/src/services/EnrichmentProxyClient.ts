@@ -30,6 +30,7 @@ export interface HistoricalMapRunRequest {
     storageProfileId: string;
     modelProfileId: string;
     visionProfileId?: string;
+    textExtractionModelProfileId?: string;
     asset: StagedAsset;
     systemPrompt: string;
     userPrompt: string;
@@ -76,6 +77,7 @@ export interface ProcessUploadedImageRequest {
     storageProfileId: string;
     modelProfileId: string;
     visionProfileId?: string;
+    textExtractionModelProfileId?: string;
     file: UploadedImageFilePayload;
     checksum: string;
     forceReprocess?: boolean;

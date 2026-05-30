@@ -146,6 +146,24 @@ const blankModelProfile = (): ProxyModelProfile => ({
     modelParams: {},
 });
 
+const blankGeminiModelProfile = (): ProxyModelProfile => ({
+    id: `gemini-${crypto.randomUUID()}`,
+    name: "Gemini label extraction",
+    provider: "gemini",
+    apiKeyEnv: "GEMINI_API_KEY",
+    defaultModel: "gemini-3.5-flash",
+    modelParams: {},
+});
+
+const blankOpenAIReconciliationProfile = (): ProxyModelProfile => ({
+    id: `openai-reconcile-${crypto.randomUUID()}`,
+    name: "OpenAI mini label reconciliation",
+    provider: "openai",
+    apiKeyEnv: "OPENAI_API_KEY",
+    defaultModel: "gpt-5.4-mini",
+    modelParams: {},
+});
+
 const blankVisionProfile = (): ProxyVisionProfile => ({
     id: `vision-${crypto.randomUUID()}`,
     name: "Google Cloud Vision",
@@ -155,6 +173,12 @@ const blankVisionProfile = (): ProxyVisionProfile => ({
     featureType: "DOCUMENT_TEXT_DETECTION",
     languageHints: [],
 });
+
+const defaultTextReconciliationProfileId = (profiles: ProxyModelProfile[]) => (
+    profiles.find((profile) => (profile.provider || "openai") === "openai" && /mini|nano|reconciliation/i.test(`${profile.name} ${profile.defaultModel}`))?.id
+    || profiles.find((profile) => profile.provider === "gemini")?.id
+    || ""
+);
 
 const defaultBatchDefaults = {
     provider: "",
@@ -610,6 +634,7 @@ export const EnrichmentWorkbench: React.FC = () => {
     const [selectedStorageId, setSelectedStorageId] = useState("");
     const [selectedModelId, setSelectedModelId] = useState("");
     const [selectedVisionId, setSelectedVisionId] = useState("");
+    const [selectedTextExtractionModelId, setSelectedTextExtractionModelId] = useState("");
     const [storageDraft, setStorageDraft] = useState<ProxyStorageProfile>(blankStorageProfile);
     const [modelDraft, setModelDraft] = useState<ProxyModelProfile>(blankModelProfile);
     const [visionDraft, setVisionDraft] = useState<ProxyVisionProfile>(blankVisionProfile);
@@ -634,12 +659,30 @@ export const EnrichmentWorkbench: React.FC = () => {
         [config.storageProfiles, selectedStorageId],
     );
     const selectedModelProfile = useMemo(
-        () => config.modelProfiles.find((profile) => profile.id === selectedModelId),
+        () => config.modelProfiles.find((profile) => profile.id === selectedModelId && (profile.provider || "openai") === "openai"),
         [config.modelProfiles, selectedModelId],
     );
     const selectedVisionProfile = useMemo(
         () => config.visionProfiles.find((profile) => profile.id === selectedVisionId),
         [config.visionProfiles, selectedVisionId],
+    );
+    const openAiModelProfiles = useMemo(
+        () => config.modelProfiles.filter((profile) => (profile.provider || "openai") === "openai"),
+        [config.modelProfiles],
+    );
+    const textReconciliationModelProfiles = useMemo(
+        () => config.modelProfiles.filter((profile) => {
+            const provider = profile.provider || "openai";
+            return provider === "openai" || provider === "gemini";
+        }),
+        [config.modelProfiles],
+    );
+    const selectedTextExtractionModelProfile = useMemo(
+        () => config.modelProfiles.find((profile) => {
+            const provider = profile.provider || "openai";
+            return profile.id === selectedTextExtractionModelId && (provider === "openai" || provider === "gemini");
+        }),
+        [config.modelProfiles, selectedTextExtractionModelId],
     );
     const inventoryRows = useMemo(() => {
         const query = inventoryQuery.trim().toLowerCase();
@@ -705,10 +748,11 @@ export const EnrichmentWorkbench: React.FC = () => {
             const normalized = { ...next, visionProfiles: next.visionProfiles || [] };
             setConfig(normalized);
             setSelectedStorageId(normalized.storageProfiles[0]?.id || "");
-            setSelectedModelId(normalized.modelProfiles[0]?.id || "");
+            setSelectedModelId(normalized.modelProfiles.find((profile) => (profile.provider || "openai") === "openai")?.id || normalized.modelProfiles[0]?.id || "");
             setSelectedVisionId(normalized.visionProfiles[0]?.id || "");
+            setSelectedTextExtractionModelId(defaultTextReconciliationProfileId(normalized.modelProfiles));
             setStorageDraft(normalized.storageProfiles[0] || blankStorageProfile());
-            setModelDraft(normalized.modelProfiles[0] || blankModelProfile());
+            setModelDraft(normalized.modelProfiles.find((profile) => (profile.provider || "openai") === "openai") || normalized.modelProfiles[0] || blankModelProfile());
             setVisionDraft(normalized.visionProfiles[0] || blankVisionProfile());
             await syncProxyProfilesToDuckDb(normalized.storageProfiles, normalized.modelProfiles);
             setStatus("Connected to enrichment proxy.");
@@ -1228,8 +1272,11 @@ export const EnrichmentWorkbench: React.FC = () => {
             const outputSchema = historicalMapPrompt ? JSON.parse(historicalMapPrompt.definition.output_schema_json) : {};
             const modelParams = normalizeModelParams(selectedModelProfile.defaultModel, selectedModelProfile.modelParams ?? {});
             const batchDefaults = defaultBatchDefaultsPayload();
+            const textExtractorLabel = selectedTextExtractionModelProfile
+                ? ` + ${(selectedTextExtractionModelProfile.provider || "openai") === "gemini" ? "Gemini" : "OpenAI"} ${selectedTextExtractionModelProfile.defaultModel} label reconciliation`
+                : "";
             const ocrEngineLabel = selectedVisionProfile
-                ? `Google Cloud Vision ${selectedVisionProfile.featureType || "DOCUMENT_TEXT_DETECTION"}`
+                ? `Google Cloud Vision ${selectedVisionProfile.featureType || "DOCUMENT_TEXT_DETECTION"}${textExtractorLabel || " + OpenAI vision augmentation"}`
                 : "OpenAI vision extraction";
             let published = 0;
             let failed = 0;
@@ -1325,7 +1372,7 @@ export const EnrichmentWorkbench: React.FC = () => {
                             const elapsed = heartbeatCount * 20;
                             const detail = item.kind === "geospatial"
                                 ? `${formatElapsed(elapsed)} waiting on proxy. The active step may be S3 upload, shapefile analysis, derivative generation, or Aardvark writing.`
-                                : `${formatElapsed(elapsed)} waiting on proxy. The active step may be S3 upload, IIIF tile generation, or ${selectedVisionProfile ? "Google Vision OCR" : "OpenAI extraction"}.`;
+                                : `${formatElapsed(elapsed)} waiting on proxy. The active step may be S3 upload, IIIF tile generation, or ${selectedVisionProfile ? selectedTextExtractionModelProfile ? "Google Vision OCR / label reconciliation" : "Google Vision OCR" : "OpenAI extraction"}.`;
                             updateUploadItem(item.id, {
                                 message: `Still processing in proxy: ${detail}`,
                             });
@@ -1362,6 +1409,7 @@ export const EnrichmentWorkbench: React.FC = () => {
                                     storageProfileId: selectedStorageProfile.id,
                                     modelProfileId: selectedModelProfile.id,
                                     visionProfileId: selectedVisionProfile?.id,
+                                    textExtractionModelProfileId: selectedVisionProfile ? selectedTextExtractionModelProfile?.id : undefined,
                                     file: {
                                         name: item.file.name,
                                         type: item.file.type,
@@ -1934,7 +1982,11 @@ export const EnrichmentWorkbench: React.FC = () => {
             modelDraft,
         ];
         if (await saveProxyConfig({ ...config, modelProfiles: nextProfiles })) {
-            setSelectedModelId(modelDraft.id);
+            if (modelDraft.provider === "gemini" || /mini|nano|reconciliation/i.test(`${modelDraft.name} ${modelDraft.defaultModel}`)) {
+                setSelectedTextExtractionModelId(modelDraft.id);
+            } else {
+                setSelectedModelId(modelDraft.id);
+            }
         }
     };
 
@@ -1964,7 +2016,10 @@ export const EnrichmentWorkbench: React.FC = () => {
     const deleteModelProfile = async () => {
         const nextProfiles = config.modelProfiles.filter((profile) => profile.id !== selectedModelId);
         if (await saveProxyConfig({ ...config, modelProfiles: nextProfiles })) {
-            setSelectedModelId(nextProfiles[0]?.id || "");
+            setSelectedModelId(nextProfiles.find((profile) => (profile.provider || "openai") === "openai")?.id || nextProfiles[0]?.id || "");
+            if (selectedTextExtractionModelId === selectedModelId) {
+                setSelectedTextExtractionModelId(defaultTextReconciliationProfileId(nextProfiles));
+            }
         }
     };
 
@@ -1990,8 +2045,8 @@ export const EnrichmentWorkbench: React.FC = () => {
         try {
             setStatus((await enrichmentProxyClient.testModelProfile(selectedModelId)).message);
         } catch (error: any) {
-            setStatus(`OpenAI test failed: ${error.message}`);
-            addToast("OpenAI test failed.", "error");
+            setStatus(`AI model test failed: ${error.message}`);
+            addToast("AI model test failed.", "error");
         }
     };
 
@@ -2025,10 +2080,10 @@ export const EnrichmentWorkbench: React.FC = () => {
 
     const uploadActionControls = (
         <div className="flex flex-wrap items-center gap-2">
-            <button type="button" onClick={processUploads} disabled={isBusy || isRestoring || processableUploadCount === 0 || !selectedStorageId || !selectedModelId} className="rounded bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white disabled:opacity-40">
+            <button type="button" onClick={processUploads} disabled={isBusy || isRestoring || processableUploadCount === 0 || !selectedStorageId || !selectedModelProfile} className="rounded bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white disabled:opacity-40">
                 {isUploading ? "Processing..." : "Process Uploads"}
             </button>
-            <button type="button" onClick={regenerateAardvarkFromS3} disabled={isBusy || isRestoring || !selectedStorageId || !selectedModelId} className="rounded border border-indigo-300 px-3 py-1.5 text-xs font-medium text-indigo-700 disabled:opacity-40 dark:border-indigo-700 dark:text-indigo-200">
+            <button type="button" onClick={regenerateAardvarkFromS3} disabled={isBusy || isRestoring || !selectedStorageId || !selectedModelProfile} className="rounded border border-indigo-300 px-3 py-1.5 text-xs font-medium text-indigo-700 disabled:opacity-40 dark:border-indigo-700 dark:text-indigo-200">
                 {isRegenerating ? "Regenerating..." : "Regenerate S3 Aardvark"}
             </button>
             <button type="button" onClick={refreshLocalAardvarkFromS3} disabled={isBusy || isRestoring || !selectedStorageId} className="rounded border border-emerald-300 px-3 py-1.5 text-xs font-medium text-emerald-700 disabled:opacity-40 dark:border-emerald-700 dark:text-emerald-200">
@@ -2122,12 +2177,19 @@ export const EnrichmentWorkbench: React.FC = () => {
                                     {config.storageProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}
                                 </select>
                                 <select value={selectedModelId} onChange={(e) => setSelectedModelId(e.target.value)} className="rounded border border-gray-300 bg-white px-2 py-1.5 text-sm dark:border-slate-700 dark:bg-slate-950">
-                                    <option value="">OpenAI profile...</option>
-                                    {config.modelProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name} - {profile.defaultModel}</option>)}
+                                    <option value="">OpenAI metadata profile...</option>
+                                    {openAiModelProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name} - {profile.defaultModel}</option>)}
                                 </select>
                                 <select value={selectedVisionId} onChange={(e) => setSelectedVisionId(e.target.value)} className="rounded border border-gray-300 bg-white px-2 py-1.5 text-sm dark:border-slate-700 dark:bg-slate-950">
                                     <option value="">OCR: OpenAI image extraction</option>
                                     {config.visionProfiles.map((profile) => <option key={profile.id} value={profile.id}>OCR: {profile.name} - {profile.featureType || "DOCUMENT_TEXT_DETECTION"}</option>)}
+                                </select>
+                                <select value={selectedTextExtractionModelId} onChange={(e) => setSelectedTextExtractionModelId(e.target.value)} disabled={!selectedVisionId} className="rounded border border-gray-300 bg-white px-2 py-1.5 text-sm disabled:opacity-50 dark:border-slate-700 dark:bg-slate-950">
+                                    <option value="">Label reconciliation: off</option>
+                                    {textReconciliationModelProfiles.map((profile) => {
+                                        const provider = (profile.provider || "openai") === "gemini" ? "Gemini" : "OpenAI";
+                                        return <option key={profile.id} value={profile.id}>{provider} labels: {profile.name} - {profile.defaultModel}</option>;
+                                    })}
                                 </select>
                                 <label
                                     className="flex min-h-40 cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed border-indigo-200 bg-indigo-50/50 px-4 py-6 text-center text-slate-700 hover:bg-indigo-50 dark:border-indigo-900 dark:bg-indigo-950/20 dark:text-slate-200 dark:hover:bg-indigo-950/40"
@@ -2402,19 +2464,41 @@ export const EnrichmentWorkbench: React.FC = () => {
 
                     <section className="rounded-lg border border-gray-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
                         <div className="mb-3 flex items-center justify-between">
-                            <h2 className="text-sm font-semibold">OpenAI Profiles</h2>
-                            <button type="button" className="rounded bg-slate-100 px-2 py-1 text-xs dark:bg-slate-800" onClick={() => setModelDraft(blankModelProfile())}>New</button>
+                            <h2 className="text-sm font-semibold">AI Model Profiles</h2>
+                            <div className="flex gap-1">
+                                <button type="button" className="rounded bg-slate-100 px-2 py-1 text-xs dark:bg-slate-800" onClick={() => setModelDraft(blankModelProfile())}>New OpenAI</button>
+                                <button type="button" className="rounded bg-slate-100 px-2 py-1 text-xs dark:bg-slate-800" onClick={() => setModelDraft(blankOpenAIReconciliationProfile())}>New Mini</button>
+                                <button type="button" className="rounded bg-slate-100 px-2 py-1 text-xs dark:bg-slate-800" onClick={() => setModelDraft(blankGeminiModelProfile())}>New Gemini</button>
+                            </div>
                         </div>
                         <select className="mb-3 w-full rounded border border-gray-300 bg-white px-2 py-1 text-sm dark:border-slate-700 dark:bg-slate-950" value={selectedModelId} onChange={(e) => setSelectedModelId(e.target.value)}>
                             <option value="">Choose profile...</option>
-                            {config.modelProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name} - {profile.defaultModel}</option>)}
+                            {config.modelProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.provider || "openai"}: {profile.name} - {profile.defaultModel}</option>)}
                         </select>
                         <div className="grid grid-cols-1 gap-2 text-xs">
                             <input className="rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950" value={modelDraft.name} onChange={(e) => setModelDraft({ ...modelDraft, name: e.target.value })} placeholder="Profile name" />
+                            <select
+                                className="rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950"
+                                value={modelDraft.provider || "openai"}
+                                onChange={(e) => {
+                                    const provider = e.target.value as ProxyModelProfile["provider"];
+                                    setModelDraft({
+                                        ...modelDraft,
+                                        provider,
+                                        apiKeyEnv: provider === "gemini" ? "GEMINI_API_KEY" : "OPENAI_API_KEY",
+                                        defaultModel: provider === "gemini"
+                                            ? "gemini-3.5-flash"
+                                            : modelDraft.provider === "openai" ? modelDraft.defaultModel || "gpt-5.5" : "gpt-5.5",
+                                    });
+                                }}
+                            >
+                                <option value="openai">OpenAI</option>
+                                <option value="gemini">Gemini</option>
+                            </select>
                             <p className="rounded-md bg-amber-50 px-2 py-1.5 text-[11px] text-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
-                                Env var name only. Put the OpenAI API key value in web/.env or the shell, then reference it here.
+                                Env var name only. Put the API key value in web/.env or the shell, then reference it here.
                             </p>
-                            <input className="rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950" value={modelDraft.apiKeyEnv} onChange={(e) => setModelDraft({ ...modelDraft, apiKeyEnv: e.target.value })} placeholder="OPENAI_API_KEY" aria-label="OpenAI API key environment variable name" />
+                            <input className="rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950" value={modelDraft.apiKeyEnv} onChange={(e) => setModelDraft({ ...modelDraft, apiKeyEnv: e.target.value })} placeholder={modelDraft.provider === "gemini" ? "GEMINI_API_KEY" : "OPENAI_API_KEY"} aria-label="AI model API key environment variable name" />
                             <input className="rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950" value={modelDraft.defaultModel} onChange={(e) => setModelDraft({ ...modelDraft, defaultModel: e.target.value })} placeholder="Default model" />
                             <textarea className="h-28 rounded border px-2 py-1 font-mono text-xs dark:border-slate-700 dark:bg-slate-950" value={pretty(modelDraft.modelParams ?? {})} onChange={(e) => setModelDraft({ ...modelDraft, modelParams: parseJsonField(e.target.value, {}) })} />
                         </div>

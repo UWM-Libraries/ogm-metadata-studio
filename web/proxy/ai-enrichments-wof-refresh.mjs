@@ -1,6 +1,7 @@
 import { buildWofConcordanceLayer } from "./wof-concordance.mjs";
 import { buildOsmConcordanceLayer } from "./osm-concordance.mjs";
 import { buildGeoNamesConcordanceLayer } from "./geonames-concordance.mjs";
+import { buildCanonicalConcordanceLayer } from "./canonical-concordance.mjs";
 
 const LOCAL_GAZETTEER_SUPPLEMENTAL_REASON_PREFIXES = [
   "Local WOF concordance selected",
@@ -146,7 +147,7 @@ function sourceTextNodesForPlacenames({ placenames, textSegments }) {
   return Array.from(nodes.values());
 }
 
-function buildGazetteerEvidenceGraph({ placenames, textSegments, wofConcordance, osmConcordance, geonamesConcordance, generatedAt }) {
+function buildGazetteerEvidenceGraph({ placenames, textSegments, wofConcordance, osmConcordance, geonamesConcordance, canonicalConcordance, generatedAt }) {
   const textNodes = sourceTextNodesForPlacenames({ placenames, textSegments });
   const textNodeIds = new Set(textNodes.map((node) => node.id));
   const placenameNodes = [];
@@ -170,6 +171,7 @@ function buildGazetteerEvidenceGraph({ placenames, textSegments, wofConcordance,
       sourceTextIndices: place.sourceTextIndices,
       authority: place.authority,
       authorityId: place.authorityId,
+      ogmPlaceId: place.ogmPlaceId,
     }));
     for (const id of place.sourceTextIds || []) {
       const textNodeId = sourceTextKeyFromId(id);
@@ -210,6 +212,9 @@ function buildGazetteerEvidenceGraph({ placenames, textSegments, wofConcordance,
         wikidata: match.wikidata,
         gnisFeatureId: match.gnisFeatureId,
         population: match.population,
+        ogmPlaceId: match.ogmPlaceId,
+        sourceCount: match.sourceCount,
+        sources: match.sources,
       }));
       edges.push({
         from: placeNodeId,
@@ -232,6 +237,7 @@ function buildGazetteerEvidenceGraph({ placenames, textSegments, wofConcordance,
       wof: wofConcordance,
       osm: osmConcordance,
       geonames: geonamesConcordance,
+      canonical: canonicalConcordance,
     },
     nodes: {
       textEvidence: textNodes,
@@ -264,6 +270,7 @@ export function refreshWofConcordanceInAiEnrichments(aiEnrichments, {
     extraction,
     resource: effectiveResource,
     mapExtent: aiEnrichments.mapExtent || {},
+    includeSupplemental: false,
   });
   const osmConcordance = buildOsmConcordanceLayer({
     placenames: wofConcordance.placenames,
@@ -273,6 +280,7 @@ export function refreshWofConcordanceInAiEnrichments(aiEnrichments, {
     resource: effectiveResource,
     mapExtent: aiEnrichments.mapExtent || {},
     boundary: wofConcordance.extension?.boundary,
+    includeSupplemental: false,
   });
   const geonamesConcordance = buildGeoNamesConcordanceLayer({
     placenames: osmConcordance.placenames,
@@ -282,14 +290,25 @@ export function refreshWofConcordanceInAiEnrichments(aiEnrichments, {
     resource: effectiveResource,
     mapExtent: aiEnrichments.mapExtent || {},
     boundary: wofConcordance.extension?.boundary,
+    includeSupplemental: false,
   });
-  const placenames = geonamesConcordance.placenames;
+  const canonicalConcordance = buildCanonicalConcordanceLayer({
+    placenames: geonamesConcordance.placenames,
+    textGroups,
+    textSegments,
+    extraction,
+    resource: effectiveResource,
+    mapExtent: aiEnrichments.mapExtent || {},
+    boundary: wofConcordance.extension?.boundary,
+  });
+  const placenames = canonicalConcordance.placenames;
   const gazetteerEvidenceGraph = buildGazetteerEvidenceGraph({
     placenames,
     textSegments,
     wofConcordance: wofConcordance.extension,
     osmConcordance: osmConcordance.extension,
     geonamesConcordance: geonamesConcordance.extension,
+    canonicalConcordance: canonicalConcordance.extension,
     generatedAt: now,
   });
 
@@ -309,12 +328,14 @@ export function refreshWofConcordanceInAiEnrichments(aiEnrichments, {
         wofConcordance: wofConcordance.extension,
         osmConcordance: osmConcordance.extension,
         geonamesConcordance: geonamesConcordance.extension,
+        canonicalGazetteer: canonicalConcordance.extension,
         gazetteerEvidenceGraph,
       }),
     }),
     wofConcordance: wofConcordance.extension,
     osmConcordance: osmConcordance.extension,
     geonamesConcordance: geonamesConcordance.extension,
+    canonicalConcordance: canonicalConcordance.extension,
     basePlacenameCount: basePlacenames.length,
     removedSupplementalPlacenameCount: currentPlacenames.length - basePlacenames.length,
   };

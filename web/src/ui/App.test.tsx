@@ -36,6 +36,24 @@ vi.mock('../duckdb/duckdbClient', () => ({
     countResources: vi.fn()
 }));
 
+vi.mock('../auth/useAuth', () => ({
+    useAuth: () => ({
+        user: null,
+        isSignedIn: true,
+        isLoading: false,
+        isGoogleReady: false,
+        error: null,
+        signIn: vi.fn(),
+        signOut: vi.fn(),
+    }),
+}));
+
+vi.mock('./shared/ToastContext', () => ({
+    useToast: () => ({
+        addToast: vi.fn(),
+    }),
+}));
+
 vi.mock('react-syntax-highlighter', () => ({
     Prism: ({ children }: any) => <div>{children}</div>
 }));

@@ -11,7 +11,7 @@ import { normalizeTextExtractionAnnotations, type TextExtractionAnnotation } fro
 function localAiEnrichmentsOverrideEndpoint(resourceId: string | undefined): string | undefined {
     if (!resourceId || typeof window === "undefined") return undefined;
     if ((import.meta as { env?: { MODE?: string } }).env?.MODE === "test") return undefined;
-    if (!["localhost", "127.0.0.1", "::1"].includes(window.location.hostname)) return undefined;
+    if (!isLocalhostWindow()) return undefined;
     const basePath = (import.meta as { env?: { BASE_URL?: string } }).env?.BASE_URL || "/";
     const base = basePath.endsWith("/") ? basePath : `${basePath}/`;
     const endpoint = new URL(`${base}dev-artifacts/${encodeURIComponent(resourceId)}/ai-enrichments.json`, window.location.origin);
@@ -19,6 +19,19 @@ function localAiEnrichmentsOverrideEndpoint(resourceId: string | undefined): str
     const viewerCacheKey = window.location.search.replace(/^\?/, "");
     if (viewerCacheKey) endpoint.searchParams.set("viewerCacheKey", viewerCacheKey);
     return endpoint.toString();
+}
+
+function isLocalhostWindow(): boolean {
+    if (typeof window === "undefined") return false;
+    return ["localhost", "127.0.0.1", "::1"].includes(window.location.hostname);
+}
+
+function preferLocalAiEnrichments(): boolean {
+    if (typeof window === "undefined") return false;
+    const params = new URLSearchParams(window.location.search);
+    if (params.has("remoteAi")) return false;
+    if (params.has("localAi")) return true;
+    return isLocalhostWindow();
 }
 
 interface ResourceViewerProps {
@@ -41,11 +54,15 @@ export const ResourceViewer: React.FC<ResourceViewerProps> = ({ resource, distri
     const localExtractionOverrideEndpoint = configuredExtractionEndpoint || extractionFallbackEndpoint
         ? localAiEnrichmentsOverrideEndpoint(resource.id)
         : undefined;
-    const extractionEndpoints = useMemo(() => (
-        [localExtractionOverrideEndpoint, configuredExtractionEndpoint, extractionFallbackEndpoint]
+    const preferLocalExtractionOverride = preferLocalAiEnrichments();
+    const extractionEndpoints = useMemo(() => {
+        const endpoints = preferLocalExtractionOverride
+            ? [localExtractionOverrideEndpoint, configuredExtractionEndpoint, extractionFallbackEndpoint]
+            : [configuredExtractionEndpoint, extractionFallbackEndpoint, localExtractionOverrideEndpoint];
+        return endpoints
             .filter((endpoint): endpoint is string => Boolean(endpoint))
-            .filter((endpoint, index, endpoints) => endpoints.indexOf(endpoint) === index)
-    ), [configuredExtractionEndpoint, extractionFallbackEndpoint, localExtractionOverrideEndpoint]);
+            .filter((endpoint, index, candidates) => candidates.indexOf(endpoint) === index);
+    }, [configuredExtractionEndpoint, extractionFallbackEndpoint, localExtractionOverrideEndpoint, preferLocalExtractionOverride]);
     const extractionEndpointSignature = extractionEndpoints.length > 0
         ? extractionEndpoints.join("\n")
         : undefined;
@@ -87,7 +104,7 @@ export const ResourceViewer: React.FC<ResourceViewerProps> = ({ resource, distri
         let isCurrent = true;
 
         const fetchAnnotations = async (endpoint: string): Promise<TextExtractionAnnotation[]> => {
-            const response = await fetch(endpoint, { signal: controller.signal });
+            const response = await fetch(endpoint, { signal: controller.signal, cache: "no-store" });
             if (!response.ok) throw new Error(`Extraction JSON returned ${response.status}`);
             return normalizeTextExtractionAnnotations(await response.json());
         };

@@ -7,6 +7,7 @@ import {
   clearWofConcordanceCache,
   normalizeWofText,
 } from "./wof-concordance.mjs";
+import { isGeneratedWofSupplementalPlacename } from "./ai-enrichments-wof-refresh.mjs";
 
 let tempDir;
 
@@ -21,6 +22,16 @@ function writeIndex(records) {
   process.env.ENRICHMENT_PROXY_WOF_CONCORDANCE = "1";
   process.env.ENRICHMENT_PROXY_WOF_INDEX_LABEL = "test-wof";
   clearWofConcordanceCache();
+}
+
+function text(content, legacyIndex = 1, confidence = 0.96) {
+  return {
+    id: `text-${String(legacyIndex).padStart(4, "0")}`,
+    content,
+    role: "label",
+    confidence,
+    legacyIndex,
+  };
 }
 
 describe("WOF concordance layer", () => {
@@ -80,7 +91,7 @@ describe("WOF concordance layer", () => {
         sourceCallId: "call-google-vision-ocr",
       }],
       textGroups: [{ content: "Seattle", role: "label", confidence: 0.9 }],
-      textSegments: [],
+      textSegments: [text("Kinnear Park")],
       resource: { dct_spatial_sm: ["Seattle", "King County", "Washington"] },
       mapExtent: { west: -123, south: 47, east: -122, north: 48, confidence: 0.7 },
     });
@@ -93,6 +104,45 @@ describe("WOF concordance layer", () => {
     expect(result.extension.matched).toBe(1);
   });
 
+  it("does not match a placename that is not backed by extracted map text", () => {
+    writeIndex([
+      {
+        wofId: "9001",
+        name: "Future Park",
+        normalizedNames: [{ value: "Future Park", normalized: "future park", source: "wof:name" }],
+        placetype: "venue",
+        country: "US",
+        region: "WA",
+        hierarchyLabels: ["Seattle", "King County", "Washington"],
+        isCurrent: true,
+      },
+    ]);
+
+    const result = buildWofConcordanceLayer({
+      placenames: [{
+        id: "place-0001",
+        name: "Future Park",
+        normalizedName: "Future Park",
+        type: "park",
+        confidence: 0.95,
+        status: "candidate",
+        gazetteerMatches: [{ provider: "whosonfirst", authorityId: "9001", name: "Future Park", status: "matched" }],
+        geocoding: {
+          matchType: "exact_contextual",
+          candidates: [{ wofId: "9001", name: "Future Park", uri: "https://spelunker.whosonfirst.org/id/9001/" }],
+        },
+      }],
+      textGroups: [],
+      textSegments: [text("Seattle")],
+      resource: { dct_spatial_sm: ["Seattle", "King County", "Washington"] },
+    });
+
+    expect(result.placenames[0].authorityId).toBeUndefined();
+    expect(result.placenames[0].gazetteerMatches).toBeUndefined();
+    expect(result.placenames[0].geocoding).toBeUndefined();
+    expect(result.extension.textUnsupportedPlacenames).toBe(1);
+  });
+
   it("keeps close same-name candidates ambiguous when context cannot separate them", () => {
     writeIndex([
       { wofId: "3001", name: "Union", normalizedNames: [{ value: "Union", normalized: "union", source: "wof:name" }], placetype: "locality", country: "US", region: "WA" },
@@ -102,7 +152,7 @@ describe("WOF concordance layer", () => {
     const result = buildWofConcordanceLayer({
       placenames: [{ id: "place-0001", name: "Union", normalizedName: "Union", type: "city", confidence: 0.9, status: "candidate" }],
       textGroups: [],
-      textSegments: [],
+      textSegments: [text("Union")],
       resource: {},
     });
 
@@ -115,6 +165,143 @@ describe("WOF concordance layer", () => {
       status: "ambiguous",
     });
     expect(result.extension.ambiguous).toBe(1);
+  });
+
+  it("does not promote fuzzy WOF matches that replace distinctive map text", () => {
+    writeIndex([
+      {
+        wofId: "756789037",
+        name: "Overlake Golf & Country Club",
+        normalizedNames: [{ value: "Overlake Golf & Country Club", normalized: "overlake golf and country club", source: "wof:name" }],
+        placetype: "venue",
+        country: "US",
+        region: "WA",
+        hierarchyLabels: ["Seattle", "King County", "Washington"],
+        isCurrent: true,
+      },
+    ]);
+
+    const result = buildWofConcordanceLayer({
+      placenames: [{
+        id: "place-0001",
+        name: "Olympic Golf And Country Club",
+        normalizedName: "Olympic Golf And Country Club",
+        type: "landmark",
+        confidence: 0.98,
+        status: "candidate",
+        sourceTextIds: ["text-0367"],
+        sourceTextIndices: [367],
+      }],
+      textGroups: [],
+      textSegments: [text("Olympic Golf and Country Club", 367, 0.99)],
+      resource: { dct_spatial_sm: ["Seattle", "King County", "Washington"] },
+    });
+
+    expect(result.placenames[0].name).toBe("Olympic Golf And Country Club");
+    expect(result.placenames[0].authority).toBeUndefined();
+    expect(result.placenames[0].authorityId).toBeUndefined();
+    expect(result.placenames[0].geocoding.matchType).toBe("ambiguous");
+    expect(result.placenames[0].gazetteerMatches?.[0]).toMatchObject({
+      provider: "whosonfirst",
+      authorityId: "756789037",
+      status: "ambiguous",
+    });
+    expect(result.extension.matched).toBe(0);
+    expect(result.extension.ambiguous).toBe(1);
+  });
+
+  it("does not retrieve WOF records through non-English aliases by default", () => {
+    writeIndex([
+      {
+        wofId: "85866051",
+        name: "Eastlake",
+        normalizedNames: [
+          { value: "Eastlake", normalized: "eastlake", source: "wof:name" },
+          { value: "Sand Point", normalized: "sand point", source: "name:swe_x_preferred" },
+        ],
+        placetype: "neighbourhood",
+        country: "US",
+        region: "WA",
+        bbox: [-122.33, 47.63, -122.32, 47.65],
+        centroid: { lon: -122.326, lat: 47.641 },
+        hierarchyLabels: ["Seattle", "King County", "Washington"],
+        isCurrent: true,
+      },
+      {
+        wofId: "890536743",
+        name: "Sand Point",
+        normalizedNames: [{ value: "Sand Point", normalized: "sand point", source: "wof:name" }],
+        placetype: "neighbourhood",
+        country: "US",
+        region: "WA",
+        bbox: [-122.28, 47.67, -122.25, 47.70],
+        centroid: { lon: -122.263, lat: 47.686 },
+        hierarchyLabels: ["Seattle", "King County", "Washington"],
+        isCurrent: true,
+      },
+    ]);
+
+    const result = buildWofConcordanceLayer({
+      placenames: [{
+        id: "place-0001",
+        name: "Sand Point",
+        normalizedName: "Sand Point",
+        type: "neighborhood",
+        confidence: 0.92,
+        status: "candidate",
+      }],
+      textGroups: [],
+      textSegments: [text("Sand Point")],
+      resource: { dct_spatial_sm: ["Seattle", "King County", "Washington"] },
+      mapExtent: { west: -122.45, south: 47.48, east: -122.22, north: 47.75, confidence: 0.8 },
+    });
+
+    expect(result.placenames[0].authorityId).toBe("890536743");
+    expect(result.placenames[0].geocoding.candidates.map((candidate) => candidate.wofId)).not.toContain("85866051");
+  });
+
+  it("uses the inferred map extent to scope WOF candidates before fuzzy lookup", () => {
+    writeIndex([
+      {
+        wofId: "3001",
+        name: "Union",
+        normalizedNames: [{ value: "Union", normalized: "union", source: "wof:name" }],
+        placetype: "locality",
+        country: "US",
+        region: "WA",
+        bbox: [-122.33, 47.55, -122.31, 47.57],
+        centroid: { lon: -122.32, lat: 47.56 },
+        isCurrent: true,
+      },
+      {
+        wofId: "3002",
+        name: "Union",
+        normalizedNames: [{ value: "Union", normalized: "union", source: "wof:name" }],
+        placetype: "locality",
+        country: "US",
+        region: "OR",
+        bbox: [-123.03, 45.20, -123.01, 45.22],
+        centroid: { lon: -123.02, lat: 45.21 },
+        isCurrent: true,
+      },
+    ]);
+
+    const result = buildWofConcordanceLayer({
+      placenames: [{ id: "place-0001", name: "Union", normalizedName: "Union", type: "city", confidence: 0.9, status: "candidate" }],
+      textGroups: [],
+      textSegments: [text("Union")],
+      resource: {},
+      mapExtent: { west: -122.45, south: 47.48, east: -122.22, north: 47.75, confidence: 0.8 },
+    });
+
+    expect(result.placenames[0].authorityId).toBe("3001");
+    expect(result.placenames[0].geocoding.candidates.map((candidate) => candidate.wofId)).toEqual(["3001"]);
+    expect(result.extension.initialSpatialFilter).toMatchObject({
+      source: "map_extent",
+      scopedRecordCount: 1,
+      totalRecordCount: 2,
+      applied: true,
+    });
   });
 
   it("prefers administrative WOF records for county-qualified metadata labels", () => {
@@ -162,7 +349,7 @@ describe("WOF concordance layer", () => {
         }],
       }],
       textGroups: [],
-      textSegments: [],
+      textSegments: [text("King County")],
       resource: { dct_spatial_sm: ["Seattle (Wash.)", "King County (Wash.)", "Washington"] },
     });
 
@@ -254,6 +441,7 @@ describe("WOF concordance layer", () => {
       placenames: [{ id: "place-0001", name: "Seattle (Wash.)", normalizedName: "Seattle (Wash.)", type: "other", confidence: 0.9, status: "candidate" }],
       textGroups: [],
       textSegments: [
+        text("Seattle", 0),
         { id: "text-0001", content: "OLYMPIC", role: "other", confidence: 0.98, legacyIndex: 1 },
         { id: "text-0002", content: "GOLF AND", role: "other", confidence: 0.97, legacyIndex: 2 },
         { id: "text-0003", content: "COUNTRY", role: "other", confidence: 0.96, legacyIndex: 3 },
@@ -264,11 +452,52 @@ describe("WOF concordance layer", () => {
 
     const olympic = result.placenames.find((place) => place.authorityId === "5001");
     expect(result.extension.boundary).toMatchObject({ wofId: "101730401", placetype: "locality" });
-    expect(result.extension.boundarySupplementalPlacenames).toBe(1);
+    expect(result.extension.supplementalPlacenames).toBe(1);
     expect(olympic?.name).toBe("Olympic Golf and Country Club");
     expect(olympic?.geocoding.matchType).toBe("exact_contextual");
     expect(olympic?.sourceTextIds).toEqual(["text-0001", "text-0002", "text-0003", "text-0004"]);
     expect(result.placenames.some((place) => place.authorityId === "5002")).toBe(false);
+  });
+
+  it("prefers the broader locality as the supplemental matching boundary", () => {
+    writeIndex([
+      {
+        wofId: "101730401",
+        name: "Seattle",
+        normalizedNames: [{ value: "Seattle", normalized: "seattle", source: "wof:name" }],
+        placetype: "locality",
+        country: "US",
+        region: "WA",
+        bbox: [-122.44, 47.49, -122.23, 47.74],
+        centroid: { lon: -122.33, lat: 47.62 },
+        hierarchyLabels: ["King County", "Washington"],
+        isCurrent: true,
+      },
+      {
+        wofId: "1209652205",
+        name: "North Park",
+        normalizedNames: [{ value: "North Park", normalized: "north park", source: "wof:name" }],
+        placetype: "locality",
+        country: "US",
+        region: "WA",
+        bbox: [-122.34985, 47.70649, -122.34985, 47.70649],
+        centroid: { lon: -122.34985, lat: 47.70649 },
+        hierarchyLabels: ["Seattle", "King County", "Washington"],
+        isCurrent: true,
+      },
+    ]);
+
+    const result = buildWofConcordanceLayer({
+      placenames: [
+        { id: "place-0001", name: "Seattle", normalizedName: "Seattle", type: "city", confidence: 0.9, status: "candidate" },
+        { id: "place-0002", name: "North Park", normalizedName: "North Park", type: "neighborhood", confidence: 0.95, status: "candidate" },
+      ],
+      textGroups: [],
+      textSegments: [text("Seattle", 1), text("North Park", 2)],
+      resource: { dct_spatial_sm: ["Seattle (Wash.)", "King County (Wash.)", "Washington"] },
+    });
+
+    expect(result.extension.boundary).toMatchObject({ wofId: "101730401", name: "Seattle" });
   });
 
   it("does not create a boundary supplemental box from distant loose OCR tokens", () => {
@@ -303,6 +532,7 @@ describe("WOF concordance layer", () => {
       placenames: [{ id: "place-0001", name: "Seattle (Wash.)", normalizedName: "Seattle (Wash.)", type: "other", confidence: 0.9, status: "candidate" }],
       textGroups: [],
       textSegments: [
+        text("Seattle", 0),
         { id: "text-0001", content: "NORTH", role: "other", confidence: 0.98, legacyIndex: 1, approxBbox: [0.1, 0.1, 0.12, 0.11] },
         { id: "text-0100", content: "Park", role: "other", confidence: 0.99, legacyIndex: 100, approxBbox: [0.8, 0.8, 0.82, 0.81] },
       ],
@@ -417,24 +647,24 @@ describe("WOF concordance layer", () => {
     ]);
     const fixturePath = path.resolve(process.cwd(), "../examples/ai-enrichments/71ab71cc-d474-49a7-b4ca-9428651e7b26/ai-enrichments.json");
     const fixture = JSON.parse(readFileSync(fixturePath, "utf8"));
+    const sourcePlacenames = fixture.derivedPlacenames.filter((place) => !isGeneratedWofSupplementalPlacename(place));
 
     const result = buildWofConcordanceLayer({
-      placenames: fixture.derivedPlacenames,
+      placenames: sourcePlacenames,
       textGroups: fixture.textGroups,
       textSegments: fixture.extractedMapText,
       resource: fixture.derivedMetadata.record,
       mapExtent: fixture.mapExtent,
     });
-
     expect(result.extension).toMatchObject({
       status: "available",
-      matched: 8,
-      ambiguous: 0,
+      matched: 7,
+      ambiguous: 1,
       unmatched: 0,
+      textUnsupportedPlacenames: 1,
     });
-    expect(result.placenames.map((place) => [place.name, place.authorityId, place.geocoding.matchType])).toEqual(expect.arrayContaining([
+    expect(result.placenames.map((place) => [place.name, place.authorityId, place.geocoding?.matchType])).toEqual(expect.arrayContaining([
       ["Seattle (Wash.)", "101730401", "exact_contextual"],
-      ["King County (Wash.)", "102086191", "exact_contextual"],
       ["Puget Sound (Wash.)", "404529221", "exact_contextual"],
       ["Carkeek Park", "756874463", "exact_contextual"],
       ["Volunteer Park", "756667157", "exact_contextual"],
@@ -442,5 +672,6 @@ describe("WOF concordance layer", () => {
       ["Leschi Park", "756861963", "exact_contextual"],
       ["Madrona Park", "756854187", "exact_contextual"],
     ]));
+    expect(result.placenames.find((place) => place.name === "Frink Park")?.geocoding?.matchType).toBe("ambiguous");
   });
 });

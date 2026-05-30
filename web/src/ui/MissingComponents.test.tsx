@@ -13,15 +13,28 @@ vi.mock('maplibre-gl', () => ({
             return {
                 remove: vi.fn(),
                 on: vi.fn((event: string, fn: () => void) => { if (event === 'load') setTimeout(fn, 0); }),
+                off: vi.fn(),
+                once: vi.fn((event: string, fn: () => void) => { if (event === 'load') setTimeout(fn, 0); }),
                 addSource: vi.fn(),
                 addLayer: vi.fn(),
+                removeLayer: vi.fn(),
+                removeSource: vi.fn(),
                 fitBounds: vi.fn(),
+                jumpTo: vi.fn(),
                 addControl: vi.fn(),
+                getLayer: vi.fn(() => null),
+                getSource: vi.fn(() => null),
                 getBounds: () => ({ getWest: () => 0, getSouth: () => 0, getEast: () => 10, getNorth: () => 10 }),
+                getZoom: () => 3,
                 isStyleLoaded: () => true,
-                once: () => {},
             };
         },
+    },
+}));
+
+vi.mock('../services/DatabaseService', () => ({
+    databaseService: {
+        getMapH3: vi.fn().mockResolvedValue({ hexes: [], globalCount: 0 }),
     },
 }));
 
@@ -159,7 +172,7 @@ describe('Missing Components Coverage', () => {
                 branch: '', setBranch: vi.fn(),
                 token: '', setToken: vi.fn(),
                 isScanning: false, scanError: null,
-                foundFiles: [{ path: 'test.json', url: 'http://foo' }],
+                foundFiles: [{ path: 'test.json', sha: 'abc123' }],
                 schemaMode: 'aardvark',
                 scan: vi.fn(),
                 parseRepoUrl: () => ({ owner: 'o', repo: 'r' })

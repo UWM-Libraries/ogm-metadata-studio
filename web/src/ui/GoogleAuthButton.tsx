@@ -1,29 +1,39 @@
-import React from "react";
+import React, { useEffect, useRef } from "react";
 import { useAuth } from "../auth/useAuth";
 
 export const GoogleAuthButton: React.FC = () => {
-  const { user, isSignedIn, isLoading, error, signIn, signOut } = useAuth();
+  const { user, isSignedIn, isLoading, isGoogleReady, error, signIn, signOut } = useAuth();
+  const buttonRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const parent = buttonRef.current;
+    if (!parent || isLoading || isSignedIn || !isGoogleReady || !window.google?.accounts?.id) {
+      return;
+    }
+
+    parent.innerHTML = "";
+    try {
+      window.google.accounts.id.renderButton(parent, {
+        theme: "outline",
+        size: "medium",
+        type: "standard",
+        text: "signin_with",
+        shape: "rectangular",
+        logo_alignment: "left",
+        width: 190,
+      });
+    } catch (err) {
+      console.error("[Auth] Failed to render Google Sign-In button:", err);
+    }
+
+    return () => {
+      parent.innerHTML = "";
+    };
+  }, [isGoogleReady, isLoading, isSignedIn]);
 
   if (isLoading) {
     return (
       <span className="text-xs text-slate-500 dark:text-slate-400 px-2 py-1 whitespace-nowrap">Loading…</span>
-    );
-  }
-
-  if (error) {
-    return (
-      <div className="flex items-center gap-2 flex-wrap justify-end">
-        <span className="text-xs text-amber-600 dark:text-amber-400 max-w-[200px] truncate" title={error}>
-          {error}
-        </span>
-        <button
-          type="button"
-          onClick={signIn}
-          className="rounded-md border border-indigo-300 dark:border-indigo-500 bg-indigo-50 dark:bg-indigo-900/30 px-3 py-1.5 text-xs font-medium text-indigo-700 dark:text-indigo-200 hover:bg-indigo-100 dark:hover:bg-indigo-900/50"
-        >
-          Sign in
-        </button>
-      </div>
     );
   }
 
@@ -54,14 +64,34 @@ export const GoogleAuthButton: React.FC = () => {
     );
   }
 
+  if (isGoogleReady) {
+    return (
+      <div className="flex items-center gap-2 flex-wrap justify-end">
+        {error && (
+          <span className="text-xs text-amber-600 dark:text-amber-400 max-w-[200px] truncate" title={error}>
+            {error}
+          </span>
+        )}
+        <div ref={buttonRef} aria-label="Sign in with Google" />
+      </div>
+    );
+  }
+
   return (
-    <button
-      type="button"
-      onClick={signIn}
-      className="rounded-md border border-indigo-300 dark:border-indigo-500 bg-indigo-50 dark:bg-indigo-900/30 px-3 py-1.5 text-xs font-medium text-indigo-700 dark:text-indigo-200 hover:bg-indigo-100 dark:hover:bg-indigo-900/50 transition-colors whitespace-nowrap"
-      aria-label="Sign in with Google"
-    >
-      Sign in with Google
-    </button>
+    <div className="flex items-center gap-2 flex-wrap justify-end">
+      {error && (
+        <span className="text-xs text-amber-600 dark:text-amber-400 max-w-[200px] truncate" title={error}>
+          {error}
+        </span>
+      )}
+      <button
+        type="button"
+        onClick={signIn}
+        className="rounded-md border border-indigo-300 dark:border-indigo-500 bg-indigo-50 dark:bg-indigo-900/30 px-3 py-1.5 text-xs font-medium text-indigo-700 dark:text-indigo-200 hover:bg-indigo-100 dark:hover:bg-indigo-900/50 transition-colors whitespace-nowrap"
+        aria-label="Sign in with Google"
+      >
+        Sign in with Google
+      </button>
+    </div>
   );
 };

@@ -96,6 +96,21 @@
       "description": "OCR or vision-derived text printed on the map, using normalized image-space bounding boxes.",
       "items": { "$ref": "#/$defs/textSegment" }
     },
+    "textExtractionRuns": {
+      "type": "array",
+      "description": "Provider-neutral extraction runs, such as Google Vision OCR, Gemini label extraction, or local OCR detectors.",
+      "items": { "$ref": "#/$defs/textExtractionRun" }
+    },
+    "atomicText": {
+      "type": "array",
+      "description": "Optional raw word, symbol, or line-level text evidence before label fusion.",
+      "items": { "$ref": "#/$defs/atomicTextEvidence" }
+    },
+    "labelCandidates": {
+      "type": "array",
+      "description": "Optional provider-neutral candidate labels produced before gazetteer matching or human review.",
+      "items": { "$ref": "#/$defs/labelCandidate" }
+    },
     "textGroups": {
       "type": "array",
       "description": "Optional consolidated text labels derived from adjacent OCR text segments, such as grouped street names or multi-word feature labels.",
@@ -457,9 +472,17 @@
       "type": "string",
       "enum": [
         "title",
+        "publication",
         "coordinate",
         "label",
         "street",
+        "route",
+        "waterbody",
+        "park",
+        "landmark",
+        "neighborhood",
+        "railroad",
+        "ferry",
         "scale",
         "legend",
         "publisher",
@@ -468,6 +491,106 @@
         "marginalia",
         "other"
       ]
+    },
+    "normalizedPoint": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": { "type": "number", "minimum": 0, "maximum": 1 }
+    },
+    "normalizedPolygon": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/normalizedPoint" }
+    },
+    "textExtractionRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "provider"],
+      "properties": {
+        "id": { "$ref": "#/$defs/nonEmptyString" },
+        "provider": { "type": "string" },
+        "model": { "type": "string" },
+        "strategy": { "type": "string" },
+        "sourceImageCount": { "type": "integer", "minimum": 0 },
+        "successfulCropCount": { "type": "integer", "minimum": 0 },
+        "failedCropCount": { "type": "integer", "minimum": 0 },
+        "sourceCallId": { "type": "string" },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "atomicTextEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "content"],
+      "properties": {
+        "id": { "$ref": "#/$defs/nonEmptyString" },
+        "content": { "$ref": "#/$defs/nonEmptyString" },
+        "approxBbox": { "$ref": "#/$defs/normalizedBox" },
+        "approxPolygon": { "$ref": "#/$defs/normalizedPolygon" },
+        "baseline": { "$ref": "#/$defs/normalizedPolygon" },
+        "confidence": { "$ref": "#/$defs/confidence" },
+        "sourceCallId": { "type": "string" },
+        "sourceAssetIds": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "orientationDegrees": { "type": "number" },
+        "writingMode": {
+          "type": "string",
+          "enum": ["horizontal", "vertical", "curved", "diagonal", "unknown"]
+        },
+        "raw": { "$ref": "#/$defs/jsonValue" },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "labelCandidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "content"],
+      "properties": {
+        "id": { "$ref": "#/$defs/nonEmptyString" },
+        "content": { "$ref": "#/$defs/nonEmptyString" },
+        "role": { "$ref": "#/$defs/textRole" },
+        "approxBbox": { "$ref": "#/$defs/normalizedBox" },
+        "approxPolygon": { "$ref": "#/$defs/normalizedPolygon" },
+        "confidence": { "$ref": "#/$defs/confidence" },
+        "sourceTextIds": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "sourceTextIndices": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "geometryStatus": {
+          "type": "string",
+          "enum": ["ocr_backed", "model_projected", "model_only", "unknown"]
+        },
+        "candidateStatus": {
+          "type": "string",
+          "enum": ["accepted", "needs_review_geometry", "needs_review_text", "rejected"]
+        },
+        "bboxSupport": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/jsonValue" }
+        },
+        "sourceCallId": { "type": "string" },
+        "orientationDegrees": { "type": "number" },
+        "writingMode": {
+          "type": "string",
+          "enum": ["horizontal", "vertical", "curved", "diagonal", "unknown"]
+        },
+        "geometryKind": {
+          "type": "string",
+          "enum": ["single", "stacked", "curved", "multiRegion"]
+        },
+        "reasoning": { "type": "string" },
+        "raw": { "$ref": "#/$defs/jsonValue" },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
     },
     "textSegment": {
       "type": "object",
@@ -575,6 +698,7 @@
         },
         "approxBbox": { "$ref": "#/$defs/normalizedBox" },
         "confidence": { "$ref": "#/$defs/confidence" },
+        "ogmPlaceId": { "type": "string" },
         "authority": { "type": "string" },
         "authorityId": { "type": "string" },
         "uri": { "$ref": "#/$defs/uriString" },
@@ -610,6 +734,12 @@
             "candidates": {
               "type": "array",
               "items": { "$ref": "#/$defs/jsonValue" }
+            },
+            "canonicalMatchType": { "type": "string" },
+            "canonicalConfidence": { "$ref": "#/$defs/confidence" },
+            "canonicalCandidates": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/jsonValue" }
             }
           }
         },
@@ -629,10 +759,11 @@
       "properties": {
         "provider": {
           "type": "string",
-          "enum": ["whosonfirst", "openstreetmap", "geonames"]
+          "enum": ["whosonfirst", "openstreetmap", "geonames", "ogm"]
         },
         "authority": { "type": "string" },
         "authorityId": { "type": "string" },
+        "ogmPlaceId": { "type": "string" },
         "uri": { "$ref": "#/$defs/uriString" },
         "name": { "type": "string" },
         "matchedName": { "type": "string" },
@@ -647,6 +778,27 @@
         "featureClass": { "type": "string" },
         "featureClassName": { "type": "string" },
         "featureCode": { "type": "string" },
+        "sourceCount": { "type": "number" },
+        "sources": { "$ref": "#/$defs/jsonValue" },
+        "projectedPositionScore": { "$ref": "#/$defs/confidence" },
+        "projectedCoordinates": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["lon", "lat"],
+          "properties": {
+            "lon": {
+              "type": "number",
+              "minimum": -180,
+              "maximum": 180
+            },
+            "lat": {
+              "type": "number",
+              "minimum": -90,
+              "maximum": 90
+            }
+          }
+        },
+        "projectionSource": { "type": "string" },
         "country": { "type": "string" },
         "region": { "type": "string" },
         "population": { "type": "number" },

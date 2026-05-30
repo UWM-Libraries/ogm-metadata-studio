@@ -4,13 +4,10 @@ import { FIXTURE_POINT, FIXTURE_POLYGON, FIXTURE_SCANNED_MAP, FIXTURE_MINIMAL } 
 import * as dbInit from './dbInit';
 
 // Mock the dbInit module
-vi.mock('./dbInit', async (importOriginal) => {
-    const actual = await importOriginal<typeof dbInit>();
-    return {
-        ...actual,
-        getDuckDbContext: vi.fn(),
-    };
-});
+vi.mock('./dbInit', () => ({
+    getDuckDbContext: vi.fn(),
+    waitForDuckDbRestore: vi.fn().mockResolvedValue(undefined),
+}));
 
 describe('DuckDB Client Core', () => {
     let mockQuery: any;
@@ -36,7 +33,7 @@ describe('DuckDB Client Core', () => {
     });
 
     it('initializes the database connection via importJsonData', async () => {
-        await importJsonData([FIXTURE_POINT]);
+        await importJsonData([FIXTURE_POINT], { skipSave: true });
         expect(dbInit.getDuckDbContext).toHaveBeenCalled();
     });
 
@@ -84,17 +81,18 @@ describe('DuckDB Search & Filter', () => {
         vi.resetAllMocks();
 
         mockQuery = vi.fn().mockImplementation((sql: string) => {
-            if (/count\(\*\)/i.test(sql)) {
+            const compactSql = sql.replace(/\s+/g, ' ');
+            if (/count\s*\(\s*\*\s*\)/i.test(sql)) {
                 // facetedSearch uses 'c', searchResources might use 'total' or 'c'.
                 // facetedSearch: SELECT count(*) as c
                 // searchResources: SELECT COUNT(*) as total
-                if (sql.includes('as c')) return { toArray: () => [{ c: 1 }] };
-                return { toArray: () => [{ total: 1 }] };
+                if (/as\s+c/i.test(sql)) return { toArray: () => [{ c: 1 }] };
+                return { toArray: () => [{ total: 1, c: 1 }] };
             }
             if (sql.includes('SELECT id FROM resources')) {
                 return { toArray: () => [{ id: 'fixture-point-1' }] };
             }
-            if (sql.includes('SELECT * FROM resources WHERE id IN')) {
+            if (compactSql.includes('FROM resources WHERE id IN')) {
                 return {
                     toArray: () => [{
                         id: 'fixture-point-1',
