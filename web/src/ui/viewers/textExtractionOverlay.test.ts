@@ -52,6 +52,24 @@ describe("text extraction overlay helpers", () => {
         ]);
     });
 
+    it("skips building-placeholder glyphs that OCR misreads as text", () => {
+        const annotations = normalizeTextExtractionAnnotations({
+            text: [
+                { content: "0 0 0 0 0 0", approx_bbox: [0.1, 0.1, 0.2, 0.12], confidence: 0.74, role: "other" },
+                { content: "000.0", approx_bbox: [0.1, 0.13, 0.2, 0.15], confidence: 0.71, role: "other" },
+                { content: "םם ם 0 ם", approx_bbox: [0.2, 0.1, 0.3, 0.12], confidence: 0.53, role: "other" },
+                { content: "D", approx_bbox: [0.3, 0.1, 0.32, 0.12], confidence: 0.66, role: "other" },
+                { content: "W CROCKETT ST", approx_bbox: [0.1, 0.2, 0.3, 0.23], confidence: 0.98, role: "street" },
+                { content: "S", approx_bbox: [0.4, 0.1, 0.42, 0.12], confidence: 0.9, role: "coordinate" },
+            ],
+        });
+
+        expect(annotations.map((annotation) => annotation.content)).toEqual([
+            "W CROCKETT ST",
+            "S",
+        ]);
+    });
+
     it("uses solidified text groups in place of their raw OCR fragments", () => {
         const annotations = normalizeTextExtractionAnnotations({
             text: [
@@ -88,6 +106,353 @@ describe("text extraction overlay helpers", () => {
             id: "text-4",
             index: 2,
             source: "text",
+        });
+    });
+
+    it("adds semantic label candidates as their own review layer and defaults raw OCR off", () => {
+        const annotations = normalizeTextExtractionAnnotations({
+            extractedMapText: [
+                {
+                    id: "text-0001",
+                    content: "Lake",
+                    approxBbox: [0.2, 0.2, 0.24, 0.23],
+                    confidence: 0.9,
+                    role: "other",
+                },
+                {
+                    id: "text-0002",
+                    content: "Union",
+                    approxBbox: [0.25, 0.2, 0.32, 0.23],
+                    confidence: 0.92,
+                    role: "other",
+                },
+            ],
+            labelCandidates: [
+                {
+                    id: "candidate-lake-union",
+                    content: "Lake Union",
+                    role: "waterbody",
+                    approxBbox: [0.2, 0.2, 0.32, 0.23],
+                    confidence: 0.94,
+                    sourceTextIds: ["text-0001", "text-0002"],
+                    sourceTextIndices: [0, 1],
+                    geometryStatus: "ocr_backed",
+                    candidateStatus: "accepted",
+                },
+            ],
+        });
+
+        expect(annotations).toHaveLength(3);
+        expect(annotations[0]).toMatchObject({
+            id: "candidate-lake-union",
+            content: "Lake Union",
+            role: "waterbody",
+            source: "label_candidate",
+            layer: "candidate",
+            sourceTextIds: ["text-0001", "text-0002"],
+            sourceTextIndices: [0, 1],
+            geometryStatus: "ocr_backed",
+            candidateStatus: "accepted",
+            bbox: { x1: 0.2, y1: 0.2, x2: 0.32, y2: 0.23 },
+            color: "#0ea5e9",
+        });
+        expect(annotations.slice(1).map((annotation) => annotation.layer)).toEqual(["extraction", "extraction"]);
+        expect(defaultAnnotationLayerVisibility(annotations)).toEqual({ showWof: false, showOsm: false, showGeoNames: false, showOgm: false, showCandidates: true, showExtraction: false });
+    });
+
+    it("deduplicates repeated label candidates using OCR-backed bounding boxes", () => {
+        const annotations = normalizeTextExtractionAnnotations({
+            labelCandidates: [
+                {
+                    id: "us-naval-low",
+                    content: "U. S. NAVAL",
+                    role: "landmark",
+                    approxBbox: [0.3, 0.4, 0.48, 0.43],
+                    confidence: 0.95,
+                    sourceTextIndices: [12],
+                    geometryStatus: "ocr_backed",
+                },
+                {
+                    id: "us-naval-best",
+                    content: "U.S. NAVAL",
+                    role: "landmark",
+                    approxBbox: [0.3, 0.4, 0.48, 0.43],
+                    confidence: 0.99,
+                    sourceTextIndices: [12],
+                    geometryStatus: "ocr_backed",
+                },
+                {
+                    id: "us-naval-other-place",
+                    content: "U. S. NAVAL",
+                    role: "landmark",
+                    approxBbox: [0.7, 0.4, 0.88, 0.43],
+                    confidence: 0.9,
+                    sourceTextIndices: [40],
+                    geometryStatus: "ocr_backed",
+                },
+            ],
+        });
+
+        expect(annotations.map((annotation) => annotation.id)).toEqual(["us-naval-best", "us-naval-other-place"]);
+    });
+
+    it("consolidates adjacent semantic label fragments into feature phrases", () => {
+        const annotations = normalizeTextExtractionAnnotations({
+            labelCandidates: [
+                {
+                    id: "naval",
+                    content: "U. S. Naval",
+                    role: "landmark",
+                    approxBbox: [0.1, 0.1, 0.2, 0.13],
+                    confidence: 0.95,
+                    sourceTextIndices: [10],
+                    geometryStatus: "ocr_backed",
+                    candidateStatus: "accepted",
+                },
+                {
+                    id: "air-station",
+                    content: "Air Station",
+                    role: "landmark",
+                    approxBbox: [0.205, 0.1, 0.32, 0.13],
+                    confidence: 0.96,
+                    sourceTextIndices: [11],
+                    geometryStatus: "ocr_backed",
+                    candidateStatus: "accepted",
+                },
+                {
+                    id: "washelli",
+                    content: "Washelli",
+                    role: "landmark",
+                    approxBbox: [0.3, 0.3, 0.42, 0.34],
+                    confidence: 0.98,
+                    sourceTextIndices: [133],
+                    geometryStatus: "ocr_backed",
+                    candidateStatus: "accepted",
+                },
+                {
+                    id: "cemetery",
+                    content: "Cemetery",
+                    role: "landmark",
+                    approxBbox: [0.32, 0.35, 0.45, 0.39],
+                    confidence: 0.98,
+                    sourceTextIndices: [157],
+                    geometryStatus: "ocr_backed",
+                    candidateStatus: "accepted",
+                },
+                {
+                    id: "overlake",
+                    content: "OVERLAKE",
+                    role: "landmark",
+                    approxBbox: [0.68, 0.2, 0.83, 0.24],
+                    confidence: 0.99,
+                    sourceTextIndices: [2117],
+                    geometryStatus: "ocr_backed",
+                    candidateStatus: "accepted",
+                },
+                {
+                    id: "golf-and",
+                    content: "GOLF AND",
+                    role: "landmark",
+                    approxBbox: [0.69, 0.25, 0.84, 0.29],
+                    confidence: 0.99,
+                    sourceTextIndices: [2129],
+                    geometryStatus: "ocr_backed",
+                    candidateStatus: "accepted",
+                },
+                {
+                    id: "country-club",
+                    content: "COUNTRY CLUB",
+                    role: "landmark",
+                    approxBbox: [0.67, 0.3, 0.86, 0.34],
+                    confidence: 0.99,
+                    sourceTextIndices: [2134],
+                    geometryStatus: "ocr_backed",
+                    candidateStatus: "accepted",
+                },
+                {
+                    id: "denny-park",
+                    content: "Denny Park",
+                    role: "park",
+                    approxBbox: [0.7, 0.7, 0.8, 0.74],
+                    confidence: 0.95,
+                    sourceTextIndices: [3000],
+                    geometryStatus: "ocr_backed",
+                    candidateStatus: "accepted",
+                },
+                {
+                    id: "volunteer-park",
+                    content: "Volunteer Park",
+                    role: "park",
+                    approxBbox: [0.7, 0.77, 0.84, 0.81],
+                    confidence: 0.95,
+                    sourceTextIndices: [3001],
+                    geometryStatus: "ocr_backed",
+                    candidateStatus: "accepted",
+                },
+            ],
+        });
+
+        expect(annotations.map((annotation) => annotation.content)).toEqual([
+            "U. S. Naval Air Station",
+            "Washelli Cemetery",
+            "OVERLAKE GOLF AND COUNTRY CLUB",
+            "Denny Park",
+            "Volunteer Park",
+        ]);
+        expect(annotations[2]).toMatchObject({
+            source: "label_candidate",
+            layer: "candidate",
+            role: "landmark",
+            sourceTextIndices: [2117, 2129, 2134],
+            geometryStatus: "ocr_backed",
+            candidateStatus: "accepted",
+            bbox: { x1: 0.67, y1: 0.2, x2: 0.86, y2: 0.34 },
+        });
+    });
+
+    it("consolidates stacked title fragments with connector words", () => {
+        const annotations = normalizeTextExtractionAnnotations({
+            labelCandidates: [
+                {
+                    id: "guide-map",
+                    content: "GUIDE MAP",
+                    role: "title",
+                    approxBbox: [0.32, 0.18, 0.5, 0.22],
+                    confidence: 0.99,
+                    sourceTextIndices: [2130],
+                    geometryStatus: "ocr_backed",
+                    candidateStatus: "accepted",
+                },
+                {
+                    id: "of",
+                    content: "OF",
+                    role: "title",
+                    approxBbox: [0.39, 0.235, 0.43, 0.265],
+                    confidence: 1,
+                    sourceTextIndices: [2165],
+                    geometryStatus: "ocr_backed",
+                    candidateStatus: "accepted",
+                },
+                {
+                    id: "seattle",
+                    content: "SEATTLE",
+                    role: "title",
+                    approxBbox: [0.28, 0.28, 0.56, 0.35],
+                    confidence: 1,
+                    sourceTextIndices: [2179],
+                    geometryStatus: "ocr_backed",
+                    candidateStatus: "accepted",
+                },
+            ],
+        });
+
+        expect(annotations).toHaveLength(1);
+        expect(annotations[0]).toMatchObject({
+            content: "GUIDE MAP OF SEATTLE",
+            role: "title",
+            sourceTextIndices: [2130, 2165, 2179],
+            geometryStatus: "ocr_backed",
+            candidateStatus: "accepted",
+            bbox: { x1: 0.28, y1: 0.18, x2: 0.56, y2: 0.35 },
+        });
+    });
+
+    it("keeps a complete overlapping feature label instead of duplicating its fragments", () => {
+        const annotations = normalizeTextExtractionAnnotations({
+            labelCandidates: [
+                {
+                    id: "calvary-full",
+                    content: "Calvary Cemetery",
+                    role: "landmark",
+                    approxBbox: [0.4, 0.4, 0.62, 0.5],
+                    confidence: 0.97,
+                    sourceTextIndices: [1083],
+                    geometryStatus: "ocr_backed",
+                    candidateStatus: "accepted",
+                },
+                {
+                    id: "calvary-fragment",
+                    content: "Calvary",
+                    role: "landmark",
+                    approxBbox: [0.4, 0.4, 0.54, 0.445],
+                    confidence: 0.98,
+                    sourceTextIndices: [1084],
+                    geometryStatus: "ocr_backed",
+                    candidateStatus: "accepted",
+                },
+                {
+                    id: "cemetery-fragment",
+                    content: "Cemetery",
+                    role: "landmark",
+                    approxBbox: [0.4, 0.455, 0.62, 0.5],
+                    confidence: 0.98,
+                    sourceTextIndices: [1085],
+                    geometryStatus: "ocr_backed",
+                    candidateStatus: "accepted",
+                },
+            ],
+        });
+
+        expect(annotations).toHaveLength(1);
+        expect(annotations[0]).toMatchObject({
+            id: "calvary-full",
+            content: "Calvary Cemetery",
+            sourceTextIndices: [1083],
+            bbox: { x1: 0.4, y1: 0.4, x2: 0.62, y2: 0.5 },
+        });
+    });
+
+    it("drops overlapping suffix fragments before merging title labels", () => {
+        const annotations = normalizeTextExtractionAnnotations({
+            labelCandidates: [
+                {
+                    id: "guide-map",
+                    content: "GUIDE MAP",
+                    role: "title",
+                    approxBbox: [0.32, 0.18, 0.5, 0.22],
+                    confidence: 0.99,
+                    sourceTextIndices: [2130],
+                    geometryStatus: "ocr_backed",
+                    candidateStatus: "accepted",
+                },
+                {
+                    id: "seattle",
+                    content: "SEATTLE",
+                    role: "title",
+                    approxBbox: [0.28, 0.28, 0.56, 0.35],
+                    confidence: 1,
+                    sourceTextIndices: [2179],
+                    geometryStatus: "ocr_backed",
+                    candidateStatus: "accepted",
+                },
+                {
+                    id: "of",
+                    content: "OF",
+                    role: "title",
+                    approxBbox: [0.39, 0.235, 0.43, 0.265],
+                    confidence: 1,
+                    sourceTextIndices: [2165],
+                    geometryStatus: "ocr_backed",
+                    candidateStatus: "accepted",
+                },
+                {
+                    id: "tle-fragment",
+                    content: "TLE",
+                    role: "title",
+                    approxBbox: [0.46, 0.28, 0.56, 0.35],
+                    confidence: 0.96,
+                    sourceTextIndices: [2180],
+                    geometryStatus: "ocr_backed",
+                    candidateStatus: "accepted",
+                },
+            ],
+        });
+
+        expect(annotations).toHaveLength(1);
+        expect(annotations[0]).toMatchObject({
+            content: "GUIDE MAP OF SEATTLE",
+            sourceTextIndices: [2130, 2165, 2179],
+            bbox: { x1: 0.28, y1: 0.18, x2: 0.56, y2: 0.35 },
         });
     });
 
@@ -141,7 +506,7 @@ describe("text extraction overlay helpers", () => {
             bbox: { x1: 0.2, y1: 0.2, x2: 0.36, y2: 0.24 },
         });
         expect(annotations.slice(1).map((annotation) => annotation.layer)).toEqual(["extraction", "extraction"]);
-        expect(defaultAnnotationLayerVisibility(annotations)).toEqual({ showWof: true, showOsm: false, showGeoNames: false, showExtraction: false });
+        expect(defaultAnnotationLayerVisibility(annotations)).toEqual({ showWof: true, showOsm: false, showGeoNames: false, showOgm: false, showCandidates: false, showExtraction: false });
     });
 
     it("keeps WOF authority matches in the listing even when they do not have extraction boxes", () => {
@@ -193,7 +558,7 @@ describe("text extraction overlay helpers", () => {
             content: "Volunteer Park",
             bbox: { x1: 0.2, y1: 0.2, x2: 0.3, y2: 0.24 },
         });
-        expect(defaultAnnotationLayerVisibility(annotations)).toEqual({ showWof: true, showOsm: false, showGeoNames: false, showExtraction: false });
+        expect(defaultAnnotationLayerVisibility(annotations)).toEqual({ showWof: true, showOsm: false, showGeoNames: false, showOgm: false, showCandidates: false, showExtraction: false });
     });
 
     it("adds secondary OSM overlap annotations for WOF authority matches", () => {
@@ -251,7 +616,7 @@ describe("text extraction overlay helpers", () => {
             placetype: "park",
             bbox: { x1: 0.2, y1: 0.2, x2: 0.32, y2: 0.24 },
         });
-        expect(defaultAnnotationLayerVisibility(annotations)).toEqual({ showWof: true, showOsm: true, showGeoNames: false, showExtraction: false });
+        expect(defaultAnnotationLayerVisibility(annotations)).toEqual({ showWof: true, showOsm: true, showGeoNames: false, showOgm: false, showCandidates: false, showExtraction: false });
     });
 
     it("uses the matched gazetteer variant label when it is more specific than the authority name", () => {
@@ -278,6 +643,45 @@ describe("text extraction overlay helpers", () => {
             content: "King County",
             authorityId: "102086191",
             placetype: "county",
+        });
+    });
+
+    it("preserves map-backed placename text when gazetteer labels differ", () => {
+        const annotations = normalizeTextExtractionAnnotations({
+            extractedMapText: [
+                {
+                    id: "text-0848",
+                    content: "Calvary Cemetery",
+                    approxBbox: [0.66, 0.23, 0.685, 0.238],
+                    legacyIndex: 848,
+                    confidence: 0.99,
+                    role: "label",
+                },
+            ],
+            derivedPlacenames: [
+                {
+                    id: "place-0008",
+                    name: "Calvary Cemetery",
+                    sourceTextIds: ["text-0848"],
+                    sourceTextIndices: [848],
+                    confidence: 0.96,
+                    gazetteerMatches: [{
+                        provider: "whosonfirst",
+                        authorityId: "756842327",
+                        name: "Tahoma National Cemetery",
+                        status: "ambiguous",
+                        matchType: "ambiguous",
+                        confidence: 0.7,
+                        placetype: "venue",
+                    }],
+                },
+            ],
+        });
+
+        expect(annotations[0]).toMatchObject({
+            content: "Calvary Cemetery",
+            source: "wof_match",
+            authorityId: "756842327",
         });
     });
 
@@ -350,7 +754,7 @@ describe("text extraction overlay helpers", () => {
             placetype: "park",
             bbox: { x1: 0.2, y1: 0.2, x2: 0.32, y2: 0.24 },
         });
-        expect(defaultAnnotationLayerVisibility(annotations)).toEqual({ showWof: true, showOsm: true, showGeoNames: false, showExtraction: false });
+        expect(defaultAnnotationLayerVisibility(annotations)).toEqual({ showWof: true, showOsm: true, showGeoNames: false, showOgm: false, showCandidates: false, showExtraction: false });
     });
 
     it("renders GeoNames peer matches as a gazetteer layer", () => {
@@ -395,7 +799,51 @@ describe("text extraction overlay helpers", () => {
             placetype: "Cape",
             bbox: { x1: 0.13, y1: 0.11, x2: 0.18, y2: 0.12 },
         });
-        expect(defaultAnnotationLayerVisibility(annotations)).toEqual({ showWof: false, showOsm: false, showGeoNames: true, showExtraction: false });
+        expect(defaultAnnotationLayerVisibility(annotations)).toEqual({ showWof: false, showOsm: false, showGeoNames: true, showOgm: false, showCandidates: false, showExtraction: false });
+    });
+
+    it("renders canonical OGM matches as a gazetteer layer", () => {
+        const annotations = normalizeTextExtractionAnnotations({
+            extractedMapText: [
+                {
+                    id: "text-0012",
+                    content: "Meadow Point",
+                    approxBbox: [0.13, 0.11, 0.18, 0.12],
+                    legacyIndex: 12,
+                    confidence: 0.98,
+                    role: "other",
+                },
+            ],
+            derivedPlacenames: [
+                {
+                    id: "place-0008",
+                    name: "Meadow Point",
+                    sourceTextIds: ["text-0012"],
+                    sourceTextIndices: [12],
+                    confidence: 0.98,
+                    gazetteerMatches: [{
+                        provider: "ogm",
+                        authorityId: "ogm:place:synthetic:meadow-point",
+                        name: "Meadow Point",
+                        placetype: "cape",
+                        confidence: 0.95,
+                        matchType: "exact_contextual",
+                    }],
+                },
+            ],
+        });
+
+        expect(annotations[0]).toMatchObject({
+            content: "Meadow Point",
+            source: "ogm_match",
+            layer: "ogm",
+            gazetteerGroupId: "place-0008",
+            authority: "ogm",
+            authorityId: "ogm:place:synthetic:meadow-point",
+            placetype: "cape",
+            bbox: { x1: 0.13, y1: 0.11, x2: 0.18, y2: 0.12 },
+        });
+        expect(defaultAnnotationLayerVisibility(annotations)).toEqual({ showWof: false, showOsm: false, showGeoNames: false, showOgm: true, showCandidates: false, showExtraction: false });
     });
 
     it("adds OSM match annotations from AI Enrichments", () => {
@@ -437,7 +885,7 @@ describe("text extraction overlay helpers", () => {
             placetype: "cape",
             bbox: { x1: 0.13, y1: 0.11, x2: 0.18, y2: 0.12 },
         });
-        expect(defaultAnnotationLayerVisibility(annotations)).toEqual({ showWof: false, showOsm: true, showGeoNames: false, showExtraction: false });
+        expect(defaultAnnotationLayerVisibility(annotations)).toEqual({ showWof: false, showOsm: true, showGeoNames: false, showOgm: false, showCandidates: false, showExtraction: false });
     });
 
     it("derives solidified groups when an older extraction only has raw text boxes", () => {

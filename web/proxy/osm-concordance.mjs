@@ -2,6 +2,18 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import Fuse from "fuse.js";
+import {
+  buildGazetteerSpatialFilter,
+  gazetteerSpatialFilterSummary,
+  recordMatchesGazetteerSpatialFilter,
+} from "./gazetteer-spatial-scope.mjs";
+import {
+  buildMapTextEvidenceIndex,
+  mapTextEntriesLookLikeDistinctPhrase,
+  matchEligibleMapTextEntry,
+  textBackedPlacenameEvidence,
+  withMapTextEvidence,
+} from "./map-text-evidence.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_INDEX_PATH = path.resolve(__dirname, "../.cache/gazetteers/osm/index.ndjson");
@@ -52,7 +64,7 @@ const FEATURE_CUE_TOKENS = new Set([
   "university",
   "waterway",
 ]);
-const ROLE_BLOCKLIST = new Set(["coordinate", "date", "legend", "scale", "street"]);
+const ROLE_BLOCKLIST = new Set(["coordinate", "date", "elevation", "legend", "scale"]);
 const GENERIC_SINGLE_TOKEN_BLOCKLIST = new Set([
   "airport",
   "bay",
@@ -105,6 +117,50 @@ const STREET_SUFFIX_TOKENS = new Set([
   "ter",
   "terrace",
   "way",
+]);
+const STREET_SUFFIX_ALIASES = new Map([
+  ["aly", "alley"],
+  ["ave", "avenue"],
+  ["av", "avenue"],
+  ["blvd", "boulevard"],
+  ["boul", "boulevard"],
+  ["cir", "circle"],
+  ["ct", "court"],
+  ["dr", "drive"],
+  ["ln", "lane"],
+  ["pkwy", "parkway"],
+  ["pl", "place"],
+  ["rd", "road"],
+  ["st", "street"],
+  ["ter", "terrace"],
+]);
+const DIRECTION_PREFIX_ALIASES = new Map([
+  ["n", "north"],
+  ["s", "south"],
+  ["e", "east"],
+  ["w", "west"],
+  ["ne", "northeast"],
+  ["nw", "northwest"],
+  ["se", "southeast"],
+  ["sw", "southwest"],
+]);
+const OSM_STREET_CATEGORIES = new Set(["highway"]);
+const OSM_STREET_TYPES = new Set([
+  "motorway",
+  "trunk",
+  "primary",
+  "secondary",
+  "tertiary",
+  "unclassified",
+  "residential",
+  "living_street",
+  "service",
+  "pedestrian",
+  "road",
+]);
+const STREET_DIRECTION_TOKENS = new Set([
+  ...DIRECTION_PREFIX_ALIASES.keys(),
+  ...DIRECTION_PREFIX_ALIASES.values(),
 ]);
 
 let cachedMatcher = null;
@@ -189,6 +245,54 @@ export function normalizeOsmText(value) {
     .toLowerCase();
 }
 
+export function normalizeOsmStreetText(value) {
+  const tokens = String(value || "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/&/g, " and ")
+    .replace(/[^a-zA-Z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean);
+  if (tokens.length === 0) return "";
+  const expanded = tokens.map((token, index) => {
+    if (index === 0 && DIRECTION_PREFIX_ALIASES.has(token)) return DIRECTION_PREFIX_ALIASES.get(token);
+    if (index === tokens.length - 1 && STREET_SUFFIX_ALIASES.has(token)) return STREET_SUFFIX_ALIASES.get(token);
+    return token;
+  });
+  return expanded.join(" ");
+}
+
+function streetNormalizedVariants(value) {
+  return Array.from(new Set([
+    normalizeOsmText(value),
+    normalizeOsmStreetText(value),
+  ].filter(Boolean)));
+}
+
+function hasStreetSuffix(value) {
+  const tokens = normalizeOsmStreetText(value).split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return false;
+  return STREET_SUFFIX_TOKENS.has(tokens[tokens.length - 1]);
+}
+
+function looksLikeStreetEvidence(label, role) {
+  return String(role || "").toLowerCase() === "street" || hasStreetSuffix(label);
+}
+
+function normalizedEvidenceLabel(label, role) {
+  return looksLikeStreetEvidence(label, role) ? normalizeOsmStreetText(label) : normalizeOsmText(label);
+}
+
+function recordLooksStreet(record) {
+  const category = String(record?.category || "").toLowerCase();
+  const type = String(record?.type || "").toLowerCase();
+  const highway = String(record?.tags?.highway || "").toLowerCase();
+  return OSM_STREET_CATEGORIES.has(category) || OSM_STREET_TYPES.has(type) || Boolean(highway);
+}
+
 function titleizeLabel(value) {
   const small = new Set(["and", "at", "by", "for", "in", "of", "on", "the"]);
   return String(value || "")
@@ -219,13 +323,65 @@ function addNormalizedNameVariant(target, value) {
   if (normalizedWithoutParenthetical) target.add(normalizedWithoutParenthetical);
 }
 
+function selectedGazetteerEvidence(value) {
+  const status = String(value || "").trim().toLowerCase();
+  return !status || status === "matched" || status === "overlap" || status === "exact" || status === "exact_contextual" || status === "fuzzy_contextual";
+}
+
+function selectedGeocodingEvidence(place) {
+  const status = String(place?.extensions?.wofConcordance?.status || place?.geocoding?.matchType || "").trim().toLowerCase();
+  return !status || !["ambiguous", "unmatched", "text_unsupported"].includes(status);
+}
+
+function exactSameNameOsmMatch(place, match) {
+  const selected = match?.selected;
+  if (!selected || !(selected.exact || match.matchType === "exact_contextual")) return false;
+  const placeName = normalizeOsmText(place?.name || place?.normalizedName);
+  const recordName = normalizeOsmText(selected.record?.name || selected.details?.name);
+  return Boolean(placeName && recordName && placeName === recordName);
+}
+
+function existingPrimaryMatchIsStrong(place) {
+  const placeName = normalizeOsmText(place?.name || place?.normalizedName);
+  const matchType = String(place?.geocoding?.matchType || place?.extensions?.wofConcordance?.matchType || "").toLowerCase();
+  const status = String(place?.extensions?.wofConcordance?.status || "").toLowerCase();
+  const exactish = ["exact", "exact_contextual", "concordance_id", "source_concordance"].includes(matchType)
+    || ["exact", "exact_contextual"].includes(status);
+  const matchedNames = [
+    place?.extensions?.wofConcordance?.matchedName,
+    place?.geocoding?.candidates?.[0]?.matchedName,
+    place?.geocoding?.candidates?.[0]?.name,
+  ].map(normalizeOsmText).filter(Boolean);
+  return Boolean(exactish && placeName && matchedNames.includes(placeName));
+}
+
+function existingPrimaryMatchIsWeakFuzzy(place) {
+  const placeName = normalizeOsmText(place?.name || place?.normalizedName);
+  const matchType = String(place?.geocoding?.matchType || place?.extensions?.wofConcordance?.matchType || "").toLowerCase();
+  if (!["fuzzy", "fuzzy_contextual", "matched"].includes(matchType)) return false;
+  const matchedNames = [
+    place?.extensions?.wofConcordance?.matchedName,
+    place?.geocoding?.candidates?.[0]?.matchedName,
+    place?.geocoding?.candidates?.[0]?.name,
+  ].map(normalizeOsmText).filter(Boolean);
+  return Boolean(placeName && matchedNames.some((name) => name && name !== placeName));
+}
+
+function shouldPromoteExactOsmMatch(place, match) {
+  return exactSameNameOsmMatch(place, match) && existingPrimaryMatchIsWeakFuzzy(place) && !existingPrimaryMatchIsStrong(place);
+}
+
 function addExistingNameVariants(target, place) {
   addNormalizedNameVariant(target, place?.name);
   addNormalizedNameVariant(target, place?.normalizedName);
-  addNormalizedNameVariant(target, place?.extensions?.wofConcordance?.matchedName);
-  for (const candidate of asArray(place?.geocoding?.candidates)) {
-    addNormalizedNameVariant(target, candidate?.name);
-    addNormalizedNameVariant(target, candidate?.matchedName);
+  if (selectedGazetteerEvidence(place?.extensions?.wofConcordance?.status)) {
+    addNormalizedNameVariant(target, place?.extensions?.wofConcordance?.matchedName);
+  }
+  if (selectedGeocodingEvidence(place)) {
+    for (const candidate of asArray(place?.geocoding?.candidates)) {
+      addNormalizedNameVariant(target, candidate?.name);
+      addNormalizedNameVariant(target, candidate?.matchedName);
+    }
   }
 }
 
@@ -238,13 +394,17 @@ function placenameLabelCandidates(place) {
     const withoutParenthetical = label.replace(/\s*\([^)]*\)\s*/g, " ").replace(/\s+/g, " ").trim();
     if (withoutParenthetical && withoutParenthetical !== label) labels.push(withoutParenthetical);
   };
-  add(place?.extensions?.wofConcordance?.matchedName);
-  for (const candidate of asArray(place?.geocoding?.candidates)) {
-    add(candidate?.matchedName);
-    add(candidate?.name);
-  }
-  add(place?.normalizedName);
   add(place?.name);
+  add(place?.normalizedName);
+  if (selectedGazetteerEvidence(place?.extensions?.wofConcordance?.status)) {
+    add(place?.extensions?.wofConcordance?.matchedName);
+  }
+  if (selectedGeocodingEvidence(place)) {
+    for (const candidate of asArray(place?.geocoding?.candidates)) {
+      add(candidate?.matchedName);
+      add(candidate?.name);
+    }
+  }
   return Array.from(new Map(labels.map((label) => [normalizeOsmText(label), label])).values())
     .filter((label) => normalizeOsmText(label));
 }
@@ -268,6 +428,24 @@ function tokenOverlapScore(a, b) {
     if (bTokens.has(token)) overlap += 1;
   }
   return overlap / Math.max(aTokens.size, bTokens.size);
+}
+
+const GENERIC_FEATURE_TOKENS = new Set([...FEATURE_CUE_TOKENS, "country"]);
+
+function distinctiveTokenSet(value) {
+  return new Set(normalizedTokens(value).filter((token) => token.length >= 3 && !GENERIC_FEATURE_TOKENS.has(token)));
+}
+
+function distinctiveTokenAlignment(evidence, candidate) {
+  if (candidate.exact || candidate.lexical >= 0.99) return { supported: true, missing: [], extra: [] };
+  const evidenceTokens = distinctiveTokenSet(evidence.normalized || evidence.label);
+  const candidateTokens = distinctiveTokenSet(candidate.variant?.normalized || candidate.record?.name);
+  if (evidenceTokens.size === 0 || candidateTokens.size === 0) {
+    return { supported: false, missing: Array.from(evidenceTokens), extra: Array.from(candidateTokens) };
+  }
+  const missing = Array.from(evidenceTokens).filter((token) => !candidateTokens.has(token));
+  const extra = Array.from(candidateTokens).filter((token) => !evidenceTokens.has(token));
+  return { supported: missing.length === 0 && extra.length === 0, missing, extra };
 }
 
 function levenshteinDistance(a, b) {
@@ -327,6 +505,18 @@ function normalizeNameVariant(value) {
   };
 }
 
+function streetNameVariants(variant) {
+  if (!variant?.value) return [];
+  return streetNormalizedVariants(variant.value)
+    .filter((normalized) => normalized && normalized !== variant.normalized)
+    .map((normalized) => ({
+      ...variant,
+      normalized,
+      source: `${variant.source || "name"}:street_normalized`,
+      weight: Number(variant.weight || 0.9) * 0.98,
+    }));
+}
+
 function normalizeRecord(raw) {
   const record = asRecord(raw);
   if (!record) return null;
@@ -335,13 +525,19 @@ function normalizeRecord(raw) {
   if (!osmType || !osmId) return null;
   const name = String(record.name || record.displayName || record.display_name || "").trim();
   if (!name) return null;
-  const variants = [
+  const baseVariants = [
     normalizeNameVariant(name),
     ...asArray(record.normalizedNames || record.names || record.altNames || record.alt_names).map(normalizeNameVariant),
   ].filter(Boolean);
-  const normalizedNames = Array.from(new Map(variants.map((variant) => [variant.normalized, variant])).values());
   const tags = asRecord(record.tags) || asRecord(record.extratags) || {};
   const address = asRecord(record.address) || {};
+  const category = String(record.category || tags.category || (tags.highway ? "highway" : "")).trim() || undefined;
+  const type = String(record.type || tags.natural || tags.place || tags.highway || "").trim() || undefined;
+  const variants = [
+    ...baseVariants,
+    ...(category === "highway" || tags.highway ? baseVariants.flatMap(streetNameVariants) : []),
+  ];
+  const normalizedNames = Array.from(new Map(variants.map((variant) => [variant.normalized, variant])).values());
   return withoutUndefined({
     osmType,
     osmId,
@@ -349,8 +545,8 @@ function normalizeRecord(raw) {
     name,
     normalizedName: normalizeOsmText(name),
     normalizedNames,
-    category: String(record.category || tags.category || "").trim() || undefined,
-    type: String(record.type || tags.natural || tags.place || "").trim() || undefined,
+    category,
+    type,
     bbox: normalizedBox(record.bbox || record.boundingbox),
     centroid: normalizedCentroid(record.centroid || record.coordinates, record),
     country: String(record.country || address.country_code || address.country || "").trim().toUpperCase() || undefined,
@@ -431,6 +627,42 @@ function loadMatcher() {
     };
   }
   return cachedMatcher;
+}
+
+function scopedOsmMatcher(matcher, filter) {
+  if (!filter?.bbox || !matcher.available) return { matcher, summary: undefined };
+  const records = matcher.records.filter((record) => recordMatchesGazetteerSpatialFilter(record, filter));
+  const summary = gazetteerSpatialFilterSummary(filter, matcher.recordCount || matcher.records.length, records.length);
+  if (records.length === 0 || records.length === matcher.records.length) return { matcher, summary };
+  const byNormalized = new Map();
+  for (const record of records) {
+    for (const variant of record.normalizedNames || []) {
+      if (!variant.normalized) continue;
+      const entries = byNormalized.get(variant.normalized) || [];
+      entries.push(record);
+      byNormalized.set(variant.normalized, entries);
+    }
+  }
+  return {
+    matcher: {
+      ...matcher,
+      records,
+      byNormalized,
+      fuse: new Fuse(records, {
+        includeScore: true,
+        threshold: 0.35,
+        ignoreLocation: true,
+        minMatchCharLength: 3,
+        keys: [
+          { name: "name", weight: 0.5 },
+          { name: "displayName", weight: 0.15 },
+          { name: "normalizedNames.value", weight: 0.25 },
+          { name: "normalizedNames.normalized", weight: 0.1 },
+        ],
+      }),
+    },
+    summary,
+  };
 }
 
 function stringsFromResource(resource) {
@@ -518,6 +750,10 @@ function spatialScore(record, mapExtent = {}, boundary = null) {
 }
 
 function featureCueScore(evidence, record) {
+  const streetEvidence = looksLikeStreetEvidence(evidence.label, evidence.type);
+  const streetRecord = recordLooksStreet(record);
+  if (streetEvidence) return streetRecord ? 1 : 0.12;
+  if (streetRecord) return 0.18;
   const evidenceTokens = new Set(normalizedTokens(evidence.label));
   const recordTokens = new Set(normalizedTokens([record.category, record.type, record.name].filter(Boolean).join(" ")));
   for (const token of evidenceTokens) {
@@ -544,21 +780,18 @@ function bestLexicalVariant(record, evidence) {
   return best || { variant: null, exact: false, lexical: 0, weighted: 0 };
 }
 
-function evidenceFromPlacename(place) {
+function evidenceFromPlacename(place, textEvidenceIndex) {
   const label = placenameLabelCandidates(place)[0] || "";
-  const normalized = normalizeOsmText(label);
+  const normalize = (value) => normalizedEvidenceLabel(value, place?.type);
+  const normalized = normalize(label);
   if (!label || !normalized) return null;
-  return {
-    label,
-    normalized,
+  return textBackedPlacenameEvidence(place, {
+    normalize,
+    labelCandidates: placenameLabelCandidates(place),
+    textEvidenceIndex,
     type: place?.type,
     confidence: Number.isFinite(Number(place?.confidence)) ? Number(place.confidence) : 0.7,
-    sourceKind: "derived_placename",
-    sourceTextIds: Array.isArray(place?.sourceTextIds) ? place.sourceTextIds : [],
-    sourceTextIndices: Array.isArray(place?.sourceTextIndices) ? place.sourceTextIndices : [],
-    approxBbox: place?.approxBbox,
-    sourceCallId: place?.sourceCallId,
-  };
+  });
 }
 
 function candidateAllowedForBoundary(candidate, boundary) {
@@ -568,11 +801,18 @@ function candidateAllowedForBoundary(candidate, boundary) {
 }
 
 function usefulEvidenceContent(label, role) {
-  const normalized = normalizeOsmText(label);
+  const streetEvidence = looksLikeStreetEvidence(label, role);
+  const normalized = normalizedEvidenceLabel(label, role);
   if (normalized.length < 3 || normalized.length > 80) return false;
   if (ROLE_BLOCKLIST.has(String(role || "").toLowerCase())) return false;
   const tokens = normalizedTokens(normalized);
   if (tokens.length === 0 || tokens.length > 8) return false;
+  if (streetEvidence) {
+    if (tokens.length > 7) return false;
+    if (tokens.length === 1 && !String(role || "").toLowerCase().includes("street")) return false;
+    const distinctive = tokens.filter((token) => token.length >= 3 && !STREET_SUFFIX_TOKENS.has(token));
+    return distinctive.length > 0;
+  }
   if (tokens.length === 1) {
     const token = tokens[0];
     if (token.length < 4 || GENERIC_SINGLE_TOKEN_BLOCKLIST.has(token)) return false;
@@ -586,11 +826,11 @@ function evidenceFromTextGroup(group) {
   const label = String(group?.content || "").trim();
   const role = String(group?.role || "other").toLowerCase();
   const confidence = Number.isFinite(Number(group?.confidence)) ? Number(group.confidence) : 0.75;
-  if (confidence < 0.74 || !usefulEvidenceContent(label, role)) return null;
+  if (!matchEligibleMapTextEntry(group, { kind: "text_group", minConfidence: 0.74, allowStreet: true }) || confidence < 0.74 || !usefulEvidenceContent(label, role)) return null;
   return {
     label,
-    normalized: normalizeOsmText(label),
-    type: role,
+    normalized: normalizedEvidenceLabel(label, role),
+    type: looksLikeStreetEvidence(label, role) ? "street" : role,
     confidence,
     sourceKind: "text_group",
     sourceTextIds: Array.isArray(group?.sourceTextIds) ? group.sourceTextIds : [],
@@ -604,11 +844,12 @@ function evidenceFromTextSegment(text) {
   const label = cleanEvidenceLabel(text?.content);
   const role = String(text?.role || "other").toLowerCase();
   const confidence = Number.isFinite(Number(text?.confidence)) ? Number(text.confidence) : 0.5;
-  if (confidence < envNumber("ENRICHMENT_PROXY_OSM_TEXT_CONFIDENCE", DEFAULT_TEXT_CONFIDENCE) || !usefulEvidenceContent(label, role)) return null;
+  const minConfidence = envNumber("ENRICHMENT_PROXY_OSM_TEXT_CONFIDENCE", DEFAULT_TEXT_CONFIDENCE);
+  if (!matchEligibleMapTextEntry(text, { kind: "text_segment", minConfidence, allowStreet: true }) || confidence < minConfidence || !usefulEvidenceContent(label, role)) return null;
   return {
     label,
-    normalized: normalizeOsmText(label),
-    type: role,
+    normalized: normalizedEvidenceLabel(label, role),
+    type: looksLikeStreetEvidence(label, role) ? "street" : role,
     confidence,
     sourceKind: "extracted_map_text",
     sourceTextIds: [text?.id].filter(Boolean),
@@ -639,18 +880,23 @@ function mergedTextBbox(items) {
 function segmentLooksPhraseUseful(text) {
   const label = cleanEvidenceLabel(text?.content);
   const normalized = normalizeOsmText(label);
+  const streetNormalized = normalizeOsmStreetText(label);
   const role = String(text?.role || "").toLowerCase();
-  if (!label || normalized.length < 2 || normalized.length > 32) return false;
+  const streetComponent = streetNormalized
+    && streetNormalized.split(/\s+/).length === 1
+    && (STREET_DIRECTION_TOKENS.has(normalized) || STREET_DIRECTION_TOKENS.has(streetNormalized) || STREET_SUFFIX_TOKENS.has(streetNormalized));
+  if (!label || (!streetComponent && normalized.length < 2) || normalized.length > 32) return false;
   if (ROLE_BLOCKLIST.has(role)) return false;
   if (!/[A-Za-z]/.test(label)) return false;
   const compact = normalized.replace(/\s+/g, "");
   if (!compact) return false;
   const alphaCount = (compact.match(/[a-z]/g) || []).length;
   if (alphaCount / compact.length < 0.55) return false;
-  return !STREET_SUFFIX_TOKENS.has(normalized);
+  return streetComponent || !STREET_SUFFIX_TOKENS.has(normalized);
 }
 
 function phraseItemsLookCoherent(items) {
+  if (!mapTextEntriesLookLikeDistinctPhrase(items)) return false;
   const indices = items
     .map((item) => Number(item?.legacyIndex))
     .filter((index) => Number.isInteger(index));
@@ -662,7 +908,8 @@ function phraseItemsLookCoherent(items) {
   return width <= 0.18 && height <= 0.16;
 }
 
-function phraseHasFeatureCue(normalized) {
+function phraseHasFeatureCue(normalized, label) {
+  if (hasStreetSuffix(label || normalized)) return true;
   return normalized.split(/\s+/).some((token) => FEATURE_CUE_TOKENS.has(token));
 }
 
@@ -671,7 +918,9 @@ function phraseEvidenceFromTextSegments(textSegments, existingNames) {
   const items = (Array.isArray(textSegments) ? textSegments : [])
     .filter((text) => {
       const confidence = Number.isFinite(Number(text?.confidence)) ? Number(text.confidence) : 0;
-      return confidence >= phraseConfidence && segmentLooksPhraseUseful(text);
+      return confidence >= phraseConfidence
+        && matchEligibleMapTextEntry(text, { kind: "text_segment", minConfidence: phraseConfidence, allowStreet: true })
+        && segmentLooksPhraseUseful(text);
     })
     .sort((a, b) => Number(a.legacyIndex ?? 0) - Number(b.legacyIndex ?? 0));
   const evidence = [];
@@ -681,14 +930,15 @@ function phraseEvidenceFromTextSegments(textSegments, existingNames) {
       const phraseItems = items.slice(start, start + length);
       if (!phraseItemsLookCoherent(phraseItems)) continue;
       const label = cleanEvidenceLabel(phraseItems.map((item) => cleanEvidenceLabel(item.content)).join(" "));
-      const normalized = normalizeOsmText(label);
-      if (seen.has(normalized) || !usefulEvidenceContent(label, undefined) || !phraseHasFeatureCue(normalized)) continue;
+      const type = looksLikeStreetEvidence(label, undefined) ? "street" : undefined;
+      const normalized = normalizedEvidenceLabel(label, type);
+      if (seen.has(normalized) || !usefulEvidenceContent(label, type) || !phraseHasFeatureCue(normalized, label)) continue;
       seen.add(normalized);
       const confidence = phraseItems.reduce((sum, item) => sum + clamp(Number(item.confidence || 0)), 0) / phraseItems.length;
       evidence.push({
         label,
         normalized,
-        type: undefined,
+        type,
         confidence,
         sourceKind: "extracted_map_text_phrase",
         sourceTextIds: phraseItems.map((item) => item.id).filter(Boolean),
@@ -703,14 +953,19 @@ function phraseEvidenceFromTextSegments(textSegments, existingNames) {
   return evidence;
 }
 
-function supplementalEvidence({ textGroups, textSegments, existingNames }) {
+function supplementalEvidence({ textGroups, textSegments, existingNames, textEvidenceIndex }) {
+  const indexedGroupIds = new Set((textEvidenceIndex?.groups || []).map((entry) => String(entry.id || "")).filter(Boolean));
+  const eligibleGroupIds = new Set((textEvidenceIndex?.matchGroups || []).map((entry) => String(entry.id || "")).filter(Boolean));
   const byNormalized = new Map();
   const addEvidence = (evidence) => {
     if (!evidence || !evidence.normalized || existingNames.has(evidence.normalized)) return;
     const existing = byNormalized.get(evidence.normalized);
     if (!existing || evidence.confidence > existing.confidence) byNormalized.set(evidence.normalized, evidence);
   };
-  for (const group of textGroups) addEvidence(evidenceFromTextGroup(group));
+  for (const group of textGroups) {
+    if (group?.id && indexedGroupIds.has(String(group.id)) && !eligibleGroupIds.has(String(group.id))) continue;
+    addEvidence(evidenceFromTextGroup(group));
+  }
   for (const evidence of phraseEvidenceFromTextSegments(textSegments, existingNames)) addEvidence(evidence);
   for (const text of textSegments) addEvidence(evidenceFromTextSegment(text));
   return Array.from(byNormalized.values())
@@ -752,6 +1007,12 @@ function candidateFromRecord(record, evidence, context, mapExtent, boundary) {
     exact: lexical.exact,
     score,
     lexical: lexical.lexical,
+    distinctiveTokenAlignment: distinctiveTokenAlignment(evidence, {
+      record,
+      variant: lexical.variant,
+      exact: lexical.exact,
+      lexical: lexical.lexical,
+    }),
     context: contextValue,
     spatial,
     feature,
@@ -793,10 +1054,11 @@ function matchEvidence(matcher, evidence, context, mapExtent, boundary) {
   const limited = candidates.slice(0, limit);
   const selected = limited[0] || null;
   const second = limited[1] || null;
+  const distinctiveAllowed = Boolean(!selected || selected.distinctiveTokenAlignment?.supported);
   const threshold = envNumber("ENRICHMENT_PROXY_OSM_MATCH_THRESHOLD", DEFAULT_MATCH_THRESHOLD);
   const ambiguousThreshold = envNumber("ENRICHMENT_PROXY_OSM_AMBIGUOUS_THRESHOLD", DEFAULT_AMBIGUOUS_THRESHOLD);
   const ambiguous = Boolean(selected && second && (selected.score - second.score) < 0.04 && !selected.exact);
-  const status = selected && selected.score >= threshold && !ambiguous
+  const status = selected && distinctiveAllowed && selected.score >= threshold && !ambiguous
     ? "matched"
     : selected && selected.score >= ambiguousThreshold
       ? "ambiguous"
@@ -813,6 +1075,7 @@ function matchEvidence(matcher, evidence, context, mapExtent, boundary) {
 function placenameTypeFromOsm(record, evidence) {
   const type = String(record.type || "").toLowerCase();
   const category = String(record.category || "").toLowerCase();
+  if (recordLooksStreet(record) || looksLikeStreetEvidence(evidence.label, evidence.type)) return "street";
   if (["city", "town", "village", "hamlet"].includes(type)) return "city";
   if (["neighbourhood", "neighborhood", "suburb", "quarter"].includes(type)) return "neighborhood";
   if (["park", "garden"].includes(type)) return "park";
@@ -825,8 +1088,10 @@ function applyMatchToPlacename(place, match) {
   const selected = match.selected;
   if (!selected) return place;
   const record = selected.record;
+  const osmPlacenameType = placenameTypeFromOsm(record, { label: place?.name, type: place?.type });
   return withGazetteerMatch(withoutUndefined({
     ...place,
+    type: place?.type && place.type !== "other" ? place.type : osmPlacenameType,
     authority: "openstreetmap",
     authorityId: record.osmKey,
     uri: osmUri(record),
@@ -871,6 +1136,22 @@ function applyMatchToPlacename(place, match) {
     wikidata: record.wikidata,
     gnisFeatureId: record.gnisFeatureId,
   });
+}
+
+function withoutOsmConcordance(place) {
+  const cleanedPlace = withoutGazetteerProvider(place, "openstreetmap");
+  const extensions = { ...(cleanedPlace.extensions || {}) };
+  delete extensions.osmConcordance;
+  const next = { ...cleanedPlace, extensions };
+  const authority = String(next.authority || "").toLowerCase();
+  if (authority === "openstreetmap" || authority === "osm") {
+    delete next.authority;
+    delete next.authorityId;
+    delete next.uri;
+    delete next.coordinates;
+    delete next.geocoding;
+  }
+  return withoutUndefined(next);
 }
 
 function removeOsmOverlapFromPlacename(place) {
@@ -937,7 +1218,7 @@ function applyOsmOverlapToPlacename(place, match) {
 
 function supplementalPlacename(evidence, match, index) {
   const record = match.selected?.record;
-  const displayName = record?.name || titleizeLabel(evidence.label);
+  const displayName = record?.name || titleizeLabel(normalizedEvidenceLabel(evidence.label, evidence.type) || evidence.label);
   const base = {
     id: `place-${String(index + 1).padStart(4, "0")}`,
     name: displayName,
@@ -964,6 +1245,7 @@ function summaryFromCounts(matcher, counts, extra = {}) {
     matched: counts.matched,
     ambiguous: counts.ambiguous,
     unmatched: counts.unmatched,
+    textUnsupportedPlacenames: counts.textUnsupported,
     overlapPlacenames: counts.overlap,
     supplementalPlacenames: counts.supplemental,
     attribution: "Contains information from OpenStreetMap contributors. Follow OSM/ODbL attribution requirements when surfacing concordance data.",
@@ -979,17 +1261,26 @@ export function buildOsmConcordanceLayer({
   resource = {},
   mapExtent = {},
   boundary = null,
+  includeSupplemental = true,
 } = {}) {
   const matcher = loadMatcher();
   if (!matcher.available) {
     return {
       placenames,
-      extension: summaryFromCounts(matcher, { matched: 0, ambiguous: 0, unmatched: 0, supplemental: 0, overlap: 0 }, matcher.error ? { error: matcher.error } : {}),
+      extension: summaryFromCounts(matcher, { matched: 0, ambiguous: 0, unmatched: 0, textUnsupported: 0, supplemental: 0, overlap: 0 }, matcher.error ? { error: matcher.error } : {}),
     };
   }
 
+  const scoped = scopedOsmMatcher(matcher, buildGazetteerSpatialFilter({ mapExtent, resource, boundary }));
+  const activeMatcher = scoped.matcher;
   const context = buildContext({ resource, extraction, textGroups, textSegments });
-  const counts = { matched: 0, ambiguous: 0, unmatched: 0, supplemental: 0, overlap: 0 };
+  const textEvidenceIndex = buildMapTextEvidenceIndex({
+    textGroups,
+    textSegments,
+    normalize: (value, entry = {}) => normalizedEvidenceLabel(value, entry?.role || entry?.type),
+    allowStreet: true,
+  });
+  const counts = { matched: 0, ambiguous: 0, unmatched: 0, textUnsupported: 0, supplemental: 0, overlap: 0 };
   const existingNames = new Set();
   const existingAuthorityIds = new Set();
   const enriched = [];
@@ -999,66 +1290,113 @@ export function buildOsmConcordanceLayer({
     addExistingNameVariants(existingNames, place);
     if (place?.authorityId) existingAuthorityIds.add(String(place.authorityId));
     if (authority === "whosonfirst") {
-      const evidence = evidenceFromPlacename(place);
+      const evidence = evidenceFromPlacename(place, textEvidenceIndex);
       if (evidence) {
-        const match = matchEvidence(matcher, evidence, context, mapExtent, boundary);
+        const match = matchEvidence(activeMatcher, evidence, context, mapExtent, boundary);
+        if (shouldPromoteExactOsmMatch(place, match)) {
+          counts.matched += 1;
+          const enrichedPlace = applyMatchToPlacename(withMapTextEvidence(withoutOsmConcordance(place), evidence), match);
+          if (enrichedPlace.authority === "openstreetmap" && enrichedPlace.authorityId) {
+            existingAuthorityIds.add(enrichedPlace.authorityId);
+          }
+          enriched.push(enrichedPlace);
+          continue;
+        }
         if (match.selected?.record?.osmKey && candidateAllowedForBoundary(match.selected, boundary)) {
           counts.overlap += 1;
           existingAuthorityIds.add(match.selected.record.osmKey);
-          enriched.push(applyOsmOverlapToPlacename(place, match));
+          enriched.push(applyOsmOverlapToPlacename(withMapTextEvidence(place, evidence), match));
+          continue;
+        }
+      } else {
+        counts.textUnsupported += 1;
+      }
+      enriched.push(removeOsmOverlapFromPlacename(place));
+      continue;
+    }
+    if (authority) {
+      if (authority === "openstreetmap" || authority === "osm") {
+        const evidence = evidenceFromPlacename(place, textEvidenceIndex);
+        if (!evidence) {
+          counts.textUnsupported += 1;
+          if (place?.authorityId) existingAuthorityIds.delete(String(place.authorityId));
+          enriched.push(withoutOsmConcordance(place));
+          continue;
+        }
+        const match = matchEvidence(activeMatcher, evidence, context, mapExtent, boundary);
+        counts[match.status] += 1;
+        const enrichedPlace = applyMatchToPlacename(withMapTextEvidence(withoutOsmConcordance(place), evidence), match);
+        if (enrichedPlace.authority === "openstreetmap" && enrichedPlace.authorityId) {
+          existingAuthorityIds.add(enrichedPlace.authorityId);
+        }
+        enriched.push(enrichedPlace);
+        continue;
+      }
+      const evidence = evidenceFromPlacename(place, textEvidenceIndex);
+      if (evidence) {
+        const match = matchEvidence(activeMatcher, evidence, context, mapExtent, boundary);
+        if (shouldPromoteExactOsmMatch(place, match)) {
+          counts.matched += 1;
+          const enrichedPlace = applyMatchToPlacename(withMapTextEvidence(withoutOsmConcordance(place), evidence), match);
+          if (enrichedPlace.authority === "openstreetmap" && enrichedPlace.authorityId) {
+            existingAuthorityIds.add(enrichedPlace.authorityId);
+          }
+          enriched.push(enrichedPlace);
           continue;
         }
       }
       enriched.push(removeOsmOverlapFromPlacename(place));
       continue;
     }
-    if (authority) {
-      enriched.push(place);
-      continue;
-    }
-    const evidence = evidenceFromPlacename(place);
+    const evidence = evidenceFromPlacename(place, textEvidenceIndex);
     if (!evidence) {
-      enriched.push(place);
+      counts.textUnsupported += 1;
+      enriched.push(withoutOsmConcordance(place));
       continue;
     }
-    const match = matchEvidence(matcher, evidence, context, mapExtent, boundary);
+    const match = matchEvidence(activeMatcher, evidence, context, mapExtent, boundary);
     counts[match.status] += 1;
-    const enrichedPlace = applyMatchToPlacename(place, match);
+    const enrichedPlace = applyMatchToPlacename(withMapTextEvidence(place, evidence), match);
     if (enrichedPlace.authority === "openstreetmap" && enrichedPlace.authorityId) {
       existingAuthorityIds.add(enrichedPlace.authorityId);
     }
     enriched.push(enrichedPlace);
   }
 
-  const supplementalMatches = [];
-  const seenSupplementalNames = new Set();
-  const supplementalLexicalThreshold = envNumber("ENRICHMENT_PROXY_OSM_SUPPLEMENTAL_LEXICAL_THRESHOLD", DEFAULT_SUPPLEMENTAL_LEXICAL_THRESHOLD);
-  const boundaryBox = normalizedBox(boundary?.bbox);
-  for (const evidence of supplementalEvidence({ textGroups, textSegments, existingNames })) {
-    if (seenSupplementalNames.has(evidence.normalized)) continue;
-    const match = matchEvidence(matcher, evidence, context, mapExtent, boundary);
-    if (!match.selected?.record?.osmKey) continue;
-    if (!match.selected.exact && match.selected.lexical < supplementalLexicalThreshold) continue;
-    if (boundaryBox && !pointInsideBox(match.selected.record.centroid, boundaryBox)) continue;
-    const authorityId = match.selected.record.osmKey;
-    if (existingAuthorityIds.has(authorityId)) continue;
-    supplementalMatches.push({ evidence, match });
-    seenSupplementalNames.add(evidence.normalized);
-    existingAuthorityIds.add(authorityId);
-  }
+  if (includeSupplemental) {
+    const supplementalMatches = [];
+    const seenSupplementalNames = new Set();
+    const supplementalLexicalThreshold = envNumber("ENRICHMENT_PROXY_OSM_SUPPLEMENTAL_LEXICAL_THRESHOLD", DEFAULT_SUPPLEMENTAL_LEXICAL_THRESHOLD);
+    const boundaryBox = normalizedBox(boundary?.bbox);
+    for (const evidence of supplementalEvidence({ textGroups, textSegments, existingNames, textEvidenceIndex })) {
+      if (seenSupplementalNames.has(evidence.normalized)) continue;
+      const match = matchEvidence(activeMatcher, evidence, context, mapExtent, boundary);
+      if (!match.selected?.record?.osmKey) continue;
+      if (!match.selected.exact && match.selected.lexical < supplementalLexicalThreshold) continue;
+      if (boundaryBox && !pointInsideBox(match.selected.record.centroid, boundaryBox)) continue;
+      const authorityId = match.selected.record.osmKey;
+      if (existingAuthorityIds.has(authorityId)) continue;
+      supplementalMatches.push({ evidence, match });
+      seenSupplementalNames.add(evidence.normalized);
+      existingAuthorityIds.add(authorityId);
+    }
 
-  supplementalMatches
-    .sort((a, b) => b.match.confidence - a.match.confidence || a.evidence.label.localeCompare(b.evidence.label))
-    .forEach((item) => {
-      counts.matched += 1;
-      counts.supplemental += 1;
-      existingNames.add(item.evidence.normalized);
-      enriched.push(supplementalPlacename(item.evidence, item.match, enriched.length));
-    });
+    supplementalMatches
+      .sort((a, b) => b.match.confidence - a.match.confidence || a.evidence.label.localeCompare(b.evidence.label))
+      .forEach((item) => {
+        counts.matched += 1;
+        counts.supplemental += 1;
+        existingNames.add(item.evidence.normalized);
+        enriched.push(supplementalPlacename(item.evidence, item.match, enriched.length));
+      });
+  }
 
   return {
     placenames: enriched,
-    extension: summaryFromCounts(matcher, counts, boundary ? { boundary } : {}),
+    extension: summaryFromCounts(matcher, counts, withoutUndefined({
+      boundary,
+      spatialFilter: scoped.summary,
+    })),
   };
 }
 

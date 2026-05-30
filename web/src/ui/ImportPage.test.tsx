@@ -74,7 +74,7 @@ describe('ImportPage', () => {
     });
 
     it('handles CSV import', async () => {
-        vi.mocked(duckdb.importCsv).mockResolvedValue({ success: true, count: 5 });
+        vi.mocked(duckdb.importCsv).mockResolvedValue({ success: true, message: 'Imported 5 resources', count: 5 });
 
         const { container } = render(<ImportPage />);
 

@@ -143,7 +143,7 @@ describe('DatabaseService', () => {
 
         it('importCsv delegates correctly', async () => {
             const file = new File([], 'test.csv');
-            vi.mocked(imprt.importCsv).mockResolvedValue({ count: 10, errors: [] });
+            vi.mocked(imprt.importCsv).mockResolvedValue({ success: true, message: 'Imported 10 rows', count: 10 });
             await databaseService.importCsv(file);
             expect(imprt.importCsv).toHaveBeenCalledWith(file);
         });

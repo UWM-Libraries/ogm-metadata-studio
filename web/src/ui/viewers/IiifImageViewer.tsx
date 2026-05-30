@@ -38,6 +38,160 @@ interface TileSpec {
     height: number;
 }
 
+type GazetteerLayer = "wof" | "osm" | "geonames" | "ogm";
+
+interface AnnotationListItem {
+    id: string;
+    annotations: TextExtractionAnnotation[];
+    content: string;
+    color: string;
+    index: number;
+    isGazetteer: boolean;
+}
+
+interface AnnotationListSection {
+    id: string;
+    label: string;
+    items: AnnotationListItem[];
+    defaultOpen: boolean;
+}
+
+const GAZETTEER_LAYER_LABELS: Record<GazetteerLayer, string> = {
+    wof: "WOF",
+    osm: "OSM",
+    geonames: "GN",
+    ogm: "OGM",
+};
+
+const GAZETTEER_LAYER_FALLBACK_COLORS: Record<GazetteerLayer, string> = {
+    wof: "#06b6d4",
+    osm: "#84cc16",
+    geonames: "#f59e0b",
+    ogm: "#c084fc",
+};
+const CANDIDATE_LAYER_FALLBACK_COLOR = "#22c55e";
+const NEIGHBORHOOD_SECTION_ROLES = new Set(["neighborhood", "neighbourhood", "district"]);
+const NEIGHBORHOOD_SECTION_PLACETYPES = new Set(["borough", "district", "neighborhood", "neighbourhood"]);
+const ANNOTATION_SECTION_DEFINITIONS: Array<Omit<AnnotationListSection, "items">> = [
+    { id: "title", label: "Title & Publication", defaultOpen: true },
+    { id: "legend", label: "Legend & Scale", defaultOpen: true },
+    { id: "water", label: "Water Bodies", defaultOpen: true },
+    { id: "terrain", label: "Terrain / Elevation", defaultOpen: true },
+    { id: "landmark", label: "Landmarks & Parks", defaultOpen: true },
+    { id: "neighborhood", label: "Neighborhoods / Districts", defaultOpen: true },
+    { id: "street", label: "Streets & Routes", defaultOpen: false },
+    { id: "reference", label: "Reference / Grid", defaultOpen: false },
+    { id: "other", label: "Other Labels", defaultOpen: false },
+];
+const NATURAL_TEXT_COLLATOR = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+const KNOWN_SEATTLE_NEIGHBORHOOD_LABELS = new Set([
+    "adams",
+    "admiral",
+    "alki",
+    "arbor heights",
+    "atlantic",
+    "ballard",
+    "beacon hill",
+    "belltown",
+    "bitter lake",
+    "blue ridge",
+    "brighton",
+    "broadview",
+    "bryant",
+    "capitol hill",
+    "cascade",
+    "cedar park",
+    "central area",
+    "central district",
+    "columbia city",
+    "crown hill",
+    "delridge",
+    "denny blaine",
+    "denny regrade",
+    "downtown",
+    "dunlap",
+    "eastlake",
+    "endolyne",
+    "fairmount park",
+    "fauntleroy",
+    "first hill",
+    "fremont",
+    "gatewood",
+    "genesee",
+    "georgetown",
+    "green lake",
+    "greenwood",
+    "haller lake",
+    "high point",
+    "highland park",
+    "hillman city",
+    "holly park",
+    "industrial district",
+    "interbay",
+    "international district",
+    "judkins park",
+    "junction",
+    "lake city",
+    "lakewood",
+    "laurelhurst",
+    "leschi",
+    "licton springs",
+    "loyal heights",
+    "madison park",
+    "madison valley",
+    "madrona",
+    "magnolia",
+    "maple leaf",
+    "matthews beach",
+    "meadowbrook",
+    "montlake",
+    "morgan junction",
+    "mount baker",
+    "mt baker",
+    "new holly",
+    "north admiral",
+    "north beach",
+    "north beacon hill",
+    "north college park",
+    "north delridge",
+    "north end",
+    "northgate",
+    "olympic hills",
+    "phinney ridge",
+    "pinehurst",
+    "pioneer square",
+    "portage bay",
+    "queen anne",
+    "rainier beach",
+    "rainier valley",
+    "rainier view",
+    "ravenna",
+    "ravenna bryant",
+    "riverview",
+    "roosevelt",
+    "roxhill",
+    "sand point",
+    "seward park",
+    "sodo",
+    "south beacon hill",
+    "south delridge",
+    "south lake union",
+    "south park",
+    "sunset hill",
+    "university district",
+    "victory heights",
+    "view ridge",
+    "wallingford",
+    "wedgwood",
+    "west seattle",
+    "west seattle junction",
+    "west woodland",
+    "whittier heights",
+    "windermere",
+    "youngstown",
+    "yesler terrace",
+]);
+
 function normalizeInfoUrl(url: string): string {
     const value = String(url || "");
     return value.endsWith('/info.json') ? value : `${value.replace(/\/+$/, '')}/info.json`;
@@ -82,6 +236,223 @@ function viewStatesEqual(a: ViewState, b: ViewState): boolean {
         && Math.abs(a.y - b.y) < 0.1;
 }
 
+function isGazetteerLayer(layer: TextExtractionAnnotation["layer"]): layer is GazetteerLayer {
+    return layer === "wof" || layer === "osm" || layer === "geonames" || layer === "ogm";
+}
+
+function isGazetteerAnnotation(annotation: TextExtractionAnnotation): boolean {
+    return isGazetteerLayer(annotation.layer);
+}
+
+function bboxKey(annotation: TextExtractionAnnotation): string | null {
+    if (!annotation.bbox) return null;
+    const { x1, y1, x2, y2 } = annotation.bbox;
+    return [x1, y1, x2, y2].map((value) => value.toFixed(5)).join(",");
+}
+
+function annotationListItemId(annotation: TextExtractionAnnotation): string {
+    const isGazetteer = isGazetteerAnnotation(annotation);
+    if (!isGazetteer && annotationIsNeighborhoodOrDistrict(annotation)) {
+        return `neighborhood:${normalizedListText(annotation.content)}`;
+    }
+    if (!isGazetteer) return annotation.id;
+    if (annotation.gazetteerGroupId) return `gazetteer:${annotation.gazetteerGroupId}`;
+    const sourceKey = annotation.sourceTextIds?.join("|")
+        || annotation.sourceTextIndices?.join("|")
+        || bboxKey(annotation)
+        || "no-source";
+    return `gazetteer:${annotation.content.trim().toLocaleLowerCase()}:${sourceKey}`;
+}
+
+function annotationListItemScore(annotation: TextExtractionAnnotation): number {
+    return (annotation.candidateStatus === "accepted" ? 100 : 0)
+        + (annotation.geometryStatus === "ocr_backed" ? 40 : annotation.geometryStatus === "model_projected" ? 20 : 0)
+        + (annotation.bbox ? 10 : 0)
+        + (annotation.confidence ?? 0);
+}
+
+function betterListAnnotation(a: TextExtractionAnnotation, b: TextExtractionAnnotation): TextExtractionAnnotation {
+    const scoreDifference = annotationListItemScore(a) - annotationListItemScore(b);
+    if (scoreDifference !== 0) return scoreDifference > 0 ? a : b;
+    return a.index <= b.index ? a : b;
+}
+
+function refreshAnnotationListItemPresentation(item: AnnotationListItem) {
+    const best = item.annotations.reduce((current, annotation) => betterListAnnotation(annotation, current), item.annotations[0]);
+    item.content = best.content;
+    item.color = best.color;
+    item.index = best.index;
+}
+
+function buildAnnotationListItems(annotations: TextExtractionAnnotation[]): AnnotationListItem[] {
+    const items: AnnotationListItem[] = [];
+    const groupedItemsById = new Map<string, AnnotationListItem>();
+
+    annotations.forEach((annotation) => {
+        const isGazetteer = isGazetteerAnnotation(annotation);
+        const shouldMergeItem = isGazetteer || annotationIsNeighborhoodOrDistrict(annotation);
+        const id = annotationListItemId(annotation);
+        if (shouldMergeItem) {
+            const existing = groupedItemsById.get(id);
+            if (existing) {
+                existing.annotations.push(annotation);
+                refreshAnnotationListItemPresentation(existing);
+                return;
+            }
+        }
+
+        const item = {
+            id,
+            annotations: [annotation],
+            content: annotation.content,
+            color: annotation.color,
+            index: annotation.index,
+            isGazetteer,
+        };
+        if (shouldMergeItem) groupedItemsById.set(id, item);
+        items.push(item);
+    });
+
+    return items;
+}
+
+function preferredAnnotationForListItem(item: AnnotationListItem): TextExtractionAnnotation {
+    return item.annotations.reduce((current, annotation) => betterListAnnotation(annotation, current), item.annotations[0]);
+}
+
+function normalizedListText(value: string): string {
+    return value
+        .normalize("NFKD")
+        .replace(/\p{Diacritic}/gu, "")
+        .replace(/[^\p{L}\p{N}]+/gu, " ")
+        .trim()
+        .toLowerCase();
+}
+
+function annotationSearchText(item: AnnotationListItem): string {
+    const fields = item.annotations.flatMap((annotation) => [
+        annotation.content,
+        annotation.role,
+        annotation.placetype,
+        annotation.authority,
+        annotation.authorityId,
+        annotation.matchType,
+        annotation.geometryStatus,
+        annotation.candidateStatus,
+        annotation.source,
+        annotation.layer && isGazetteerLayer(annotation.layer) ? GAZETTEER_LAYER_LABELS[annotation.layer] : annotation.layer,
+        ...(annotation.sourceTextIds || []),
+        ...(annotation.sourceTextIndices || []).map((index) => String(index)),
+    ]);
+    return normalizedListText([item.content, ...fields].filter(Boolean).join(" "));
+}
+
+function annotationItemMatchesSearch(item: AnnotationListItem, normalizedQuery: string): boolean {
+    if (!normalizedQuery) return true;
+    const haystack = annotationSearchText(item);
+    if (haystack.includes(normalizedQuery)) return true;
+    return normalizedQuery.split(/\s+/).every((token) => haystack.includes(token));
+}
+
+function looksLikeStreetLabel(content: string): boolean {
+    const normalized = normalizedListText(content);
+    return /\b(?:ave|avenue|st|street|way|blvd|boulevard|road|rd|pl|place|drive|dr|lane|ln|ct|court|highway|hwy)\b/.test(normalized);
+}
+
+function looksLikeExplicitWaterBodyLabel(content: string): boolean {
+    const normalized = normalizedListText(content);
+    return /\b(?:bay|canal|channel|creek|harbor|harbour|inlet|lake|reservoir|river|sea|sound|spring|springs|stream|waterway)\b/.test(normalized);
+}
+
+function looksLikeTerrainOrElevationLabel(content: string): boolean {
+    const normalized = normalizedListText(content);
+    if (/^(?:\+|x|bm|b m|bench mark|spot elev(?:ation)?)?\s*\d{2,5}(?:\s*(?:ft|feet|m|meters?))?$/.test(normalized)) return true;
+    return /\b(?:arroyo|basin|bench|bluff|butte|canyon|cliff|divide|flat|flats|gap|gulch|hill|hills|mesa|mount|mountain|mt|narrows|peak|peaks|range|ridge|slope|summit|valley|wash)\b/.test(normalized)
+        && !looksLikeExplicitWaterBodyLabel(content);
+}
+
+function canInferSectionFromContent(role: string, placetype: string): boolean {
+    return ["", "label", "other", "unknown"].includes(role) && ["", "label", "other", "unknown"].includes(placetype);
+}
+
+function isKnownSeattleNeighborhoodOrDistrict(content: string): boolean {
+    return KNOWN_SEATTLE_NEIGHBORHOOD_LABELS.has(normalizedListText(content));
+}
+
+function annotationIsNeighborhoodOrDistrict(annotation: TextExtractionAnnotation): boolean {
+    const role = String(annotation.role || "").toLowerCase();
+    const placetype = String(annotation.placetype || "").toLowerCase();
+    return NEIGHBORHOOD_SECTION_ROLES.has(role)
+        || NEIGHBORHOOD_SECTION_PLACETYPES.has(placetype)
+        || annotationIsKnownSeattleNeighborhoodOrDistrict(annotation);
+}
+
+function annotationIsKnownSeattleNeighborhoodOrDistrict(annotation: TextExtractionAnnotation): boolean {
+    const role = String(annotation.role || "").toLowerCase();
+    const placetype = String(annotation.placetype || "").toLowerCase();
+    return (role === "neighborhood" || ["borough", "locality", "neighbourhood", "neighborhood"].includes(placetype))
+        && isKnownSeattleNeighborhoodOrDistrict(annotation.content);
+}
+
+function annotationSectionId(item: AnnotationListItem): string {
+    const annotation = preferredAnnotationForListItem(item);
+    const role = String(annotation.role || "").toLowerCase();
+    const placetype = String(annotation.placetype || "").toLowerCase();
+    const content = normalizedListText(item.content);
+    const canInferFromContent = canInferSectionFromContent(role, placetype);
+
+    if (["title", "publication", "publisher", "date"].includes(role)) return "title";
+    if (["legend", "scale"].includes(role)) return "legend";
+    if (["landform", "elevation"].includes(role) || looksLikeTerrainOrElevationLabel(item.content)
+        || ["hill", "hills", "landform", "mountain", "peak", "ridge", "summit", "valley"].includes(placetype)) return "terrain";
+    if (role === "waterbody" || ["bay", "canal", "channel", "creek", "harbor", "harbour", "lake", "river", "sound", "waterbody", "waterway"].includes(placetype)) return "water";
+    if (role === "street" || role === "route" || looksLikeStreetLabel(item.content)) return "street";
+    if (annotationIsNeighborhoodOrDistrict(annotation)) return "neighborhood";
+    if (["park", "landmark", "ferry", "railroad"].includes(role)
+        || ["airport", "campus", "cemetery", "park", "station", "venue"].includes(placetype)
+        || /\b(?:airport|beach|cemetery|club|ferry|fort|garden|golf|park|stadium|station|terminal|university)\b/.test(content)) return "landmark";
+    if (["coordinate", "grid", "marginalia"].includes(role) || /^[\d\s.,-]+$/.test(content)) return "reference";
+    if (canInferFromContent && /\b(?:bay|canal|channel|creek|duwamish|harbor|harbour|lake|portage|puget|river|shilshole|slough|sound|waterway)\b/.test(content)) return "water";
+    return "other";
+}
+
+function itemSortKey(item: AnnotationListItem): string {
+    return normalizedListText(item.content) || item.content.toLowerCase();
+}
+
+function sortAnnotationSectionItems(sectionId: string, items: AnnotationListItem[]): AnnotationListItem[] {
+    const readOrderSections = new Set(["title", "legend"]);
+    return [...items].sort((a, b) => {
+        if (readOrderSections.has(sectionId)) return a.index - b.index;
+        const textCompare = NATURAL_TEXT_COLLATOR.compare(itemSortKey(a), itemSortKey(b));
+        return textCompare || a.index - b.index;
+    });
+}
+
+function buildAnnotationListSections(items: AnnotationListItem[]): AnnotationListSection[] {
+    const itemsBySection = new Map<string, AnnotationListItem[]>();
+    items.forEach((item) => {
+        const id = annotationSectionId(item);
+        const group = itemsBySection.get(id) || [];
+        group.push(item);
+        itemsBySection.set(id, group);
+    });
+
+    return ANNOTATION_SECTION_DEFINITIONS.flatMap((definition) => {
+        const sectionItems = itemsBySection.get(definition.id) || [];
+        if (sectionItems.length === 0) return [];
+        return [{ ...definition, items: sortAnnotationSectionItems(definition.id, sectionItems) }];
+    });
+}
+
+function layerColor(annotations: TextExtractionAnnotation[], layer: GazetteerLayer): string {
+    return annotations.find((annotation) => annotation.layer === layer)?.color || GAZETTEER_LAYER_FALLBACK_COLORS[layer];
+}
+
+function candidateLayerColor(annotations: TextExtractionAnnotation[]): string {
+    return annotations.find((annotation) => annotation.layer === "candidate")?.color || CANDIDATE_LAYER_FALLBACK_COLOR;
+}
+
 export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
     infoUrl,
     className = '',
@@ -90,6 +461,7 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
     textExtractionStatus = "none",
     textExtractionMessage = "",
 }) => {
+    const rootRef = useRef<HTMLDivElement>(null);
     const containerRef = useRef<HTMLDivElement>(null);
     const annotationListRef = useRef<HTMLDivElement>(null);
     const annotationEntryRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
@@ -107,11 +479,17 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
     const [showWofAnnotations, setShowWofAnnotations] = useState(true);
     const [showOsmAnnotations, setShowOsmAnnotations] = useState(true);
     const [showGeoNamesAnnotations, setShowGeoNamesAnnotations] = useState(true);
+    const [showOgmAnnotations, setShowOgmAnnotations] = useState(true);
+    const [showCandidateAnnotations, setShowCandidateAnnotations] = useState(true);
     const [showExtractionAnnotations, setShowExtractionAnnotations] = useState(true);
     const [showTextPanel, setShowTextPanel] = useState(true);
     const [showSelectedTextOnly, setShowSelectedTextOnly] = useState(false);
+    const [openAnnotationSectionIds, setOpenAnnotationSectionIds] = useState<Set<string>>(new Set());
     const [selectedTextId, setSelectedTextId] = useState<string | null>(null);
+    const [annotationSearchQuery, setAnnotationSearchQuery] = useState("");
+    const [isFullscreen, setIsFullscreen] = useState(false);
     const annotationDefaultsRef = useRef("");
+    const annotationSectionsRef = useRef("");
 
     const normalizedInfoUrl = useMemo(() => normalizeInfoUrl(infoUrl), [infoUrl]);
     const info = infoState.url === normalizedInfoUrl ? infoState.info : null;
@@ -120,54 +498,112 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
     const hasWofAnnotations = textAnnotations.some((annotation) => annotation.layer === "wof");
     const hasOsmAnnotations = textAnnotations.some((annotation) => annotation.layer === "osm");
     const hasGeoNamesAnnotations = textAnnotations.some((annotation) => annotation.layer === "geonames");
+    const hasOgmAnnotations = textAnnotations.some((annotation) => annotation.layer === "ogm");
+    const hasCandidateAnnotations = textAnnotations.some((annotation) => annotation.layer === "candidate");
     const hasExtractionAnnotations = textAnnotations.some((annotation) => annotation.layer === "extraction");
+    const hasGazetteerAnnotations = hasWofAnnotations || hasOsmAnnotations || hasGeoNamesAnnotations || hasOgmAnnotations;
+    const hasLayerControls = hasCandidateAnnotations || hasGazetteerAnnotations;
     const showTextStatus = !hasTextAnnotations && textExtractionStatus !== "none";
     const enabledTextAnnotations = textAnnotations.filter((annotation) => (
-        annotation.layer === "wof"
+        annotation.layer === "candidate"
+            ? showCandidateAnnotations
+            : annotation.layer === "wof"
             ? showWofAnnotations
             : annotation.layer === "osm"
                 ? showOsmAnnotations
                 : annotation.layer === "geonames"
                     ? showGeoNamesAnnotations
+                    : annotation.layer === "ogm"
+                        ? showOgmAnnotations
                     : showExtractionAnnotations
     ));
-    const activeSelectedTextId = enabledTextAnnotations.some((annotation) => annotation.id === selectedTextId)
-        ? selectedTextId
+    const activeSelectedAnnotation = enabledTextAnnotations.find((annotation) => annotation.id === selectedTextId) || null;
+    const activeSelectedTextId = activeSelectedAnnotation?.id || null;
+    const activeSelectedListItemId = activeSelectedAnnotation ? annotationListItemId(activeSelectedAnnotation) : null;
+    const isShowingSelectedTextOnly = showSelectedTextOnly && Boolean(activeSelectedListItemId);
+    const annotationSearchTerm = normalizedListText(annotationSearchQuery);
+    const annotationListItems = buildAnnotationListItems(enabledTextAnnotations);
+    const searchedAnnotationListItems = annotationSearchTerm
+        ? annotationListItems.filter((item) => annotationItemMatchesSearch(item, annotationSearchTerm))
+        : annotationListItems;
+    const searchMatchedAnnotationIds = annotationSearchTerm
+        ? new Set(searchedAnnotationListItems.flatMap((item) => item.annotations.map((annotation) => annotation.id)))
         : null;
-    const isShowingSelectedTextOnly = showSelectedTextOnly && Boolean(activeSelectedTextId);
+    const searchFilteredTextAnnotations = searchMatchedAnnotationIds
+        ? enabledTextAnnotations.filter((annotation) => searchMatchedAnnotationIds.has(annotation.id))
+        : enabledTextAnnotations;
     const visibleTextAnnotations = !showTextOverlay
         ? []
         : isShowingSelectedTextOnly
-            ? enabledTextAnnotations.filter((annotation) => annotation.id === activeSelectedTextId)
-            : enabledTextAnnotations;
-    const showOnlyWof = hasWofAnnotations && showWofAnnotations && !showOsmAnnotations && !showGeoNamesAnnotations && !showExtractionAnnotations;
-    const showOnlyOsm = hasOsmAnnotations && showOsmAnnotations && !showWofAnnotations && !showGeoNamesAnnotations && !showExtractionAnnotations;
-    const showOnlyGeoNames = hasGeoNamesAnnotations && showGeoNamesAnnotations && !showWofAnnotations && !showOsmAnnotations && !showExtractionAnnotations;
-    const showOnlyExtraction = hasExtractionAnnotations && showExtractionAnnotations && !showWofAnnotations && !showOsmAnnotations && !showGeoNamesAnnotations;
-    const annotationPanelTitle = showOnlyWof
-        ? "WOF Matches"
-        : showOnlyOsm
-            ? "OSM Matches"
-            : showOnlyGeoNames
-                ? "GeoNames Matches"
-                : showOnlyExtraction
-                    ? "Extraction Entries"
-                    : (showWofAnnotations || showOsmAnnotations || showGeoNamesAnnotations) && !showExtractionAnnotations
-                        ? "Gazetteer Matches"
-                        : "Overlay Entries";
+            ? enabledTextAnnotations.filter((annotation) => annotationListItemId(annotation) === activeSelectedListItemId)
+            : searchFilteredTextAnnotations;
+    const displayedAnnotationListItems = isShowingSelectedTextOnly && activeSelectedListItemId
+        ? annotationListItems.filter((item) => item.id === activeSelectedListItemId)
+        : searchedAnnotationListItems;
+    const annotationListSections = buildAnnotationListSections(displayedAnnotationListItems);
+    const annotationCountLabel = isShowingSelectedTextOnly
+        ? `1 / ${annotationSearchTerm ? searchedAnnotationListItems.length : annotationListItems.length}`
+        : annotationSearchTerm
+            ? `${searchedAnnotationListItems.length} / ${annotationListItems.length}`
+            : annotationListItems.length;
+    const selectedAnnotationSectionId = activeSelectedListItemId
+        ? annotationListSections.find((section) => section.items.some((item) => item.id === activeSelectedListItemId))?.id || null
+        : null;
+    const showOnlyCandidates = hasCandidateAnnotations && showCandidateAnnotations && !showWofAnnotations && !showOsmAnnotations && !showGeoNamesAnnotations && !showOgmAnnotations && !showExtractionAnnotations;
+    const showOnlyExtraction = hasExtractionAnnotations && showExtractionAnnotations && !showWofAnnotations && !showOsmAnnotations && !showGeoNamesAnnotations && !showOgmAnnotations && !showCandidateAnnotations;
+    const annotationPanelTitle = showOnlyCandidates
+        ? "Map Labels"
+        : hasGazetteerAnnotations && !showExtractionAnnotations && !showCandidateAnnotations
+            ? "Gazetteer Matches"
+            : showOnlyExtraction
+                ? "Extraction Entries"
+                : "Overlay Entries";
 
+    /* eslint-disable react-hooks/set-state-in-effect */
     useEffect(() => {
-        const signature = `${normalizedInfoUrl}:${textAnnotations.length}:${hasWofAnnotations ? "wof" : "no-wof"}:${hasOsmAnnotations ? "osm" : "no-osm"}:${hasGeoNamesAnnotations ? "geonames" : "no-geonames"}:${hasExtractionAnnotations ? "ocr" : "no-ocr"}`;
+        const signature = `${normalizedInfoUrl}:${textAnnotations.length}:${hasWofAnnotations ? "wof" : "no-wof"}:${hasOsmAnnotations ? "osm" : "no-osm"}:${hasGeoNamesAnnotations ? "geonames" : "no-geonames"}:${hasOgmAnnotations ? "ogm" : "no-ogm"}:${hasCandidateAnnotations ? "candidate" : "no-candidate"}:${hasExtractionAnnotations ? "ocr" : "no-ocr"}`;
         if (annotationDefaultsRef.current === signature) return;
         annotationDefaultsRef.current = signature;
         const defaults = defaultAnnotationLayerVisibility(textAnnotations);
         setShowWofAnnotations(defaults.showWof);
         setShowOsmAnnotations(defaults.showOsm);
         setShowGeoNamesAnnotations(defaults.showGeoNames);
+        setShowOgmAnnotations(defaults.showOgm);
+        setShowCandidateAnnotations(defaults.showCandidates);
         setShowExtractionAnnotations(defaults.showExtraction);
         setShowSelectedTextOnly(false);
         setSelectedTextId(null);
-    }, [hasExtractionAnnotations, hasGeoNamesAnnotations, hasOsmAnnotations, hasWofAnnotations, normalizedInfoUrl, textAnnotations]);
+        setAnnotationSearchQuery("");
+    }, [hasCandidateAnnotations, hasExtractionAnnotations, hasGeoNamesAnnotations, hasOgmAnnotations, hasOsmAnnotations, hasWofAnnotations, normalizedInfoUrl, textAnnotations]);
+
+    useEffect(() => {
+        const signature = `${annotationSearchTerm}:${annotationListSections.map((section) => `${section.id}:${section.items.length}`).join("|")}`;
+        if (annotationSectionsRef.current === signature) return;
+        annotationSectionsRef.current = signature;
+        const shouldOpenAll = annotationSearchTerm || annotationListSections.length <= 3;
+        setOpenAnnotationSectionIds(new Set(annotationListSections
+            .filter((section) => shouldOpenAll || section.defaultOpen)
+            .map((section) => section.id)));
+    }, [annotationListSections, annotationSearchTerm]);
+
+    useEffect(() => {
+        if (!selectedAnnotationSectionId) return;
+        setOpenAnnotationSectionIds((current) => {
+            if (current.has(selectedAnnotationSectionId)) return current;
+            const next = new Set(current);
+            next.add(selectedAnnotationSectionId);
+            return next;
+        });
+    }, [selectedAnnotationSectionId]);
+    /* eslint-enable react-hooks/set-state-in-effect */
+
+    useEffect(() => {
+        const handleFullscreenChange = () => {
+            setIsFullscreen(document.fullscreenElement === rootRef.current);
+        };
+        document.addEventListener("fullscreenchange", handleFullscreenChange);
+        return () => document.removeEventListener("fullscreenchange", handleFullscreenChange);
+    }, []);
 
     useEffect(() => {
         viewRef.current = view;
@@ -242,17 +678,26 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
         setSelectedTextId(annotation.id);
         setShowTextOverlay(true);
         focusTextAnnotation(annotation);
-    }, [focusTextAnnotation]);
+    }, [focusTextAnnotation, setSelectedTextId, setShowTextOverlay]);
 
     const setAnnotationEntryRef = useCallback((id: string, element: HTMLButtonElement | null) => {
         if (element) annotationEntryRefs.current.set(id, element);
         else annotationEntryRefs.current.delete(id);
     }, []);
 
+    const toggleAnnotationSection = useCallback((id: string) => {
+        setOpenAnnotationSectionIds((current) => {
+            const next = new Set(current);
+            if (next.has(id)) next.delete(id);
+            else next.add(id);
+            return next;
+        });
+    }, []);
+
     useEffect(() => {
-        if (!activeSelectedTextId || !showTextPanel) return;
+        if (!activeSelectedListItemId || !showTextPanel) return;
         const container = annotationListRef.current;
-        const entry = annotationEntryRefs.current.get(activeSelectedTextId);
+        const entry = annotationEntryRefs.current.get(activeSelectedListItemId);
         if (!container || !entry) return;
         const frame = window.requestAnimationFrame(() => {
             const containerRect = container.getBoundingClientRect();
@@ -264,7 +709,7 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
             }
         });
         return () => window.cancelAnimationFrame(frame);
-    }, [activeSelectedTextId, showTextPanel]);
+    }, [activeSelectedListItemId, openAnnotationSectionIds, showTextPanel]);
 
     useEffect(() => {
         const controller = new AbortController();
@@ -325,6 +770,27 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
         const frame = window.requestAnimationFrame(fitView);
         return () => window.cancelAnimationFrame(frame);
     }, [fitView]);
+
+    const toggleFullscreen = useCallback(() => {
+        const element = rootRef.current;
+        if (!element) return;
+
+        if (!element.requestFullscreen || !document.exitFullscreen) {
+            setIsFullscreen((current) => !current);
+            return;
+        }
+
+        if (document.fullscreenElement === element) {
+            document.exitFullscreen()
+                .then(() => setIsFullscreen(false))
+                .catch((error) => console.warn("IIIF viewer: could not exit fullscreen", error));
+            return;
+        }
+
+        element.requestFullscreen()
+            .then(() => setIsFullscreen(true))
+            .catch((error) => console.warn("IIIF viewer: could not enter fullscreen", error));
+    }, []);
 
     const tileData = useMemo(() => {
         if (!info || containerSize.width <= 0 || containerSize.height <= 0) return { tiles: [] as TileSpec[], scaleFactor: 1 };
@@ -426,7 +892,10 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
     }
 
     return (
-        <div className={`${className} ${heightClassName} relative overflow-hidden bg-slate-950 text-white`}>
+        <div
+            ref={rootRef}
+            className={`${className} ${isFullscreen ? "h-screen w-screen rounded-none" : heightClassName} relative overflow-hidden bg-slate-950 text-white`}
+        >
             <div
                 ref={containerRef}
                 className="absolute inset-0 z-0 cursor-grab touch-none overflow-hidden active:cursor-grabbing"
@@ -460,6 +929,7 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
                     const width = (bbox.x2 - bbox.x1) * info.width * view.scale;
                     const height = (bbox.y2 - bbox.y1) * info.height * view.scale;
                     const isSelected = activeSelectedTextId === annotation.id;
+                    const needsGeometryReview = annotation.candidateStatus === "needs_review_geometry";
 
                     return (
                         <button
@@ -474,6 +944,7 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
                                 width,
                                 height,
                                 borderColor: annotation.color,
+                                borderStyle: needsGeometryReview ? "dashed" : "solid",
                                 backgroundColor: colorWithAlpha(annotation.color, isSelected ? 0.24 : 0.13),
                             }}
                             title={`${annotation.index}. ${annotation.content}`}
@@ -497,6 +968,31 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
                 <button type="button" className="h-8 w-8 rounded bg-white/10 text-sm font-semibold hover:bg-white/20" title="Zoom in" onClick={() => zoomAt(view.scale * 1.3)}>+</button>
                 <button type="button" className="h-8 w-8 rounded bg-white/10 text-sm font-semibold hover:bg-white/20" title="Zoom out" onClick={() => zoomAt(view.scale / 1.3)}>-</button>
                 <button type="button" className="h-8 rounded bg-white/10 px-2 text-xs font-medium hover:bg-white/20" title="Fit image" onClick={fitView}>Fit</button>
+                <button
+                    type="button"
+                    className="flex h-8 w-8 items-center justify-center rounded bg-white/10 text-slate-100 hover:bg-white/20"
+                    title={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+                    aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+                    onClick={toggleFullscreen}
+                >
+                    <svg className="h-4 w-4" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
+                        {isFullscreen ? (
+                            <>
+                                <path d="M8 4v4H4" />
+                                <path d="M12 4v4h4" />
+                                <path d="M8 16v-4H4" />
+                                <path d="M12 16v-4h4" />
+                            </>
+                        ) : (
+                            <>
+                                <path d="M7 3H3v4" />
+                                <path d="M13 3h4v4" />
+                                <path d="M7 17H3v-4" />
+                                <path d="M13 17h4v-4" />
+                            </>
+                        )}
+                    </svg>
+                </button>
                 {hasTextAnnotations && (
                     <>
                         <button
@@ -507,36 +1003,6 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
                         >
                             Boxes
                         </button>
-                        {hasWofAnnotations && (
-                            <button
-                                type="button"
-                                className={`h-8 rounded px-2 text-xs font-medium ${showWofAnnotations ? "bg-white/20 text-white" : "bg-white/10 text-slate-300 hover:bg-white/20"}`}
-                                title="Toggle Who's On First matches"
-                                onClick={() => setShowWofAnnotations((current) => !current)}
-                            >
-                                WOF
-                            </button>
-                        )}
-                        {hasOsmAnnotations && (
-                            <button
-                                type="button"
-                                className={`h-8 rounded px-2 text-xs font-medium ${showOsmAnnotations ? "bg-white/20 text-white" : "bg-white/10 text-slate-300 hover:bg-white/20"}`}
-                                title="Toggle OpenStreetMap matches"
-                                onClick={() => setShowOsmAnnotations((current) => !current)}
-                            >
-                                OSM
-                            </button>
-                        )}
-                        {hasGeoNamesAnnotations && (
-                            <button
-                                type="button"
-                                className={`h-8 rounded px-2 text-xs font-medium ${showGeoNamesAnnotations ? "bg-white/20 text-white" : "bg-white/10 text-slate-300 hover:bg-white/20"}`}
-                                title="Toggle GeoNames matches"
-                                onClick={() => setShowGeoNamesAnnotations((current) => !current)}
-                            >
-                                GN
-                            </button>
-                        )}
                         {hasExtractionAnnotations && (
                             <button
                                 type="button"
@@ -545,6 +1011,16 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
                                 onClick={() => setShowExtractionAnnotations((current) => !current)}
                             >
                                 OCR
+                            </button>
+                        )}
+                        {hasCandidateAnnotations && (
+                            <button
+                                type="button"
+                                className={`h-8 rounded px-2 text-xs font-medium ${showCandidateAnnotations ? "bg-white/20 text-white" : "bg-white/10 text-slate-300 hover:bg-white/20"}`}
+                                title="Toggle semantic map labels"
+                                onClick={() => setShowCandidateAnnotations((current) => !current)}
+                            >
+                                Labels
                             </button>
                         )}
                         <button
@@ -567,22 +1043,23 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
                 </div>
             )}
             {hasTextAnnotations && showTextPanel && (
-                <div data-testid="iiif-annotation-panel" className="absolute bottom-3 left-3 right-3 z-50 max-h-44 overflow-hidden rounded-md bg-slate-950/95 text-xs shadow-xl ring-1 ring-white/15 backdrop-blur sm:left-auto sm:top-3 sm:w-80 sm:max-h-none">
-                    <div className="flex items-center gap-2 border-b border-white/10 px-3 py-2">
+                <div data-testid="iiif-annotation-panel" className="absolute bottom-3 left-3 right-3 z-50 flex max-h-64 flex-col overflow-hidden rounded-md bg-slate-950/95 text-xs shadow-xl ring-1 ring-white/15 backdrop-blur sm:left-auto sm:top-3 sm:w-80 sm:max-h-none">
+                    <div className="flex flex-none items-center gap-2 border-b border-white/10 px-3 py-2">
                         <div className="font-semibold text-slate-100">{annotationPanelTitle}</div>
-                        <div className="text-slate-400">{isShowingSelectedTextOnly ? `1 / ${enabledTextAnnotations.length}` : enabledTextAnnotations.length}</div>
+                        <div className="text-slate-400">{annotationCountLabel}</div>
                         <button
                             type="button"
                             className="ml-auto rounded bg-white/10 px-2 py-1 text-[10px] font-medium text-slate-200 hover:bg-white/20 disabled:cursor-not-allowed disabled:opacity-40"
-                            disabled={!activeSelectedTextId}
-                            title={isShowingSelectedTextOnly ? "Show all text boxes" : "Show only the selected text box"}
+                            disabled={!activeSelectedListItemId}
+                            title={isShowingSelectedTextOnly ? "Show all rows" : "Show only the selected row"}
                             onClick={() => {
                                 if (isShowingSelectedTextOnly) {
                                     setShowSelectedTextOnly(false);
-                                } else if (activeSelectedTextId) {
+                                } else if (activeSelectedListItemId) {
                                     setShowSelectedTextOnly(true);
                                     setShowTextOverlay(true);
-                                    const annotation = enabledTextAnnotations.find((item) => item.id === activeSelectedTextId);
+                                    const selectedItem = annotationListItems.find((item) => item.id === activeSelectedListItemId);
+                                    const annotation = selectedItem ? preferredAnnotationForListItem(selectedItem) : activeSelectedAnnotation;
                                     if (annotation) focusTextAnnotation(annotation);
                                 }
                             }}
@@ -590,41 +1067,175 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
                             {isShowingSelectedTextOnly ? "Show All" : "Show Selected"}
                         </button>
                     </div>
-                    <div ref={annotationListRef} data-testid="iiif-annotation-list" className="max-h-36 overflow-auto sm:max-h-[calc(100%-2.25rem)]">
-                        {enabledTextAnnotations.length === 0 && (
-                            <div className="px-3 py-3 text-slate-400">No overlay layer selected.</div>
-                        )}
-                        {enabledTextAnnotations.map((annotation) => {
-                            const isSelected = activeSelectedTextId === annotation.id;
-                            return (
+                    {hasLayerControls && (
+                        <div data-testid="iiif-gazetteer-layer-controls" className="flex flex-none flex-wrap gap-1.5 border-b border-white/10 px-3 py-2">
+                            {hasCandidateAnnotations && (
                                 <button
-                                    key={annotation.id}
-                                    ref={(element) => setAnnotationEntryRef(annotation.id, element)}
                                     type="button"
-                                    data-annotation-id={annotation.id}
-                                    data-annotation-row="true"
-                                    className={`grid w-full grid-cols-[1.75rem_minmax(0,1fr)] gap-2 border-b border-white/10 px-3 py-2 text-left last:border-b-0 ${isSelected ? "bg-white/15" : "hover:bg-white/10"}`}
-                                    onClick={() => selectTextAnnotation(annotation)}
+                                    data-label-layer-toggle="candidate"
+                                    aria-pressed={showCandidateAnnotations}
+                                    className={`inline-flex items-center gap-1.5 rounded px-2 py-1 text-[10px] font-semibold ${showCandidateAnnotations ? "bg-white/20 text-white" : "bg-white/10 text-slate-300 hover:bg-white/20"}`}
+                                    title="Toggle semantic map labels"
+                                    onClick={() => setShowCandidateAnnotations((current) => !current)}
                                 >
-                                    <span
-                                        className="mt-0.5 inline-flex h-5 w-5 items-center justify-center rounded text-[10px] font-semibold text-slate-950"
-                                        style={{ backgroundColor: annotation.color }}
-                                    >
-                                        {annotation.index}
-                                    </span>
-                                    <span className="min-w-0">
-                                        <span className="line-clamp-3 whitespace-pre-wrap text-slate-100">{annotation.content}</span>
-                                        <span className="mt-1 flex flex-wrap gap-2 text-[10px] uppercase text-slate-400">
-                                            <span>{annotation.layer === "wof" ? "WOF" : annotation.layer === "osm" ? "OSM" : annotation.layer === "geonames" ? "GN" : annotation.role}</span>
-                                            {annotation.authorityId && <span>{annotation.authorityId}</span>}
-                                            {annotation.placetype && <span>{annotation.placetype}</span>}
-                                            {annotation.source === "text_group" && <span>{annotation.sourceTextIndices?.length || 0} boxes</span>}
-                                            {(annotation.source === "wof_match" || annotation.source === "osm_match" || annotation.source === "geonames_match") && (annotation.sourceTextIndices?.length || 0) > 1 && <span>{annotation.sourceTextIndices?.length || 0} boxes</span>}
-                                            {(annotation.source === "wof_match" || annotation.source === "osm_match" || annotation.source === "geonames_match") && !annotation.bbox && <span>no box</span>}
-                                            {annotation.confidence !== undefined && <span>{Math.round(annotation.confidence * 100)}%</span>}
-                                        </span>
-                                    </span>
+                                    <span className="h-2 w-2 rounded-full" style={{ backgroundColor: candidateLayerColor(textAnnotations) }} />
+                                    Labels
                                 </button>
+                            )}
+                            {hasWofAnnotations && (
+                                <button
+                                    type="button"
+                                    data-gazetteer-layer-toggle="wof"
+                                    aria-pressed={showWofAnnotations}
+                                    className={`inline-flex items-center gap-1.5 rounded px-2 py-1 text-[10px] font-semibold ${showWofAnnotations ? "bg-white/20 text-white" : "bg-white/10 text-slate-300 hover:bg-white/20"}`}
+                                    title="Toggle Who's On First matches"
+                                    onClick={() => setShowWofAnnotations((current) => !current)}
+                                >
+                                    <span className="h-2 w-2 rounded-full" style={{ backgroundColor: layerColor(textAnnotations, "wof") }} />
+                                    WOF
+                                </button>
+                            )}
+                            {hasOsmAnnotations && (
+                                <button
+                                    type="button"
+                                    data-gazetteer-layer-toggle="osm"
+                                    aria-pressed={showOsmAnnotations}
+                                    className={`inline-flex items-center gap-1.5 rounded px-2 py-1 text-[10px] font-semibold ${showOsmAnnotations ? "bg-white/20 text-white" : "bg-white/10 text-slate-300 hover:bg-white/20"}`}
+                                    title="Toggle OpenStreetMap matches"
+                                    onClick={() => setShowOsmAnnotations((current) => !current)}
+                                >
+                                    <span className="h-2 w-2 rounded-full" style={{ backgroundColor: layerColor(textAnnotations, "osm") }} />
+                                    OSM
+                                </button>
+                            )}
+                            {hasGeoNamesAnnotations && (
+                                <button
+                                    type="button"
+                                    data-gazetteer-layer-toggle="geonames"
+                                    aria-pressed={showGeoNamesAnnotations}
+                                    className={`inline-flex items-center gap-1.5 rounded px-2 py-1 text-[10px] font-semibold ${showGeoNamesAnnotations ? "bg-white/20 text-white" : "bg-white/10 text-slate-300 hover:bg-white/20"}`}
+                                    title="Toggle GeoNames matches"
+                                    onClick={() => setShowGeoNamesAnnotations((current) => !current)}
+                                >
+                                    <span className="h-2 w-2 rounded-full" style={{ backgroundColor: layerColor(textAnnotations, "geonames") }} />
+                                    GN
+                                </button>
+                            )}
+                            {hasOgmAnnotations && (
+                                <button
+                                    type="button"
+                                    data-gazetteer-layer-toggle="ogm"
+                                    aria-pressed={showOgmAnnotations}
+                                    className={`inline-flex items-center gap-1.5 rounded px-2 py-1 text-[10px] font-semibold ${showOgmAnnotations ? "bg-white/20 text-white" : "bg-white/10 text-slate-300 hover:bg-white/20"}`}
+                                    title="Toggle canonical OGM matches"
+                                    onClick={() => setShowOgmAnnotations((current) => !current)}
+                                >
+                                    <span className="h-2 w-2 rounded-full" style={{ backgroundColor: layerColor(textAnnotations, "ogm") }} />
+                                    OGM
+                                </button>
+                            )}
+                        </div>
+                    )}
+                    <div className="flex flex-none items-center gap-2 border-b border-white/10 px-3 py-2">
+                        <input
+                            data-testid="iiif-annotation-search"
+                            aria-label="Search map labels and gazetteer matches"
+                            value={annotationSearchQuery}
+                            onChange={(event) => {
+                                setAnnotationSearchQuery(event.currentTarget.value);
+                                setShowSelectedTextOnly(false);
+                            }}
+                            className="min-w-0 flex-1 rounded border border-white/10 bg-white/10 px-2 py-1 text-xs text-slate-100 placeholder:text-slate-500 focus:border-indigo-300 focus:outline-none focus:ring-1 focus:ring-indigo-300"
+                            placeholder="Search labels or matches..."
+                        />
+                        {annotationSearchQuery.trim() && (
+                            <button
+                                type="button"
+                                className="rounded bg-white/10 px-2 py-1 text-[10px] font-medium text-slate-200 hover:bg-white/20"
+                                onClick={() => {
+                                    setAnnotationSearchQuery("");
+                                    setShowSelectedTextOnly(false);
+                                }}
+                            >
+                                Clear
+                            </button>
+                        )}
+                    </div>
+                    <div ref={annotationListRef} data-testid="iiif-annotation-list" className="min-h-0 flex-1 overflow-auto">
+                        {displayedAnnotationListItems.length === 0 && (
+                            <div className="px-3 py-3 text-slate-400">
+                                {annotationSearchTerm ? "No matching labels or matches." : "No overlay layer selected."}
+                            </div>
+                        )}
+                        {annotationListSections.map((section) => {
+                            const isOpen = openAnnotationSectionIds.has(section.id);
+                            return (
+                                <div key={section.id} data-testid="iiif-annotation-section" className="border-b border-white/10 last:border-b-0">
+                                    <button
+                                        type="button"
+                                        data-testid="iiif-annotation-section-toggle"
+                                        aria-expanded={isOpen}
+                                        className="flex w-full items-center gap-2 bg-white/[0.03] px-3 py-2 text-left text-[10px] font-semibold uppercase tracking-wide text-slate-300 hover:bg-white/10"
+                                        onClick={() => toggleAnnotationSection(section.id)}
+                                    >
+                                        <span className="min-w-0 flex-1 truncate">{section.label}</span>
+                                        <span className="rounded bg-white/10 px-1.5 py-0.5 text-slate-400">{section.items.length}</span>
+                                        <span className="text-slate-500">{isOpen ? "-" : "+"}</span>
+                                    </button>
+                                    {isOpen && section.items.map((item) => {
+                                        const annotation = preferredAnnotationForListItem(item);
+                                        const isSelected = activeSelectedListItemId === item.id;
+                                        const needsGeometryReview = annotation.candidateStatus === "needs_review_geometry";
+                                        return (
+                                            <button
+                                                key={item.id}
+                                                ref={(element) => setAnnotationEntryRef(item.id, element)}
+                                                type="button"
+                                                data-testid="iiif-annotation-row"
+                                                data-annotation-id={item.id}
+                                                data-annotation-row="true"
+                                                className={`grid w-full grid-cols-[1.75rem_minmax(0,1fr)] gap-2 border-t border-white/10 px-3 py-2 text-left first:border-t-0 ${isSelected ? "bg-white/15" : "hover:bg-white/10"}`}
+                                                onClick={() => selectTextAnnotation(annotation)}
+                                            >
+                                                <span
+                                                    className="mt-0.5 inline-flex h-5 w-5 items-center justify-center rounded text-[10px] font-semibold text-slate-950"
+                                                    style={{ backgroundColor: item.color }}
+                                                >
+                                                    {item.index}
+                                                </span>
+                                                <span className="min-w-0">
+                                                    <span className="line-clamp-3 whitespace-pre-wrap text-slate-100">{item.content}</span>
+                                                    {item.isGazetteer ? (
+                                                        <span className="mt-1 flex flex-wrap gap-1.5 text-[10px] text-slate-400">
+                                                            {item.annotations.length > 1 && <span className="inline-flex whitespace-nowrap rounded bg-white/5 px-1.5 py-0.5 uppercase">{item.annotations.length} hits</span>}
+                                                            {item.annotations.map((hit) => (
+                                                                <span key={hit.id} className="inline-flex max-w-full items-center gap-1 whitespace-nowrap rounded bg-white/5 px-1.5 py-0.5 uppercase">
+                                                                    {isGazetteerLayer(hit.layer) && (
+                                                                        <span className="font-semibold" style={{ color: hit.color }}>{GAZETTEER_LAYER_LABELS[hit.layer]}</span>
+                                                                    )}
+                                                                    {hit.authorityId && <span className="max-w-28 truncate">{hit.authorityId}</span>}
+                                                                    {hit.placetype && <span>{hit.placetype}</span>}
+                                                                    {!hit.bbox && <span>no box</span>}
+                                                                    {hit.confidence !== undefined && <span>{Math.round(hit.confidence * 100)}%</span>}
+                                                                </span>
+                                                            ))}
+                                                        </span>
+                                                    ) : (
+                                                        <span className="mt-1 flex flex-wrap gap-2 text-[10px] uppercase text-slate-400">
+                                                            <span>{annotation.role}</span>
+                                                            {annotation.geometryStatus === "ocr_backed" && <span>OCR backed</span>}
+                                                            {annotation.geometryStatus === "model_projected" && (
+                                                                needsGeometryReview ? <span>needs geometry review</span> : <span>vision bbox</span>
+                                                            )}
+                                                            {annotation.source === "text_group" && <span>{annotation.sourceTextIndices?.length || 0} boxes</span>}
+                                                            {annotation.confidence !== undefined && <span>{Math.round(annotation.confidence * 100)}%</span>}
+                                                        </span>
+                                                    )}
+                                                </span>
+                                            </button>
+                                        );
+                                    })}
+                                </div>
                             );
                         })}
                     </div>

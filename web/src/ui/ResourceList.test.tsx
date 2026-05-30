@@ -4,6 +4,9 @@ import { vi, describe, it, expect, beforeEach } from 'vitest';
 import { ResourceList } from './ResourceList';
 import * as duckdbClient from '../duckdb/duckdbClient';
 import { FIXTURE_POINT } from '../test/fixtures';
+import { Resource } from '../aardvark/model';
+
+const FIXTURE_RESOURCE = FIXTURE_POINT as unknown as Resource;
 
 // Mock the duckdb client
 vi.mock('../duckdb/duckdbClient', () => ({
@@ -36,7 +39,7 @@ describe('ResourceList Component', () => {
 
     it('renders resources after fetch', async () => {
         vi.mocked(duckdbClient.searchResources).mockResolvedValue({
-            resources: [FIXTURE_POINT],
+            resources: [FIXTURE_RESOURCE],
             total: 1
         });
 
@@ -51,17 +54,17 @@ describe('ResourceList Component', () => {
 
         // Wait for loading to finish and data to appear
         await waitFor(() => {
-            expect(screen.getByText(FIXTURE_POINT.dct_title_s)).toBeDefined();
+            expect(screen.getByText(FIXTURE_RESOURCE.dct_title_s)).toBeDefined();
         });
 
-        expect(screen.getByText(FIXTURE_POINT.id)).toBeDefined();
+        expect(screen.getByText(FIXTURE_RESOURCE.id)).toBeDefined();
         expect(screen.getByText('Datasets')).toBeDefined();
         expect(screen.getByText('Public')).toBeDefined();
     });
 
     it('calls onEdit when edit button is clicked', async () => {
         vi.mocked(duckdbClient.searchResources).mockResolvedValue({
-            resources: [FIXTURE_POINT],
+            resources: [FIXTURE_RESOURCE],
             total: 1
         });
 
@@ -79,7 +82,7 @@ describe('ResourceList Component', () => {
         });
 
         fireEvent.click(screen.getByText('Edit'));
-        expect(mockOnEdit).toHaveBeenCalledWith(FIXTURE_POINT.id);
+        expect(mockOnEdit).toHaveBeenCalledWith(FIXTURE_RESOURCE.id);
     });
 
     it('handles search input', async () => {
@@ -113,7 +116,7 @@ describe('ResourceList Component', () => {
     });
     it('handles sorting', async () => {
         vi.mocked(duckdbClient.searchResources).mockResolvedValue({
-            resources: [FIXTURE_POINT],
+            resources: [FIXTURE_RESOURCE],
             total: 1
         });
 
@@ -146,7 +149,7 @@ describe('ResourceList Component', () => {
     it('handles pagination', async () => {
         vi.mocked(duckdbClient.searchResources).mockResolvedValue({
             resources: Array.from({ length: 20 }, (_, i) => ({
-                ...FIXTURE_POINT,
+                ...FIXTURE_RESOURCE,
                 id: `fixture-${i}`
             })),
             total: 30

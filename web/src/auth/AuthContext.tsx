@@ -29,6 +29,7 @@ export interface AuthState {
   user: GoogleUser | null;
   isSignedIn: boolean;
   isLoading: boolean;
+  isGoogleReady: boolean;
   error: string | null;
   signIn: () => void;
   signOut: () => void;
@@ -125,16 +126,17 @@ function waitForGoogleGis(maxMs: number = 3000): Promise<boolean> {
 const AuthContext = createContext<AuthState | null>(null);
 
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const clientId = import.meta.env.VITE_GOOGLE_CLIENT_ID as string | undefined;
+  const hasValidClientId = Boolean(clientId && clientId.includes("."));
   const [user, setUser] = useState<GoogleUser | null>(() => loadStoredProfile());
-  const [isLoading, setIsLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(hasValidClientId);
+  const [error, setError] = useState<string | null>(() => (
+    hasValidClientId ? null : "Sign-in not configured. Set VITE_GOOGLE_CLIENT_ID for the Vite build environment."
+  ));
   const [gisReady, setGisReady] = useState(false);
 
-  const clientId = import.meta.env.VITE_GOOGLE_CLIENT_ID as string | undefined;
-
   if (import.meta.env.DEV && typeof window !== "undefined") {
-    const hasClientId = Boolean(clientId && clientId.includes("."));
-    console.debug("[Auth] VITE_GOOGLE_CLIENT_ID loaded:", hasClientId ? "yes" : "no (add to web/.env and restart dev server)");
+    console.debug("[Auth] VITE_GOOGLE_CLIENT_ID loaded:", hasValidClientId ? "yes" : "no (add to web/.env and restart dev server)");
   }
 
   const handleCredential = useCallback((response: CredentialResponse) => {
@@ -144,6 +146,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         console.warn("[Auth] Sign-in blocked for non-allowed email:", parsed.email);
         setUser(null);
         clearGoogleSessionStorage();
+        window.google?.accounts?.id?.disableAutoSelect?.();
         setError("This Google account is not allowed to access this app.");
         return;
       }
@@ -156,13 +159,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }, []);
 
   useEffect(() => {
-    if (!clientId || typeof clientId !== "string" || !clientId.includes(".")) {
-      setIsLoading(false);
-      setGisReady(false);
-      setError("Sign-in not configured. Set VITE_GOOGLE_CLIENT_ID for the Vite build environment.");
-      return;
-    }
-    setError(null);
+    if (!hasValidClientId || !clientId) return;
     let cancelled = false;
     const timeout = window.setTimeout(() => {
       if (!cancelled) {
@@ -204,7 +201,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       cancelled = true;
       window.clearTimeout(timeout);
     };
-  }, [clientId, handleCredential]);
+  }, [clientId, handleCredential, hasValidClientId]);
 
   const signIn = useCallback(() => {
     if (!gisReady || !window.google?.accounts?.id) {
@@ -216,12 +213,21 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       return;
     }
     setError(null);
-    window.google.accounts.id.prompt();
+    window.google.accounts.id.prompt((notification) => {
+      if (notification.isNotDisplayed()) {
+        const reason = notification.getNotDisplayedReason?.();
+        setError(reason ? `Google Sign-In prompt was not displayed (${reason}). Use the Google sign-in button instead.` : "Google Sign-In prompt was not displayed. Use the Google sign-in button instead.");
+      } else if (notification.isSkippedMoment()) {
+        const reason = notification.getSkippedReason?.();
+        setError(reason ? `Google Sign-In prompt was skipped (${reason}). Use the Google sign-in button instead.` : "Google Sign-In prompt was skipped. Use the Google sign-in button instead.");
+      }
+    });
   }, [gisReady, clientId]);
 
   const signOut = useCallback(() => {
     setUser(null);
     clearGoogleSessionStorage();
+    window.google?.accounts?.id?.disableAutoSelect?.();
     setError(null);
   }, []);
 
@@ -229,6 +235,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     user,
     isSignedIn: !!user,
     isLoading,
+    isGoogleReady: gisReady,
     error,
     signIn,
     signOut,

@@ -2,6 +2,18 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import Fuse from "fuse.js";
+import {
+  buildGazetteerSpatialFilter,
+  gazetteerSpatialFilterSummary,
+  recordMatchesGazetteerSpatialFilter,
+} from "./gazetteer-spatial-scope.mjs";
+import {
+  buildMapTextEvidenceIndex,
+  mapTextEntriesLookLikeDistinctPhrase,
+  matchEligibleMapTextEntry,
+  textBackedPlacenameEvidence,
+  withMapTextEvidence,
+} from "./map-text-evidence.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_INDEX_PATH = path.resolve(__dirname, "../.cache/gazetteers/wof/index.ndjson");
@@ -134,21 +146,39 @@ function withGazetteerMatch(place, match) {
 
 function withoutGazetteerProvider(place, provider) {
   if (!Array.isArray(place?.gazetteerMatches)) return place;
+  const gazetteerMatches = place.gazetteerMatches.filter((match) => String(match?.provider || match?.authority || "").toLowerCase() !== provider);
+  const next = { ...place };
+  if (gazetteerMatches.length > 0) {
+    next.gazetteerMatches = gazetteerMatches;
+  } else {
+    delete next.gazetteerMatches;
+  }
   return withoutUndefined({
-    ...place,
-    gazetteerMatches: place.gazetteerMatches.filter((match) => String(match?.provider || match?.authority || "").toLowerCase() !== provider),
+    ...next,
+  });
+}
+
+function geocodingLooksWof(geocoding) {
+  if (!geocoding || typeof geocoding !== "object") return false;
+  return (Array.isArray(geocoding.candidates) ? geocoding.candidates : []).some((candidate) => {
+    if (!candidate || typeof candidate !== "object") return false;
+    return candidate.wofId || String(candidate.uri || "").includes("whosonfirst.org");
   });
 }
 
 function withoutWofConcordance(place) {
   const cleaned = withoutGazetteerProvider(place, "whosonfirst");
   const authority = String(cleaned?.authority || "").toLowerCase();
-  if (authority !== "whosonfirst" && authority !== "wof") return cleaned;
   const next = { ...cleaned };
-  delete next.authority;
-  delete next.authorityId;
-  delete next.uri;
-  delete next.coordinates;
+  if (authority === "whosonfirst" || authority === "wof") {
+    delete next.authority;
+    delete next.authorityId;
+    delete next.uri;
+    delete next.coordinates;
+  }
+  if (authority === "whosonfirst" || authority === "wof" || geocodingLooksWof(next.geocoding)) {
+    delete next.geocoding;
+  }
   return withoutUndefined(next);
 }
 
@@ -220,6 +250,26 @@ function tokenOverlapScore(a, b) {
   return overlap / Math.max(aTokens.size, bTokens.size);
 }
 
+function distinctiveTokenSet(value) {
+  return new Set(normalizedTokens(value).filter((token) => token.length >= 3 && !GENERIC_FEATURE_TOKENS.has(token)));
+}
+
+function distinctiveTokenAlignment(evidence, candidate) {
+  if (candidate.exact || candidate.lexicalScore >= 0.99) {
+    return { supported: true, overlap: 1, missing: [], extra: [] };
+  }
+  const evidenceTokens = distinctiveTokenSet(evidence.normalized || evidence.label);
+  const candidateTokens = distinctiveTokenSet(candidate.variant?.normalized || candidate.record?.name);
+  if (evidenceTokens.size === 0 || candidateTokens.size === 0) {
+    return { supported: false, overlap: 0, missing: Array.from(evidenceTokens), extra: Array.from(candidateTokens) };
+  }
+  const missing = Array.from(evidenceTokens).filter((token) => !candidateTokens.has(token));
+  const extra = Array.from(candidateTokens).filter((token) => !evidenceTokens.has(token));
+  const overlap = (evidenceTokens.size - missing.length) / Math.max(evidenceTokens.size, candidateTokens.size);
+  const supported = missing.length === 0 && extra.length === 0;
+  return { supported, overlap, missing, extra };
+}
+
 function levenshteinDistance(a, b) {
   if (a === b) return 0;
   if (!a) return b.length;
@@ -250,12 +300,22 @@ function editSimilarity(a, b) {
 function sourceWeight(source) {
   const label = String(source || "").toLowerCase();
   if (!label) return 0.78;
+  if (!sourceSearchableByDefault(label)) return 0.42;
   if (label.includes("preferred") || label.endsWith("_p") || label.endsWith("-p") || label === "wof:name") return 1;
   if (label.includes("variant") || label.endsWith("_v") || label.endsWith("-v")) return 0.88;
   if (label.includes("historical") || label.includes("historic") || label.endsWith("_h") || label.endsWith("-h")) return 0.84;
   if (label.includes("colloquial") || label.endsWith("_s") || label.endsWith("-s")) return 0.78;
   if (label.includes("abbrev") || label.endsWith("_a") || label.endsWith("-a")) return 0.68;
   return 0.8;
+}
+
+function sourceSearchableByDefault(source) {
+  const label = String(source || "").toLowerCase();
+  if (!label) return true;
+  if (label === "wof:name" || label.startsWith("wof:")) return true;
+  const languageSource = label.match(/^(?:name|names|fullname):([a-z]{2,3})(?:_|$)/);
+  if (!languageSource) return true;
+  return languageSource[1] === "eng" || languageSource[1] === "en";
 }
 
 function compactNumber(value) {
@@ -326,6 +386,7 @@ function normalizeNameVariant(item, fallbackSource = "wof:name") {
     normalized,
     source,
     weight: sourceWeight(source),
+    searchable: sourceSearchableByDefault(source),
   };
 }
 
@@ -365,7 +426,7 @@ function normalizeWofRecord(record) {
   const country = String(record.country || "").trim().toUpperCase();
   const region = String(record.region || record.regionCode || record.region_code || "").trim().toUpperCase();
   const hierarchyLabels = normalizeHierarchyLabels(record);
-  const normalizedNameSet = new Set(uniqueVariants.map((variant) => variant.normalized));
+  const normalizedNameSet = new Set(uniqueVariants.filter((variant) => variant.searchable !== false).map((variant) => variant.normalized));
   return {
     wofId,
     name: name || uniqueVariants[0]?.display,
@@ -441,6 +502,7 @@ function loadMatcher() {
     const byName = new Map();
     for (const record of records) {
       for (const variant of record.normalizedNames) {
+        if (variant.searchable === false) continue;
         if (!byName.has(variant.normalized)) byName.set(variant.normalized, []);
         byName.get(variant.normalized).push({ record, variant, exact: true });
       }
@@ -483,9 +545,43 @@ function loadMatcher() {
   }
 }
 
+function scopedWofMatcher(matcher, filter) {
+  if (!filter?.bbox || !matcher.available) return { matcher, summary: undefined };
+  const records = matcher.records.filter((record) => recordMatchesGazetteerSpatialFilter(record, filter));
+  const summary = gazetteerSpatialFilterSummary(filter, matcher.recordCount || matcher.records.length, records.length);
+  if (records.length === 0 || records.length === matcher.records.length) return { matcher, summary };
+  const byName = new Map();
+  for (const record of records) {
+    for (const variant of record.normalizedNames) {
+      if (variant.searchable === false) continue;
+      if (!byName.has(variant.normalized)) byName.set(variant.normalized, []);
+      byName.get(variant.normalized).push({ record, variant, exact: true });
+    }
+  }
+  return {
+    matcher: {
+      ...matcher,
+      records,
+      byName,
+      fuse: new Fuse(records, {
+        includeScore: true,
+        ignoreLocation: true,
+        minMatchCharLength: 3,
+        threshold: 0.36,
+        keys: [
+          { name: "searchNames", weight: 0.9 },
+          { name: "name", weight: 0.1 },
+        ],
+      }),
+    },
+    summary,
+  };
+}
+
 function bestVariantForQuery(record, query) {
   let best = null;
-  for (const variant of record.normalizedNames) {
+  const variants = record.normalizedNames.filter((variant) => variant.searchable !== false);
+  for (const variant of variants.length > 0 ? variants : record.normalizedNames) {
     const exact = variant.normalized === query;
     const overlap = tokenOverlapScore(query, variant.normalized);
     const edit = editSimilarity(query, variant.normalized);
@@ -525,21 +621,17 @@ function candidateRecords(matcher, query, { exactOnly = false, expectedWofId } =
   return Array.from(candidates.values());
 }
 
-function evidenceFromPlacename(place) {
-  const normalized = normalizeWofText(place?.name || place?.normalizedName);
+function evidenceFromPlacename(place, textEvidenceIndex) {
+  const label = String(place?.name || place?.normalizedName || "").trim();
+  const normalized = normalizeWofText(label);
   if (!normalized) return null;
-  return {
-    id: place.id,
-    label: place.name,
-    normalized,
+  return textBackedPlacenameEvidence(place, {
+    normalize: normalizeWofText,
+    labelCandidates: [label, place?.normalizedName],
+    textEvidenceIndex,
     type: inferredPlacenameType(place, normalized),
-    confidence: Number.isFinite(Number(place.confidence)) ? Number(place.confidence) : 0.72,
-    sourceKind: "derived_placename",
-    sourceTextIds: place.sourceTextIds || [],
-    sourceTextIndices: place.sourceTextIndices || [],
-    approxBbox: place.approxBbox,
-    sourceCallId: place.sourceCallId,
-  };
+    confidence: Number.isFinite(Number(place?.confidence)) ? Number(place.confidence) : 0.72,
+  });
 }
 
 function inferredPlacenameType(place, normalized) {
@@ -568,7 +660,7 @@ function usefulSupplementalLabel(label) {
 
 function segmentLooksPhraseUseful(text) {
   const role = String(text?.role || "");
-  if (["date", "scale", "street"].includes(role)) return false;
+  if (["date", "elevation", "scale", "street"].includes(role)) return false;
   const label = cleanSupplementalLabel(text?.content);
   const normalized = normalizeWofText(label);
   if (!normalized || normalized.length > 36) return false;
@@ -590,81 +682,8 @@ function mergedTextBbox(items) {
   ].map((value) => Math.round(value * 1_000_000) / 1_000_000);
 }
 
-function textBboxCenter(item) {
-  const box = item?.approxBbox;
-  if (!Array.isArray(box) || box.length < 4) return null;
-  const values = box.map((value) => Number(value));
-  if (values.some((value) => !Number.isFinite(value))) return null;
-  return {
-    x: (values[0] + values[2]) / 2,
-    y: (values[1] + values[3]) / 2,
-    width: Math.abs(values[2] - values[0]),
-    height: Math.abs(values[3] - values[1]),
-  };
-}
-
-function primarySourceTextIndex(item) {
-  const indices = (item?.sourceTextIndices || [])
-    .map((index) => Number(index))
-    .filter((index) => Number.isInteger(index));
-  return indices.length > 0 ? Math.min(...indices) : Number.NaN;
-}
-
-function tokenScanMatchesLookCoherent(tokens, matches) {
-  if (matches.length !== tokens.length || matches.length < 2) return false;
-  const indices = matches.map(primarySourceTextIndex);
-  if (indices.some((index) => !Number.isFinite(index))) return false;
-  for (let index = 1; index < indices.length; index += 1) {
-    if (indices[index] <= indices[index - 1]) return false;
-  }
-  const indexSpan = Math.max(...indices) - Math.min(...indices);
-  if (indexSpan > Math.max(12, tokens.length * 8)) return false;
-
-  const centers = matches.map(textBboxCenter);
-  if (centers.some((center) => !center)) return false;
-  const bbox = mergedTextBbox(matches);
-  if (!bbox) return false;
-  const width = Math.max(0, bbox[2] - bbox[0]);
-  const height = Math.max(0, bbox[3] - bbox[1]);
-  if (width > 0.14 || height > 0.14 || width * height > 0.008) return false;
-
-  const medianHeight = centers
-    .map((center) => center.height)
-    .sort((a, b) => a - b)[Math.floor(centers.length / 2)] || 0;
-  const maxStep = Math.max(0.065, medianHeight * 18);
-  for (let index = 1; index < centers.length; index += 1) {
-    const previous = centers[index - 1];
-    const current = centers[index];
-    if (Math.hypot(current.x - previous.x, current.y - previous.y) > maxStep) return false;
-  }
-  return true;
-}
-
-function coherentTokenScanMatches(tokens, tokenOccurrences) {
-  const occurrenceSets = tokens.map((token) => (tokenOccurrences.get(token) || []).slice(0, 20));
-  if (occurrenceSets.some((items) => items.length === 0)) return null;
-  let best = null;
-  const walk = (tokenIndex, selected) => {
-    if (tokenIndex === occurrenceSets.length) {
-      if (!tokenScanMatchesLookCoherent(tokens, selected)) return;
-      const bbox = mergedTextBbox(selected);
-      const area = bbox ? Math.max(0, bbox[2] - bbox[0]) * Math.max(0, bbox[3] - bbox[1]) : 1;
-      const indices = selected.map(primarySourceTextIndex);
-      const indexSpan = Math.max(...indices) - Math.min(...indices);
-      const confidence = selected.reduce((sum, item) => sum + Number(item.confidence || 0), 0) / selected.length;
-      const score = confidence - area * 2 - indexSpan * 0.002;
-      if (!best || score > best.score) best = { matches: selected, score };
-      return;
-    }
-    for (const occurrence of occurrenceSets[tokenIndex]) {
-      walk(tokenIndex + 1, [...selected, occurrence]);
-    }
-  };
-  walk(0, []);
-  return best?.matches || null;
-}
-
 function phraseItemsLookCoherent(items) {
+  if (!mapTextEntriesLookLikeDistinctPhrase(items)) return false;
   const indices = items
     .map((item) => Number(item.legacyIndex))
     .filter((index) => Number.isInteger(index));
@@ -685,7 +704,9 @@ function phraseEvidenceFromTextSegments(textSegments, seen) {
   const items = (Array.isArray(textSegments) ? textSegments : [])
     .filter((text) => {
       const confidence = Number.isFinite(Number(text?.confidence)) ? Number(text.confidence) : 0;
-      return confidence >= phraseConfidence && segmentLooksPhraseUseful(text);
+      return confidence >= phraseConfidence
+        && matchEligibleMapTextEntry(text, { kind: "text_segment", minConfidence: phraseConfidence })
+        && segmentLooksPhraseUseful(text);
     })
     .sort((a, b) => Number(a.legacyIndex ?? 0) - Number(b.legacyIndex ?? 0));
   const evidence = [];
@@ -731,19 +752,22 @@ function evidenceSortScore(evidence) {
   return score;
 }
 
-function supplementalEvidence({ textGroups = [], textSegments = [], existingNames }) {
+function supplementalEvidence({ textGroups = [], textSegments = [], existingNames, textEvidenceIndex }) {
   const limit = Math.max(0, envNumber("ENRICHMENT_PROXY_WOF_SUPPLEMENTAL_LIMIT", DEFAULT_SUPPLEMENTAL_LIMIT));
   const textConfidence = clamp(envNumber("ENRICHMENT_PROXY_WOF_TEXT_CONFIDENCE", DEFAULT_TEXT_CONFIDENCE));
+  const indexedGroupIds = new Set((textEvidenceIndex?.groups || []).map((entry) => String(entry.id || "")).filter(Boolean));
+  const eligibleGroupIds = new Set((textEvidenceIndex?.matchGroups || []).map((entry) => String(entry.id || "")).filter(Boolean));
   const evidence = [];
   const seen = new Set(existingNames);
   for (const group of textGroups) {
+    if (group?.id && indexedGroupIds.has(String(group.id)) && !eligibleGroupIds.has(String(group.id))) continue;
     const label = cleanSupplementalLabel(group?.content);
     const normalized = normalizeWofText(label);
     const role = String(group?.role || "");
     if (seen.has(normalized) || !usefulSupplementalLabel(label)) continue;
-    if (["coordinate", "date", "scale", "street"].includes(role)) continue;
+    if (["coordinate", "date", "elevation", "scale", "street"].includes(role)) continue;
     const confidence = Number.isFinite(Number(group?.confidence)) ? Number(group.confidence) : 0.7;
-    if (confidence < 0.68) continue;
+    if (!matchEligibleMapTextEntry(group, { kind: "text_group", minConfidence: 0.68 }) || confidence < 0.68) continue;
     seen.add(normalized);
     evidence.push({
       label,
@@ -763,8 +787,9 @@ function supplementalEvidence({ textGroups = [], textSegments = [], existingName
     const normalized = normalizeWofText(label);
     const role = String(text?.role || "");
     if (seen.has(normalized) || !usefulSupplementalLabel(label)) continue;
-    if (["coordinate", "date", "scale", "street"].includes(role)) continue;
+    if (["coordinate", "date", "elevation", "scale", "street"].includes(role)) continue;
     const confidence = Number.isFinite(Number(text?.confidence)) ? Number(text.confidence) : 0.5;
+    if (!matchEligibleMapTextEntry(text, { kind: "text_segment", minConfidence: 0 })) continue;
     if (confidence < textConfidence && role !== "title") continue;
     seen.add(normalized);
     evidence.push({
@@ -908,6 +933,7 @@ function placetypeCompatibility(record, evidence) {
     country: new Set(["country", "dependency"]),
     county: new Set(["county", "macrocounty"]),
     landmark: new Set(["venue", "campus", "locality", "neighbourhood"]),
+    landform: new Set(["venue"]),
     mountain: new Set(["venue"]),
     neighborhood: new Set(["neighbourhood", "macrohood", "microhood", "borough", "locality"]),
     park: new Set(["venue", "campus", "neighbourhood", "locality"]),
@@ -975,6 +1001,7 @@ function scoreCandidate(candidate, evidence, context, mapExtent) {
   const source = sourceEvidenceScore(evidence);
   const nameSource = candidate.variant?.weight ?? 0.78;
   const current = candidate.record.isCurrent === false || candidate.record.isDeprecated || candidate.record.isSuperseded ? 0.36 : 1;
+  const distinctive = distinctiveTokenAlignment(evidence, { ...candidate, lexicalScore: lexical.score });
   let score = (
     lexical.score * 0.45
     + nameSource * 0.09
@@ -990,8 +1017,12 @@ function scoreCandidate(candidate, evidence, context, mapExtent) {
     ...candidate,
     score: clamp(score),
     lexicalScore: lexical.score,
+    distinctiveTokenAlignment: distinctive,
     evidence: [
       ...lexical.evidence,
+      !distinctive.supported && lexical.score < 0.99 && distinctive.missing.length + distinctive.extra.length > 0
+        ? "distinctive map tokens diverged from WOF name"
+        : undefined,
       ...type.evidence,
       ...spatial.evidence,
       ...hierarchy.matches.map((match) => `context matched ${match}`),
@@ -1004,7 +1035,7 @@ function weakSupplementalVenueMatch(record, evidence) {
   if (!["venue", "campus"].includes(record.placetype)) return false;
   if (recordLooksParkish(record) || phraseHasFeatureCue(evidence.normalized)) return false;
   if (["derived_placename", "text_group", "wof_boundary_text_group"].includes(evidence.sourceKind)) return false;
-  return ["extracted_map_text", "extracted_map_text_phrase", "wof_boundary_exact_text", "wof_boundary_text_scan"].includes(evidence.sourceKind);
+  return ["extracted_map_text", "extracted_map_text_phrase", "wof_boundary_exact_text"].includes(evidence.sourceKind);
 }
 
 function applyAmbiguityPenalty(scored) {
@@ -1071,16 +1102,19 @@ function matchEvidence(matcher, evidence, context, mapExtent, options = {}) {
     ? 0.01
     : 0.055;
   const selected = top && top.score >= selectedThreshold && margin >= requiredMargin ? top : null;
-  const status = selected
+  const distinctiveSelected = selected && (selected.lexicalScore >= 0.99 || selected.distinctiveTokenAlignment?.supported)
+    ? selected
+    : null;
+  const status = distinctiveSelected
     ? "matched"
     : top && top.score >= ambiguousThreshold ? "ambiguous" : "unmatched";
   return {
     status,
-    selected,
-    confidence: selected ? selected.score : top ? top.score : 0,
+    selected: distinctiveSelected,
+    confidence: distinctiveSelected ? distinctiveSelected.score : top ? top.score : 0,
     candidates: candidates.slice(0, candidateLimit).map(candidatePayload),
-    matchType: selected
-      ? selected.lexicalScore >= 0.99 ? "exact_contextual" : "fuzzy_contextual"
+    matchType: distinctiveSelected
+      ? distinctiveSelected.lexicalScore >= 0.99 ? "exact_contextual" : "fuzzy_contextual"
       : status,
   };
 }
@@ -1105,7 +1139,7 @@ function boundaryCandidateSortValue(item) {
   const record = item.match.selected?.record;
   if (!record?.bbox) return Number.POSITIVE_INFINITY;
   const priority = BOUNDARY_PLACETYPE_PRIORITY.get(record.placetype) ?? 10;
-  return priority * 1_000_000 + bboxArea(record.bbox);
+  return priority * 1_000_000 - bboxArea(record.bbox);
 }
 
 function boundaryFromPrimaryMatches(primaryMatches) {
@@ -1130,58 +1164,6 @@ function recordInsideBoundary(record, boundary) {
   return bboxIntersects(record.bbox, boundary.bbox);
 }
 
-function tokenOccurrencesFromOcr({ textGroups = [], textSegments = [] }) {
-  const occurrences = new Map();
-  const addOccurrence = ({ label, sourceKind, sourceTextIds = [], sourceTextIndices = [], approxBbox, confidence = 0.5, sourceCallId }) => {
-    const normalized = normalizeWofText(cleanSupplementalLabel(label));
-    if (!normalized) return;
-    for (const token of normalized.split(/\s+/).filter((item) => item.length >= 3 && !PHRASE_STOP_TOKENS.has(item))) {
-      if (!occurrences.has(token)) occurrences.set(token, []);
-      occurrences.get(token).push({
-        token,
-        label,
-        sourceKind,
-        sourceTextIds,
-        sourceTextIndices,
-        approxBbox,
-        confidence: clamp(Number(confidence || 0)),
-        sourceCallId,
-      });
-    }
-  };
-  for (const group of textGroups || []) {
-    const role = String(group?.role || "");
-    if (["date", "scale", "street"].includes(role)) continue;
-    const confidence = Number.isFinite(Number(group?.confidence)) ? Number(group.confidence) : 0.6;
-    if (confidence < 0.68) continue;
-    addOccurrence({
-      label: group?.content,
-      sourceKind: "text_group",
-      sourceTextIds: group?.sourceTextIds || [],
-      sourceTextIndices: group?.sourceTextIndices || [],
-      approxBbox: group?.approxBbox,
-      confidence,
-      sourceCallId: group?.sourceCallId,
-    });
-  }
-  for (const text of textSegments || []) {
-    if (!segmentLooksPhraseUseful(text)) continue;
-    const confidence = Number.isFinite(Number(text?.confidence)) ? Number(text.confidence) : 0.5;
-    if (confidence < 0.72) continue;
-    addOccurrence({
-      label: text?.content,
-      sourceKind: "extracted_map_text",
-      sourceTextIds: [text?.id].filter(Boolean),
-      sourceTextIndices: Number.isInteger(Number(text?.legacyIndex)) ? [Number(text.legacyIndex)] : [],
-      approxBbox: text?.approxBbox,
-      confidence,
-      sourceCallId: text?.sourceCallId,
-    });
-  }
-  for (const values of occurrences.values()) values.sort((a, b) => b.confidence - a.confidence);
-  return occurrences;
-}
-
 function exactEvidenceByNormalized(evidences) {
   const byNormalized = new Map();
   for (const evidence of evidences) {
@@ -1201,9 +1183,10 @@ function variantLooksBoundaryScannable(record, variant) {
   return BOUNDARY_SCAN_PLACETYPES.has(record.placetype);
 }
 
-function boundaryEvidenceForRecord(record, { exactByNormalized, tokenOccurrences }) {
+function boundaryEvidenceForRecord(record, { exactByNormalized }) {
   const variants = record.normalizedNames
     .filter((variant) => variant?.normalized)
+    .filter((variant) => variant.searchable !== false)
     .sort((a, b) => b.weight - a.weight || b.normalized.length - a.normalized.length);
   for (const variant of variants) {
     if (!variantLooksBoundaryScannable(record, variant)) continue;
@@ -1217,23 +1200,6 @@ function boundaryEvidenceForRecord(record, { exactByNormalized, tokenOccurrences
         confidence: clamp((Number(exact.confidence || 0.75) * 0.9) + (variant.weight * 0.1)),
       };
     }
-    const tokens = variant.normalized.split(/\s+/).filter((token) => token.length >= 3 && !PHRASE_STOP_TOKENS.has(token));
-    const matches = coherentTokenScanMatches(tokens, tokenOccurrences);
-    if (!matches) continue;
-    const sourceTextIds = Array.from(new Set(matches.flatMap((item) => item.sourceTextIds || [])));
-    const sourceTextIndices = Array.from(new Set(matches.flatMap((item) => item.sourceTextIndices || []))).sort((a, b) => a - b);
-    const confidence = matches.reduce((sum, item) => sum + Number(item.confidence || 0), 0) / matches.length;
-    return {
-      label: variant.display,
-      normalized: variant.normalized,
-      type: undefined,
-      confidence: clamp((confidence * 0.84) + (variant.weight * 0.1) + 0.04),
-      sourceKind: "wof_boundary_text_scan",
-      sourceTextIds,
-      sourceTextIndices,
-      approxBbox: mergedTextBbox(matches),
-      sourceCallId: matches.find((item) => item.sourceCallId)?.sourceCallId,
-    };
   }
   return null;
 }
@@ -1242,14 +1208,15 @@ function boundaryScopedSupplementalEvidence({ matcher, boundary, textGroups, tex
   if (!boundary?.bbox) return [];
   const limit = Math.max(0, envNumber("ENRICHMENT_PROXY_WOF_BOUNDARY_SCAN_LIMIT", DEFAULT_BOUNDARY_SCAN_LIMIT));
   const exactByNormalized = exactEvidenceByNormalized(supplementalEvidences);
-  const tokenOccurrences = tokenOccurrencesFromOcr({ textGroups, textSegments });
+  void textGroups;
+  void textSegments;
   return matcher.records
     .filter((record) => !existingAuthorityIds.has(record.wofId))
     .filter((record) => BOUNDARY_SCAN_PLACETYPES.has(record.placetype) || phraseHasFeatureCue(record.normalizedName))
     .filter((record) => recordInsideBoundary(record, boundary))
     .slice(0, limit)
     .map((record) => {
-      const evidence = boundaryEvidenceForRecord(record, { exactByNormalized, tokenOccurrences });
+      const evidence = boundaryEvidenceForRecord(record, { exactByNormalized });
       return evidence ? { evidence, expectedWofId: record.wofId } : null;
     })
     .filter(Boolean);
@@ -1390,6 +1357,7 @@ function summaryFromCounts(matcher, counts, extra = {}) {
     matched: counts.matched,
     ambiguous: counts.ambiguous,
     unmatched: counts.unmatched,
+    textUnsupportedPlacenames: counts.textUnsupported,
     supplementalPlacenames: counts.supplemental,
     boundarySupplementalPlacenames: counts.boundarySupplemental,
     attribution: "Contains information from Who's On First. Follow WOF license and attribution requirements when surfacing concordance data.",
@@ -1397,17 +1365,29 @@ function summaryFromCounts(matcher, counts, extra = {}) {
   });
 }
 
-export function buildWofConcordanceLayer({ placenames = [], textGroups = [], textSegments = [], extraction = {}, resource = {}, mapExtent = {} } = {}) {
+export function buildWofConcordanceLayer({
+  placenames = [],
+  textGroups = [],
+  textSegments = [],
+  extraction = {},
+  resource = {},
+  mapExtent = {},
+  includeSupplemental = true,
+} = {}) {
   const matcher = loadMatcher();
   if (!matcher.available) {
     return {
       placenames,
-      extension: summaryFromCounts(matcher, { matched: 0, ambiguous: 0, unmatched: 0, supplemental: 0, boundarySupplemental: 0 }, matcher.error ? { error: matcher.error } : {}),
+      extension: summaryFromCounts(matcher, { matched: 0, ambiguous: 0, unmatched: 0, textUnsupported: 0, supplemental: 0, boundarySupplemental: 0 }, matcher.error ? { error: matcher.error } : {}),
     };
   }
 
+  const initialScope = scopedWofMatcher(matcher, buildGazetteerSpatialFilter({ mapExtent, resource }));
+  let activeMatcher = initialScope.matcher;
+  let activeSpatialSummary = initialScope.summary;
   const context = buildContext({ resource, extraction, textGroups, textSegments });
-  const counts = { matched: 0, ambiguous: 0, unmatched: 0, supplemental: 0, boundarySupplemental: 0 };
+  const textEvidenceIndex = buildMapTextEvidenceIndex({ textGroups, textSegments, normalize: normalizeWofText });
+  const counts = { matched: 0, ambiguous: 0, unmatched: 0, textUnsupported: 0, supplemental: 0, boundarySupplemental: 0 };
   const existingNames = new Set();
   const existingAuthorityIds = new Set();
   const enriched = [];
@@ -1415,29 +1395,34 @@ export function buildWofConcordanceLayer({ placenames = [], textGroups = [], tex
   const primaryReview = [];
 
   for (const place of placenames) {
-    const evidence = evidenceFromPlacename(place);
+    const evidence = evidenceFromPlacename(place, textEvidenceIndex);
     if (!evidence) {
-      enriched.push(place);
+      counts.textUnsupported += 1;
+      enriched.push(withoutWofConcordance(place));
       continue;
     }
     existingNames.add(evidence.normalized);
-    const match = matchEvidence(matcher, evidence, context, mapExtent);
+    const match = matchEvidence(activeMatcher, evidence, context, mapExtent);
     counts[match.status] += 1;
-    const enrichedPlace = applyMatchToPlacename(place, match);
+    const evidencePlace = withMapTextEvidence(place, evidence);
+    const enrichedPlace = applyMatchToPlacename(evidencePlace, match);
     if (enrichedPlace.authority === "whosonfirst" && enrichedPlace.authorityId) {
       existingAuthorityIds.add(enrichedPlace.authorityId);
       primaryMatches.push({ place: enrichedPlace, match });
     } else {
-      primaryReview.push({ index: enriched.length, place, evidence, match });
+      primaryReview.push({ index: enriched.length, place: evidencePlace, evidence, match });
     }
     enriched.push(enrichedPlace);
   }
 
   const boundary = boundaryFromPrimaryMatches(primaryMatches);
   const effectiveMapExtent = effectiveMapExtentFromBoundary(mapExtent, boundary);
+  const effectiveScope = scopedWofMatcher(matcher, buildGazetteerSpatialFilter({ mapExtent: effectiveMapExtent, resource, boundary }));
+  activeMatcher = effectiveScope.matcher;
+  activeSpatialSummary = effectiveScope.summary || activeSpatialSummary;
   if (boundary) {
     for (const item of primaryReview) {
-      const rematch = matchEvidence(matcher, item.evidence, context, effectiveMapExtent);
+      const rematch = matchEvidence(activeMatcher, item.evidence, context, effectiveMapExtent);
       if (rematch.status !== "matched" || !rematch.selected?.record?.wofId) continue;
       counts[item.match.status] -= 1;
       counts.matched += 1;
@@ -1447,59 +1432,65 @@ export function buildWofConcordanceLayer({ placenames = [], textGroups = [], tex
       primaryMatches.push({ place: enrichedPlace, match: rematch });
     }
   }
-  const supplementalEvidences = supplementalEvidence({ textGroups, textSegments, existingNames });
-  const supplementalByWofId = new Map();
-  const supplementalByNormalized = new Map();
-  const addSupplementalItem = ({ evidence, expectedWofId, source }) => {
-    const match = matchEvidence(matcher, evidence, context, effectiveMapExtent, {
-      exactOnly: Boolean(expectedWofId) || supplementalExactOnly(matcher),
-      expectedWofId,
-    });
-    if (!match.selected?.record?.wofId) return;
-    const wofId = match.selected.record.wofId;
-    if (expectedWofId && expectedWofId !== wofId) return;
-    if (existingAuthorityIds.has(wofId)) return;
-    const item = { evidence, match, source };
-    const normalizedKey = evidence.normalized || normalizeWofText(evidence.label);
-    const existingForLabel = supplementalByNormalized.get(normalizedKey);
-    if (existingForLabel && !betterSupplementalMatch(item, existingForLabel)) return;
-    if (existingForLabel?.match?.selected?.record?.wofId) {
-      supplementalByWofId.delete(existingForLabel.match.selected.record.wofId);
+  if (includeSupplemental) {
+    const supplementalEvidences = supplementalEvidence({ textGroups, textSegments, existingNames, textEvidenceIndex });
+    const supplementalByWofId = new Map();
+    const supplementalByNormalized = new Map();
+    const addSupplementalItem = ({ evidence, expectedWofId, source }) => {
+      const match = matchEvidence(activeMatcher, evidence, context, effectiveMapExtent, {
+        exactOnly: Boolean(expectedWofId) || supplementalExactOnly(matcher),
+        expectedWofId,
+      });
+      if (!match.selected?.record?.wofId) return;
+      const wofId = match.selected.record.wofId;
+      if (expectedWofId && expectedWofId !== wofId) return;
+      if (existingAuthorityIds.has(wofId)) return;
+      const item = { evidence, match, source };
+      const normalizedKey = evidence.normalized || normalizeWofText(evidence.label);
+      const existingForLabel = supplementalByNormalized.get(normalizedKey);
+      if (existingForLabel && !betterSupplementalMatch(item, existingForLabel)) return;
+      if (existingForLabel?.match?.selected?.record?.wofId) {
+        supplementalByWofId.delete(existingForLabel.match.selected.record.wofId);
+      }
+      const existing = supplementalByWofId.get(wofId);
+      if (!existing || betterSupplementalMatch(item, existing)) {
+        supplementalByWofId.set(wofId, item);
+        supplementalByNormalized.set(normalizedKey, item);
+      }
+    };
+    for (const evidence of supplementalEvidences) {
+      addSupplementalItem({ evidence, source: "evidence" });
     }
-    const existing = supplementalByWofId.get(wofId);
-    if (!existing || betterSupplementalMatch(item, existing)) {
-      supplementalByWofId.set(wofId, item);
-      supplementalByNormalized.set(normalizedKey, item);
+    for (const item of boundaryScopedSupplementalEvidence({
+      matcher: activeMatcher,
+      boundary,
+      textGroups,
+      textSegments,
+      supplementalEvidences,
+      existingAuthorityIds,
+    })) {
+      addSupplementalItem({ ...item, source: "boundary" });
     }
-  };
-  for (const evidence of supplementalEvidences) {
-    addSupplementalItem({ evidence, source: "evidence" });
-  }
-  for (const item of boundaryScopedSupplementalEvidence({
-    matcher,
-    boundary,
-    textGroups,
-    textSegments,
-    supplementalEvidences,
-    existingAuthorityIds,
-  })) {
-    addSupplementalItem({ ...item, source: "boundary" });
-  }
 
-  const supplementalMatches = Array.from(supplementalByWofId.values())
-    .sort((a, b) => supplementalMatchSortScore(b) - supplementalMatchSortScore(a) || a.evidence.label.localeCompare(b.evidence.label));
-  for (const item of supplementalMatches) {
-    counts.matched += 1;
-    counts.supplemental += 1;
-    if (item.source === "boundary") counts.boundarySupplemental += 1;
-    existingNames.add(item.evidence.normalized);
-    existingAuthorityIds.add(item.match.selected.record.wofId);
-    enriched.push(supplementalPlacename(item.evidence, item.match, enriched.length));
+    const supplementalMatches = Array.from(supplementalByWofId.values())
+      .sort((a, b) => supplementalMatchSortScore(b) - supplementalMatchSortScore(a) || a.evidence.label.localeCompare(b.evidence.label));
+    for (const item of supplementalMatches) {
+      counts.matched += 1;
+      counts.supplemental += 1;
+      if (item.source === "boundary") counts.boundarySupplemental += 1;
+      existingNames.add(item.evidence.normalized);
+      existingAuthorityIds.add(item.match.selected.record.wofId);
+      enriched.push(supplementalPlacename(item.evidence, item.match, enriched.length));
+    }
   }
 
   return {
     placenames: enriched,
-    extension: summaryFromCounts(matcher, counts, boundary ? { boundary } : {}),
+    extension: summaryFromCounts(matcher, counts, withoutUndefined({
+      boundary,
+      initialSpatialFilter: initialScope.summary,
+      spatialFilter: activeSpatialSummary,
+    })),
   };
 }
 
