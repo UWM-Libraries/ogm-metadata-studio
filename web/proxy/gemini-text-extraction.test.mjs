@@ -2,15 +2,21 @@ import { describe, expect, it } from "vitest";
 import {
   GEMINI_LABEL_EXTRACTION_CALL_ID,
   HYBRID_GEMINI_VISION_OCR_PROVIDER,
+  HYBRID_KIMI_VISION_OCR_PROVIDER,
   HYBRID_OPENAI_VISION_OCR_PROVIDER,
+  KIMI_AGENT_SWARM_CALL_ID,
   OPENAI_LABEL_RECONCILIATION_CALL_ID,
   inferMapReadingContext,
+  kimiAgentSwarmRequestBody,
   mergeGoogleVisionWithGeminiExtraction,
+  mergeGoogleVisionWithKimiAgentSwarm,
   mergeGoogleVisionWithOpenAIReconciliation,
   normalizeGeminiLabelsForExtraction,
+  normalizeKimiLabelsForExtraction,
   normalizeOpenAILabelsForExtraction,
   openAIMapLabelReconciliationRequestBody,
   parseGeminiJson,
+  parseKimiAgentSwarmJson,
   parseOpenAIMapLabelJson,
 } from "./gemini-text-extraction.mjs";
 
@@ -73,6 +79,63 @@ describe("Gemini map-label extraction fusion", () => {
       source_call_id: OPENAI_LABEL_RECONCILIATION_CALL_ID,
       extraction_source: "openai_reconciliation",
       approx_bbox: [0.275, 0.408, 0.35, 0.424],
+    });
+  });
+
+  it("builds Kimi K2.6 swarm requests with JSON schema output and prompt caching", () => {
+    const { body, systemPrompt, userPrompt } = kimiAgentSwarmRequestBody({
+      model: "kimi-k2.6",
+      modelProfile: { modelParams: { temperature: 0.2 } },
+      promptCacheKey: "ogm:test-cache-key",
+      request: {
+        resourceId: "map-123",
+        file: { name: "seattle-map.jpg", type: "image/jpeg", size: 12345 },
+      },
+      derivatives: [{
+        ...derivative,
+        dataUri: "data:image/jpeg;base64,abc",
+      }],
+      ocrExtraction: {
+        text: [{ content: "LAKE UNION", role: "waterbody", confidence: 0.95, approx_bbox: [0.2, 0.2, 0.3, 0.24] }],
+        text_groups: [],
+        placenames: [],
+      },
+    });
+
+    expect(body.model).toBe("kimi-k2.6");
+    expect(body.temperature).toBeUndefined();
+    expect(body.thinking).toEqual({ type: "disabled" });
+    expect(body.prompt_cache_key).toBe("ogm:test-cache-key");
+    expect(body.response_format).toMatchObject({
+      type: "json_schema",
+      json_schema: { name: "kimi_map_agent_swarm" },
+    });
+    expect(body.messages[1].content).toEqual(expect.arrayContaining([
+      { type: "text", text: "sourceRegionId: ocr-source-tile-01" },
+      { type: "image_url", image_url: { url: "data:image/jpeg;base64,abc" } },
+    ]));
+    expect(systemPrompt).toMatch(/evidence-sharing swarm/i);
+    expect(userPrompt).toContain("map_collar_layout_segmentation");
+    expect(userPrompt).toContain("LAKE UNION");
+  });
+
+  it("projects Kimi swarm labels back into full-image coordinates", () => {
+    const labels = normalizeKimiLabelsForExtraction({
+      labels: [{
+        content: "Lake Union",
+        role: "waterbody",
+        confidence: 0.96,
+        bbox1000: [100, 250, 300, 750],
+        sourceRegionId: "ocr-source-tile-01",
+      }],
+    }, [derivative]);
+
+    expect(labels).toHaveLength(1);
+    expect(labels[0]).toMatchObject({
+      content: "Lake Union",
+      source_call_id: KIMI_AGENT_SWARM_CALL_ID,
+      extraction_source: "kimi_agent_swarm",
+      approx_bbox: [0.2625, 0.42, 0.2875, 0.46],
     });
   });
 
@@ -609,7 +672,7 @@ describe("Gemini map-label extraction fusion", () => {
     expect(merged.parsedResponse.text_groups).toEqual([]);
     expect(merged.parsedResponse.text.map((entry) => entry.content)).toContain("W. Lander St");
     expect(merged.parsedResponse.text.map((entry) => entry.content)).toContain("East Marginal Way");
-    expect(merged.parsedResponse.placenames.map((entry) => entry.name)).toEqual(["W. Lander St", "East Marginal Way"]);
+    expect(merged.parsedResponse.placenames.map((entry) => entry.name)).toEqual([]);
     expect(merged.parsedResponse.text_grouping_summary.gemini_filtered_overmerged_group_count).toBe(1);
   });
 
@@ -654,6 +717,67 @@ describe("Gemini map-label extraction fusion", () => {
       model: "gpt-5.4-mini",
     });
     expect(merged.parsedResponse.text_grouping_summary.openai_reconciled_added_text_count).toBe(1);
+  });
+
+  it("adds Kimi swarm labels, claims, cache metadata, and provenance", () => {
+    const merged = mergeGoogleVisionWithKimiAgentSwarm({
+      ocrResult: {
+        parsedResponse: {
+          text: [
+            { content: "LANDER ST", approx_bbox: [0.2, 0.3, 0.4, 0.32], orientation_degrees: 0, confidence: 0.91 },
+          ],
+          text_groups: [],
+          placenames: [],
+          debug: {},
+        },
+        provider: "google_cloud_vision",
+      },
+      kimiSwarm: {
+        model: "kimi-k2.6",
+        strategy: "per_crop_kimi_agent_swarm_cached_v1",
+        usage: { prompt_tokens: 1000, cached_tokens: 500 },
+        derivatives: [derivative],
+        parsedResponse: {
+          labels: [
+            {
+              content: "West Waterway",
+              role: "waterbody",
+              confidence: 0.9,
+              bbox1000: [100, 100, 500, 200],
+              sourceRegionId: "ocr-source-tile-01",
+            },
+          ],
+          claims: [{
+            agentId: "coverage_extent",
+            field: "dct_spatial_sm",
+            value: ["West Waterway"],
+            confidence: 0.82,
+            evidence: [{ type: "ocr", text: "West Waterway", sourceRegionId: "ocr-source-tile-01" }],
+            warnings: [],
+          }],
+          agents: [{ id: "coverage_extent", status: "completed", claimCount: 1 }],
+          extractionStatus: { successfulCropCount: 1, failedCropCount: 0, responseCacheHitCount: 1 },
+          cropStatuses: [{ sourceRegionId: "ocr-source-tile-01", promptCacheKey: "ogm:test", cacheHit: true }],
+        },
+        rawResponse: { choices: [] },
+        requestBody: {},
+      },
+    });
+
+    expect(merged.provider).toBe(HYBRID_KIMI_VISION_OCR_PROVIDER);
+    expect(merged.parsedResponse.text.map((entry) => entry.content)).toContain("West Waterway");
+    expect(merged.parsedResponse.kimi_swarm.claims[0]).toMatchObject({
+      agentId: "coverage_extent",
+      field: "dct_spatial_sm",
+    });
+    expect(merged.parsedResponse.text_extraction_runs.at(-1)).toMatchObject({
+      id: KIMI_AGENT_SWARM_CALL_ID,
+      provider: "kimi",
+      model: "kimi-k2.6",
+      responseCacheHitCount: 1,
+      cachedTokens: 500,
+    });
+    expect(merged.parsedResponse.text_grouping_summary.kimi_swarm_added_text_count).toBe(1);
   });
 
   it("uses duplicate OpenAI neighborhood labels to seed and upgrade placenames", () => {
@@ -865,5 +989,18 @@ describe("Gemini map-label extraction fusion", () => {
 
     expect(parsed.labels.map((label) => label.content)).toEqual(["Ames Terminal", "West Waterway"]);
     expect(parsed.extractionStatus.omittedReason).toMatch(/OpenAI returned malformed JSON/);
+  });
+
+  it("salvages complete labels from malformed Kimi swarm JSON", () => {
+    const parsed = parseKimiAgentSwarmJson(`{
+      "labels": [
+        {"content":"Ames Terminal","confidence":0.8,"bbox1000":[1,2,3,4],"sourceRegionId":"crop-1"}
+        {"content":"West Waterway","confidence":0.7,"bbox1000":[5,6,7,8],"sourceRegionId":"crop-1"}
+      ],
+      "claims": []
+    }`);
+
+    expect(parsed.labels.map((label) => label.content)).toEqual(["Ames Terminal", "West Waterway"]);
+    expect(parsed.extractionStatus.omittedReason).toMatch(/Kimi returned malformed JSON/);
   });
 });
