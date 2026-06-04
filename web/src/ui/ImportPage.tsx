@@ -3,6 +3,7 @@ import { importCsv, saveDb, exportDbBlob, importJsonData, exportAardvarkJsonZip 
 import { publishCurrentDataToRepoRoot } from "../publish/publishToRepo";
 import { GithubImport } from "./GithubImport";
 import { DEFAULT_RESOURCES_PARQUET, PARQUET_ARTIFACTS, usingDefaultResourceStarter } from "../config/parquetArtifacts";
+import { withBasePath } from "../utils/basePath";
 
 interface ImportPageProps {
     resourceCount?: number;
@@ -16,6 +17,7 @@ export const ImportPage: React.FC<ImportPageProps> = ({ resourceCount = 0, onImp
     const [repoRootHandle, setRepoRootHandle] = useState<any | null>(null);
     const [repoRootName, setRepoRootName] = useState<string>("");
     const usingStarterArtifact = usingDefaultResourceStarter();
+    const logoUrl = withBasePath("/opengeometadata-bauhaus-logo.svg");
 
     const handleExportJsonZip = async () => {
         try {
@@ -159,12 +161,21 @@ export const ImportPage: React.FC<ImportPageProps> = ({ resourceCount = 0, onImp
     return (
         <div className="p-8 max-w-4xl mx-auto space-y-8">
             {resourceCount === 0 && (
-                <div className="bg-gradient-to-r from-indigo-500 to-purple-600 rounded-xl p-8 text-white shadow-lg animate-fade-in-up">
-                    <h1 className="text-3xl font-bold mb-4">Welcome to Aardvark Metadata Studio!</h1>
-                    <p className="text-lg opacity-90 max-w-2xl">
-                        It looks like your database is empty. To get started, please import some data below.
-                        You can upload CSV/JSON files or connect a GitHub repository.
-                    </p>
+                <div className="rounded-md border-2 border-[#1e1e1e] bg-[#fffdf3] p-8 text-[#141414] shadow-[6px_6px_0_#111111] dark:bg-slate-950 dark:text-[#fffdf3] dark:shadow-[6px_6px_0_#f6d94d]">
+                    <div className="flex items-start gap-5">
+                        <img
+                            src={logoUrl}
+                            alt="OpenGeoMetadata geometric logo"
+                            className="h-16 w-16 shrink-0 border-2 border-[#111111] bg-[#fffdf3]"
+                        />
+                        <div>
+                            <h1 className="text-3xl font-extrabold tracking-normal mb-3">Welcome to OpenGeoMetadata Studio!</h1>
+                            <p className="text-lg text-[#5a5547] dark:text-[#fffdf3]/80 max-w-2xl">
+                                It looks like your database is empty. To get started, please import some data below.
+                                You can upload CSV/JSON files or connect a GitHub repository.
+                            </p>
+                        </div>
+                    </div>
                 </div>
             )}
 
@@ -174,13 +185,13 @@ export const ImportPage: React.FC<ImportPageProps> = ({ resourceCount = 0, onImp
             <div className="flex border-b border-gray-200 dark:border-slate-800 space-x-6">
                 <button
                     onClick={() => setMode("local")}
-                    className={`pb-2 text-sm font-medium border-b-2 transition-colors ${mode === "local" ? "border-indigo-500 text-indigo-600 dark:text-white" : "border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-300"}`}
+                    className={`pb-2 text-sm font-medium border-b-2 transition-colors ${mode === "local" ? "border-[#0057b8] text-[#0057b8] dark:text-[#f6d94d] dark:border-[#f6d94d]" : "border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-300"}`}
                 >
                     Local File Upload
                 </button>
                 <button
                     onClick={() => setMode("github")}
-                    className={`pb-2 text-sm font-medium border-b-2 transition-colors ${mode === "github" ? "border-indigo-500 text-indigo-600 dark:text-white" : "border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-300"}`}
+                    className={`pb-2 text-sm font-medium border-b-2 transition-colors ${mode === "github" ? "border-[#0057b8] text-[#0057b8] dark:text-[#f6d94d] dark:border-[#f6d94d]" : "border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-300"}`}
                 >
                     GitHub Import
                 </button>
@@ -201,10 +212,10 @@ export const ImportPage: React.FC<ImportPageProps> = ({ resourceCount = 0, onImp
                         disabled={loading}
                         className="block w-full text-sm text-slate-500 dark:text-slate-400
                             file:mr-4 file:py-2 file:px-4
-                            file:rounded-full file:border-0
+                            file:rounded-md file:border-2 file:border-[#111111]
                             file:text-sm file:font-semibold
-                            file:bg-indigo-600 file:text-white
-                            hover:file:bg-indigo-700
+                            file:bg-[#111111] file:text-[#fffdf3]
+                            hover:file:bg-[#0057b8]
                         "
                     />
                     {status && (
@@ -288,7 +299,7 @@ export const ImportPage: React.FC<ImportPageProps> = ({ resourceCount = 0, onImp
                             <button
                                 onClick={handleChooseRepoRoot}
                                 disabled={loading}
-                                className="rounded-md border border-indigo-300 dark:border-indigo-500 bg-indigo-50 dark:bg-indigo-900/30 px-4 py-2 text-sm font-medium text-indigo-700 dark:text-indigo-200 hover:bg-indigo-100 dark:hover:bg-indigo-900/50 disabled:opacity-50"
+                                className="rounded-md border-2 border-[#111111] bg-[#f6d94d] px-4 py-2 text-sm font-semibold text-[#111111] hover:bg-[#fffdf3] disabled:opacity-50 dark:border-[#f6d94d] dark:bg-[#f6d94d] dark:hover:bg-[#fffdf3]"
                             >
                                 {repoRootHandle ? "Choose Different Folder" : "Choose Repo Folder"}
                             </button>

@@ -78,14 +78,14 @@ export const AutosuggestInput: React.FC<AutosuggestInputProps> = ({
 
     return (
         <div ref={wrapperRef} className={`relative ${className}`}>
-            <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-                <svg className="h-5 w-5 text-slate-400 dark:text-slate-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
+                <svg className="h-5 w-5 text-[#0057b8] dark:text-[#f6d94d]" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
                 </svg>
             </div>
             <input
                 type="text"
-                className="block w-full rounded-md border border-gray-300 dark:border-slate-700 bg-white dark:bg-slate-950 pl-10 pr-3 py-2 text-slate-900 dark:text-slate-200 placeholder-slate-400 dark:placeholder-slate-500 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 sm:text-sm"
+                className="block h-12 w-full rounded-md border-2 border-[#1e1e1e] bg-[#fffdf3] pl-11 pr-3 py-2 text-[#141414] placeholder-[#5a5547]/70 shadow-[2px_2px_0_#111111] transition-colors focus:border-[#0057b8] focus:outline-none focus:ring-2 focus:ring-[#0057b8]/30 dark:border-[#f6d94d] dark:bg-slate-950 dark:text-[#fffdf3] dark:placeholder-[#fffdf3]/50 dark:shadow-[2px_2px_0_#f6d94d] sm:text-sm"
                 placeholder={placeholder}
                 value={value}
                 onChange={(e) => onChange(e.target.value)}
@@ -96,11 +96,11 @@ export const AutosuggestInput: React.FC<AutosuggestInputProps> = ({
             />
 
             {isOpen && (
-                <ul className="absolute z-50 mt-1 max-h-60 w-full overflow-auto rounded-md bg-white dark:bg-slate-900 py-1 text-base shadow-lg ring-1 ring-black ring-opacity-5 focus:outline-none sm:text-sm border border-gray-200 dark:border-slate-700">
+                <ul className="absolute z-50 mt-2 max-h-60 w-full overflow-auto rounded-md bg-[#fffdf3] dark:bg-slate-950 py-1 text-base shadow-[4px_4px_0_#111111] dark:shadow-[4px_4px_0_#f6d94d] focus:outline-none sm:text-sm border-2 border-[#1e1e1e] dark:border-[#f6d94d]">
                     {suggestions.map((suggestion, index) => (
                         <li
                             key={index}
-                            className={`relative cursor-default select-none py-2 pl-3 pr-9 ${index === focusedIndex ? "bg-indigo-600 text-white" : "text-slate-900 dark:text-slate-200 hover:bg-gray-100 dark:hover:bg-slate-800"
+                            className={`relative cursor-default select-none py-2 pl-3 pr-9 ${index === focusedIndex ? "bg-[#0057b8] text-white" : "text-[#141414] dark:text-[#fffdf3] hover:bg-[#f6d94d]/40 dark:hover:bg-slate-800"
                                 }`}
                             onClick={() => selectSuggestion(suggestion)}
                             onMouseEnter={() => setFocusedIndex(index)}
@@ -109,7 +109,7 @@ export const AutosuggestInput: React.FC<AutosuggestInputProps> = ({
                                 <span className={`block truncate ${index === focusedIndex ? "font-semibold" : "font-normal"}`}>
                                     {suggestion.text}
                                 </span>
-                                <span className={`text-xs ml-2 ${index === focusedIndex ? "text-indigo-200" : "text-slate-400"}`}>
+                                <span className={`text-xs ml-2 ${index === focusedIndex ? "text-blue-100" : "text-[#5a5547] dark:text-[#fffdf3]/60"}`}>
                                     {suggestion.type}
                                 </span>
                             </div>
