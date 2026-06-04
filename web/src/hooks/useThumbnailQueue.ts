@@ -1,4 +1,4 @@
-import { getDistributionsForResource, upsertThumbnail } from "../duckdb/duckdbClient";
+import { getDistributionsForResource, getThumbnail, upsertThumbnail } from "../duckdb/duckdbClient";
 import { useState, useCallback, useRef } from "react";
 import { Resource, Distribution } from "../aardvark/model";
 import { ImageService } from "../services/ImageService";
@@ -48,6 +48,12 @@ export function useThumbnailQueue() {
 
             limit(async () => {
                 try {
+                    const cachedUrl = await getThumbnail(item.id);
+                    if (cachedUrl) {
+                        setThumbnails(prev => ({ ...prev, [item.id]: cachedUrl }));
+                        return;
+                    }
+
                     let dists = item.distributions;
                     if (!dists || dists.length === 0) {
                         dists = await getDistributionsForResource(item.id);
@@ -63,15 +69,15 @@ export function useThumbnailQueue() {
                             await upsertThumbnail(item.id, blob);
                             setThumbnails(prev => ({ ...prev, [item.id]: URL.createObjectURL(blob) }));
                         } else {
-                            setThumbnails(prev => ({ ...prev, [item.id]: null }));
+                            setThumbnails(prev => Object.prototype.hasOwnProperty.call(prev, item.id) ? prev : ({ ...prev, [item.id]: null }));
                         }
                     } else {
                         // Mark as null to indicate "checked but none found" (optional, allows UI to stop loading state)
-                        setThumbnails(prev => ({ ...prev, [item.id]: null }));
+                        setThumbnails(prev => Object.prototype.hasOwnProperty.call(prev, item.id) ? prev : ({ ...prev, [item.id]: null }));
                     }
                 } catch (err) {
                     console.warn(`Error fetching thumbnail for ${item.id}`, err);
-                    setThumbnails(prev => ({ ...prev, [item.id]: null }));
+                    setThumbnails(prev => Object.prototype.hasOwnProperty.call(prev, item.id) ? prev : ({ ...prev, [item.id]: null }));
                 }
             });
         });

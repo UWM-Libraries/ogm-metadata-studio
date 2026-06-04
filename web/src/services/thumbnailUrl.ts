@@ -86,8 +86,13 @@ export function inferredUploadedThumbnailUrl(resource: Resource): string | null 
 }
 
 export function displayThumbnailUrl(resource: Resource, thumbnails: Record<string, string | null>): string | null {
+    const queued = Object.prototype.hasOwnProperty.call(thumbnails, resource.id) ? thumbnails[resource.id] : undefined;
+    if (queued) return queued;
+
+    if (resource.thumbnail?.startsWith("blob:")) return resource.thumbnail;
+
     const explicit = explicitThumbnailUrl(resource);
     if (explicit && !isGeneratedStudioThumbnailUrl(explicit)) return explicit;
-    if (Object.prototype.hasOwnProperty.call(thumbnails, resource.id)) return thumbnails[resource.id];
-    return null;
+
+    return explicit || inferredUploadedThumbnailUrl(resource);
 }
