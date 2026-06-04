@@ -6,7 +6,7 @@ import { bboxToBounds, geoJsonToBounds, getBoundsFromGeometry, intersectLngLatBb
 import { cogInfoArtifactUrl, cogPreviewArtifactUrl, proxiedArtifactUrl } from './artifactProxy';
 import type { GeoJsonGeometry, SelectableGeoJsonFeature } from './geospatialFeature';
 
-const MAP_STYLE = "https://demotiles.maplibre.org/style.json";
+const MAP_STYLE = "https://tiles.openfreemap.org/styles/bright";
 const PMTILES_SOURCE_ID = 'pmtiles-overlay';
 const PMTILES_LAYER_PREFIX = 'pmtiles-overlay-';
 const SELECTION_SOURCE_ID = 'selected-feature-overlay';

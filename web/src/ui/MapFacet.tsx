@@ -6,7 +6,7 @@ import { DUCKDB_RESTORED_EVENT } from "../duckdb/dbInit";
 import { databaseService } from "../services/DatabaseService";
 import { zoomToResolution } from "../utils/h3Resolution";
 
-const MAP_STYLE = "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json";
+const MAP_STYLE = "https://tiles.openfreemap.org/styles/bright";
 
 const HEX_SOURCE_ID = "h3-hexes";
 const HEX_LAYER_ID = "h3-hexes-fill";
