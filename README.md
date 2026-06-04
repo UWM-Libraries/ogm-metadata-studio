@@ -1,8 +1,8 @@
-# OGM Metadata Studio
+# OpenGeoMetadata Studio
 
 A browser-native metadata management workspace for the [OpenGeoMetadata Aardvark](https://opengeometadata.org/schema/geoblacklight-schema-aardvark.json) standard.
 
-**Aardvark Metadata Studio** enables libraries and researchers to manage geospatial metadata repositories (like OpenGeoMetadata) entirely in the browser. It combines the speed of a local database engine with the persistence of standard Git workflows.
+**OpenGeoMetadata Studio** enables libraries and researchers to manage geospatial metadata repositories entirely in the browser. It combines the speed of a local database engine with the persistence of standard Git workflows.
 
 Built with **React**, **Vite**, **DuckDB-WASM**, **Google Auth**, and **GitHub REST API**.
 
@@ -71,6 +71,16 @@ npm run coverage
 2.  **Ingest**: The app loads these JSONs into `records.duckdb` (client-side).
 3.  **Edit/Search**: Use the dashboard to filter, search, and edit records.
 4.  **Sync**: (In Progress) Edits are committed back to your GitHub repository as new JSON versions.
+
+### Published Parquet Artifacts
+
+`web/public/resources.parquet` is reserved as the empty starter artifact, so new forks open with `0` results. Forks that want to publish their own dataset should choose a named artifact and commit that file instead:
+
+```bash
+VITE_RESOURCES_PARQUET=resources.my-library.parquet
+```
+
+The companion distributions file defaults to the matching name, such as `resource_distributions.my-library.parquet`. Set `VITE_RESOURCE_DISTRIBUTIONS_PARQUET` only if you need a different name.
 
 ## 🧠 Enrichment Workflow
 

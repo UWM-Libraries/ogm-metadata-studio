@@ -88,9 +88,10 @@ request.kimiAgentSwarmTargetCrops
 request.kimiTextExtractionTargetCrops
 KIMI_AGENT_SWARM_CONCURRENCY
 KIMI_AGENT_SWARM_MAX_COMPLETION_TOKENS
+KIMI_AGENT_SWARM_TIMEOUT_MS
 ```
 
-Default concurrency is `2`, capped at `8`. Default max completion tokens are `16000`.
+Default concurrency is `6`, capped at `8`. Default max completion tokens are `16000`. Default per-crop request timeout is `180000` ms; timed-out crops are recorded as failed crop statuses while successful crops continue into the merged extraction.
 
 ## Agent Swarm Contract
 
@@ -377,8 +378,9 @@ The pipeline is designed to avoid a naive "many agents read everything" cost pat
 For bulk processing, tune:
 
 ```bash
-KIMI_AGENT_SWARM_CONCURRENCY=2
+KIMI_AGENT_SWARM_CONCURRENCY=6
 KIMI_AGENT_SWARM_MAX_COMPLETION_TOKENS=16000
+KIMI_AGENT_SWARM_TIMEOUT_MS=180000
 KIMI_AGENT_SWARM_RESPONSE_CACHE=1
 ```
 

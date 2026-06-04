@@ -1,5 +1,7 @@
 import React, { useEffect, useRef } from 'react';
 import { Resource } from '../aardvark/model';
+import { displayThumbnailUrl } from '../services/thumbnailUrl';
+import { ResourceThumbnail } from './shared/ResourceThumbnail';
 
 interface GalleryViewProps {
     resources: Resource[];
@@ -46,7 +48,9 @@ export const GalleryView: React.FC<GalleryViewProps> = ({ resources, thumbnails,
     return (
         <div className="flex flex-col">
             <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4 p-4">
-                {resources.map(r => (
+                {resources.map(r => {
+                    const thumbnailUrl = displayThumbnailUrl(r, thumbnails);
+                    return (
                     <div
                         key={r.id}
                         className="group relative bg-white dark:bg-slate-900 border border-gray-200 dark:border-slate-800 rounded-lg overflow-hidden hover:shadow-md transition-shadow cursor-pointer flex flex-col"
@@ -54,13 +58,11 @@ export const GalleryView: React.FC<GalleryViewProps> = ({ resources, thumbnails,
                     >
                         {/* Thumbnail Aspect Ratio 1:1 or 4:3? Aardvark usually squares. */}
                         <div className="aspect-square bg-gray-100 dark:bg-slate-950 flex items-center justify-center overflow-hidden relative">
-                            {thumbnails[r.id] ? (
-                                <img src={thumbnails[r.id]!} alt="" className="w-full h-full object-cover" />
-                            ) : (
-                                <span className="text-4xl opacity-10 select-none">
-                                    {r.gbl_resourceClass_sm?.includes("Maps") ? "🗺️" : "📄"}
-                                </span>
-                            )}
+                            <ResourceThumbnail
+                                resource={r}
+                                src={thumbnailUrl}
+                                fallbackClassName="text-4xl opacity-10 select-none"
+                            />
 
                             {/* Overlay Gradient for Text Readability? No, text below. */}
 
@@ -80,7 +82,8 @@ export const GalleryView: React.FC<GalleryViewProps> = ({ resources, thumbnails,
                             </div>
                         </div>
                     </div>
-                ))}
+                );
+                })}
             </div>
             {/* Sentinel for infinite scroll */}
             {hasMore && <div ref={observerTarget} className="h-10 w-full" />}

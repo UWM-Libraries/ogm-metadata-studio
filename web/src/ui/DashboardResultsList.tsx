@@ -1,5 +1,7 @@
 import React from 'react';
 import { Resource } from '../aardvark/model';
+import { displayThumbnailUrl } from '../services/thumbnailUrl';
+import { ResourceThumbnail } from './shared/ResourceThumbnail';
 
 interface DashboardResultsListProps {
     resources: Resource[];
@@ -15,7 +17,9 @@ interface DashboardResultsListProps {
 export const DashboardResultsList: React.FC<DashboardResultsListProps> = ({ resources, thumbnails, mapUrls, onSelect, onAddFilter, page = 1, pageSize = 20 }) => {
     return (
         <div className="space-y-4">
-            {resources.map((r, index) => (
+            {resources.map((r, index) => {
+                const thumbnailUrl = displayThumbnailUrl(r, thumbnails);
+                return (
                 <div key={r.id} className="group relative grid grid-cols-[auto_1fr] gap-4 rounded-lg border border-gray-200 dark:border-slate-800 bg-white dark:bg-slate-900/40 p-4 hover:border-gray-300 dark:hover:border-slate-700 hover:bg-gray-50 dark:hover:bg-slate-900/60 transition-colors shadow-sm hover:shadow-md">
 
                     {/* Index Number */}
@@ -32,20 +36,12 @@ export const DashboardResultsList: React.FC<DashboardResultsListProps> = ({ reso
                         <div className="hidden sm:flex flex-row items-stretch select-none">
                             {/* Thumbnail */}
                             <div className="w-40 h-40 bg-gray-100 dark:bg-slate-950 rounded-l-lg border border-gray-200 dark:border-slate-800 border-r-0 items-center justify-center overflow-hidden flex-shrink-0">
-                                {thumbnails[r.id] ? (
-                                    <img
-                                        src={thumbnails[r.id]!}
-                                        alt={`Thumbnail for ${r.dct_title_s}`}
-                                        className="w-full h-full object-cover"
-                                        onError={(e) => (e.currentTarget.style.display = 'none')}
-                                        referrerPolicy="no-referrer"
-                                        title={`Thumbnail: ${r.dct_title_s}`}
-                                    />
-                                ) : (
-                                    <span className="text-3xl opacity-20 grayscale select-none" title={`No thumbnail for ${r.dct_title_s}`}>
-                                        {r.gbl_resourceClass_sm?.includes("Maps") ? "🗺️" : "📄"}
-                                    </span>
-                                )}
+                                <ResourceThumbnail
+                                    resource={r}
+                                    src={thumbnailUrl}
+                                    alt={`Thumbnail for ${r.dct_title_s}`}
+                                    title={`Thumbnail: ${r.dct_title_s}`}
+                                />
                             </div>
 
                             {/* Static Map */}
@@ -143,7 +139,8 @@ export const DashboardResultsList: React.FC<DashboardResultsListProps> = ({ reso
                         </div>
                     </div>
                 </div>
-            ))}
+            );
+            })}
         </div>
     );
 };

@@ -188,6 +188,38 @@ export interface ProcessGeospatialPackageResponse {
     }>;
 }
 
+export interface UploadJobProgressMilestone {
+    at: string;
+    elapsed_ms: number;
+    label: string;
+    detail?: Record<string, unknown>;
+}
+
+export interface UploadJobProgressResponse {
+    jobId: string;
+    fileName: string;
+    status: "active" | "complete" | "error";
+    startedAt: string;
+    updatedAt: string;
+    completedAt?: string;
+    error?: string;
+    summary?: {
+        kind: "crop" | "milestone";
+        label: string;
+        percent?: number | null;
+        provider?: string;
+        phase?: string;
+        cropCount?: number;
+        started?: number;
+        completed?: number;
+        failed?: number;
+        labels?: number;
+        claims?: number;
+        cacheHits?: number;
+    } | null;
+    milestones: UploadJobProgressMilestone[];
+}
+
 export interface ProcessedS3Resource {
     resourceId: string;
     root: string;
@@ -409,6 +441,11 @@ export class EnrichmentProxyClient {
             headers: { "Content-Type": "application/json" },
             body: safeJsonStringify(request),
         }, LARGE_UPLOAD_TIMEOUT_MS, signal);
+        return parseResponse(res);
+    }
+
+    async getUploadJobProgress(jobId: string, signal?: AbortSignal): Promise<UploadJobProgressResponse> {
+        const res = await fetchWithTimeout(`${this.baseUrl}/api/uploads/jobs/${encodeURIComponent(jobId)}/progress`, {}, SYNC_TIMEOUT_MS, signal);
         return parseResponse(res);
     }
 

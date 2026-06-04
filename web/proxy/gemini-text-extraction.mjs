@@ -21,6 +21,8 @@ const OPENAI_TEXT_RECONCILIATION_STRATEGY = "per_crop_openai_map_label_reconcili
 const KIMI_CHAT_COMPLETIONS_ENDPOINT = "https://api.moonshot.ai/v1/chat/completions";
 const KIMI_DEFAULT_MODEL = "kimi-k2.6";
 const KIMI_AGENT_SWARM_STRATEGY = "per_crop_kimi_agent_swarm_cached_v1";
+const KIMI_AGENT_SWARM_DEFAULT_CONCURRENCY = 6;
+const KIMI_AGENT_SWARM_DEFAULT_TIMEOUT_MS = 180_000;
 const MAP_LABEL_ROLE_ENUM = [
   "title",
   "publication",
@@ -1242,6 +1244,13 @@ function kimiJsonObjectFallbackBody(body) {
 async function postKimiAgentSwarmResponse({ apiKey, body, request = {} }) {
   let currentBody = { ...body };
   let usedJsonObjectFallback = false;
+  const timeoutMs = Math.max(30_000, Number(
+    request.kimiAgentSwarmTimeoutMs
+    || request.kimiTextExtractionTimeoutMs
+    || request.textExtractionTimeoutMs
+    || process.env.KIMI_AGENT_SWARM_TIMEOUT_MS
+    || KIMI_AGENT_SWARM_DEFAULT_TIMEOUT_MS,
+  ) || KIMI_AGENT_SWARM_DEFAULT_TIMEOUT_MS);
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const cacheKey = kimiCacheKeyForBody(currentBody);
     if (kimiResponseCacheEnabled(request)) {
@@ -1269,14 +1278,29 @@ async function postKimiAgentSwarmResponse({ apiKey, body, request = {} }) {
       }
     }
 
-    const response = await fetch(KIMI_CHAT_COMPLETIONS_ENDPOINT, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(currentBody),
-    });
+    const controller = new AbortController();
+    const timeout = setTimeout(() => {
+      controller.abort(new Error(`Kimi map-agent swarm request timed out after ${Math.round(timeoutMs / 1000)}s.`));
+    }, timeoutMs);
+    let response;
+    try {
+      response = await fetch(KIMI_CHAT_COMPLETIONS_ENDPOINT, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(currentBody),
+        signal: controller.signal,
+      });
+    } catch (error) {
+      if (controller.signal.aborted) {
+        throw new Error(error?.message || `Kimi map-agent swarm request timed out after ${Math.round(timeoutMs / 1000)}s.`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
     const rawResponse = await response.json().catch(() => ({}));
     if (response.ok) {
       const outputText = extractKimiResponseText(rawResponse);
@@ -1713,8 +1737,19 @@ export async function callKimiMapAgentSwarm({ modelProfile, request = {}, deriva
     || request.kimiTextExtractionConcurrency
     || request.textExtractionConcurrency
     || process.env.KIMI_AGENT_SWARM_CONCURRENCY
-    || 2,
-  ) || 2));
+    || KIMI_AGENT_SWARM_DEFAULT_CONCURRENCY,
+  ) || KIMI_AGENT_SWARM_DEFAULT_CONCURRENCY));
+  log("Kimi map-agent swarm crop queue started", {
+    cropCount: readyDerivatives.length,
+    concurrency,
+    timeoutMs: Math.max(30_000, Number(
+      request.kimiAgentSwarmTimeoutMs
+      || request.kimiTextExtractionTimeoutMs
+      || request.textExtractionTimeoutMs
+      || process.env.KIMI_AGENT_SWARM_TIMEOUT_MS
+      || KIMI_AGENT_SWARM_DEFAULT_TIMEOUT_MS,
+    ) || KIMI_AGENT_SWARM_DEFAULT_TIMEOUT_MS),
+  });
   const cropResults = await mapWithConcurrency(readyDerivatives, concurrency, async (derivative, index) => {
     const sourceRegionId = derivative.sourceImageId || derivative.id || `image-${index + 1}`;
     const promptCacheKey = kimiPromptCacheKey({ request, derivative, agentId: "map-agent-swarm" });
@@ -1784,6 +1819,11 @@ export async function callKimiMapAgentSwarm({ modelProfile, request = {}, deriva
         promptCacheKey,
       };
     }
+  });
+  log("Kimi map-agent swarm crop queue complete", {
+    cropCount: readyDerivatives.length,
+    completed: cropResults.filter((result) => result?.status === "completed").length,
+    failed: cropResults.filter((result) => result?.status === "failed").length,
   });
 
   const successes = cropResults.filter((result) => result?.status === "completed");

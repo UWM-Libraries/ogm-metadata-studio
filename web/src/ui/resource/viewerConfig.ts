@@ -1,5 +1,6 @@
 import { Distribution, Resource } from '../../aardvark/model';
 import { envelopeToBounds, geoJsonToBounds } from '../viewers/maplibreBounds';
+import { vectorGeoJsonArtifactUrl } from '../viewers/artifactProxy';
 
 export interface ViewerConfig {
     protocol: string;
@@ -89,10 +90,39 @@ function pmtilesSiblingFromGeoJson(url: string | undefined): string | undefined 
         const parsed = new URL(url);
         if (!/\/derivatives\/[^/?#]+\.geojson$/i.test(parsed.pathname)) return undefined;
         parsed.pathname = parsed.pathname.replace(/\.geojson$/i, ".pmtiles");
+        parsed.search = "";
+        parsed.hash = "";
         return parsed.toString();
     } catch {
         return undefined;
     }
+}
+
+function geospatialDerivativeSiblingFromPackage(url: string | undefined, extension: ".geojson" | ".pmtiles"): string | undefined {
+    if (!url) return undefined;
+    try {
+        const parsed = new URL(url);
+        const match = parsed.pathname.match(/^(.*\/)original_file\/([^/]+)\.zip$/i);
+        if (!match) return undefined;
+        parsed.pathname = `${match[1]}derivatives/${match[2]}${extension}`;
+        parsed.search = "";
+        parsed.hash = "";
+        return parsed.toString();
+    } catch {
+        return undefined;
+    }
+}
+
+function isLikelyShapefilePackageResource(resource: Resource): boolean {
+    const text = [
+        resource.dct_format_s,
+        ...(Array.isArray(resource.gbl_resourceType_sm) ? resource.gbl_resourceType_sm : []),
+    ].filter(Boolean).join(" ").toLowerCase();
+    return text.includes("shapefile") || text.includes("shape file");
+}
+
+function referenceShapefilePackageUrl(resource: Resource, refs: Record<string, unknown>): string | undefined {
+    return isLikelyShapefilePackageResource(resource) ? referenceUrlByExtension(refs, ".zip") : undefined;
 }
 
 function refsFromDistributions(distributions: Distribution[]): Record<string, unknown> {
@@ -314,11 +344,17 @@ export function detectViewerConfig(resource: Resource, distributions: Distributi
         };
     }
 
-    const geojson = referenceUrl(refs, [
+    const shapefilePackageUrl = referenceShapefilePackageUrl(resource, refs);
+    const inferredPackageGeojson = shapefilePackageUrl
+        ? vectorGeoJsonArtifactUrl(shapefilePackageUrl) || geospatialDerivativeSiblingFromPackage(shapefilePackageUrl, ".geojson")
+        : undefined;
+    const inferredPackagePmtiles = geospatialDerivativeSiblingFromPackage(shapefilePackageUrl, ".pmtiles");
+    const explicitGeojson = referenceUrl(refs, [
         "geojson",
         "application/geo+json",
         "https://opengeometadata.org/reference/geojson",
     ]) || referenceUrlByExtension(refs, ".geojson");
+    const geojson = explicitGeojson || inferredPackageGeojson;
 
     // PMTiles vector tile derivative. For locally generated geospatial packages,
     // older imports may only have kept the GeoJSON downloadUrl entry, so infer the
@@ -328,7 +364,7 @@ export function detectViewerConfig(resource: Resource, distributions: Distributi
         "application/vnd.pmtiles",
         "https://opengeometadata.org/reference/pmtiles",
         "https://pmtiles.io/",
-    ]) || referenceUrlByExtension(refs, ".pmtiles") || pmtilesSiblingFromGeoJson(geojson);
+    ]) || referenceUrlByExtension(refs, ".pmtiles") || pmtilesSiblingFromGeoJson(explicitGeojson) || (!geojson ? inferredPackagePmtiles : undefined);
     if (pmtiles) {
         return {
             protocol: "pmtiles",

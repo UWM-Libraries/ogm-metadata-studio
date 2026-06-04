@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cogInfoArtifactUrl, cogPreviewArtifactUrl, proxiedArtifactUrl } from './artifactProxy';
+import { cogInfoArtifactUrl, cogPreviewArtifactUrl, proxiedArtifactUrl, vectorGeoJsonArtifactUrl, vectorPreviewArtifactUrl } from './artifactProxy';
 
 describe('artifactProxy', () => {
     afterEach(() => {
@@ -12,6 +12,13 @@ describe('artifactProxy', () => {
         const proxied = proxiedArtifactUrl('s3.amazonaws.com/ogm-metadata-studio/uploads/data.pmtiles');
 
         expect(proxied).toBe('http://localhost:8787/api/artifacts/proxy?url=https%3A%2F%2Fs3.amazonaws.com%2Fogm-metadata-studio%2Fuploads%2Fdata.pmtiles');
+    });
+
+    it('does not proxy local artifact endpoints a second time', () => {
+        vi.stubEnv('VITE_ENRICHMENT_PROXY_URL', 'http://localhost:8787');
+        const endpoint = 'http://localhost:8787/api/artifacts/vector-geojson?url=https%3A%2F%2Fs3.amazonaws.com%2Fogm-metadata-studio%2Fuploads%2Fgeodata-1%2Foriginal_file%2Ffootprints.zip';
+
+        expect(proxiedArtifactUrl(endpoint)).toBe(endpoint);
     });
 
     it('normalizes host-only COG preview URLs before proxying', () => {
@@ -33,6 +40,22 @@ describe('artifactProxy', () => {
         const info = cogInfoArtifactUrl('s3.amazonaws.com/ogm-metadata-studio/uploads/geodata-1/derivatives/map.cog.tif');
 
         expect(info).toBe('http://localhost:8787/api/artifacts/cog-info?url=https%3A%2F%2Fs3.amazonaws.com%2Fogm-metadata-studio%2Fuploads%2Fgeodata-1%2Fderivatives%2Fmap.cog.tif');
+    });
+
+    it('builds on-demand vector GeoJSON URLs for zipped shapefile packages', () => {
+        vi.stubEnv('VITE_ENRICHMENT_PROXY_URL', 'http://localhost:8787');
+
+        const geojson = vectorGeoJsonArtifactUrl('s3.amazonaws.com/ogm-metadata-studio/uploads/geodata-1/original_file/footprints.zip');
+
+        expect(geojson).toBe('http://localhost:8787/api/artifacts/vector-geojson?url=https%3A%2F%2Fs3.amazonaws.com%2Fogm-metadata-studio%2Fuploads%2Fgeodata-1%2Foriginal_file%2Ffootprints.zip');
+    });
+
+    it('builds on-demand vector thumbnail preview URLs for zipped shapefile packages', () => {
+        vi.stubEnv('VITE_ENRICHMENT_PROXY_URL', 'http://localhost:8787');
+
+        const preview = vectorPreviewArtifactUrl('s3.amazonaws.com/ogm-metadata-studio/uploads/geodata-1/original_file/footprints.zip', 512, 256);
+
+        expect(preview).toBe('http://localhost:8787/api/artifacts/vector-preview?url=https%3A%2F%2Fs3.amazonaws.com%2Fogm-metadata-studio%2Fuploads%2Fgeodata-1%2Foriginal_file%2Ffootprints.zip&width=512&height=256');
     });
 
     it('falls back to the local enrichment proxy when the Vite env var is empty', () => {
