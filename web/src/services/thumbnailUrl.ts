@@ -89,5 +89,5 @@ export function displayThumbnailUrl(resource: Resource, thumbnails: Record<strin
     const explicit = explicitThumbnailUrl(resource);
     if (explicit && !isGeneratedStudioThumbnailUrl(explicit)) return explicit;
     if (Object.prototype.hasOwnProperty.call(thumbnails, resource.id)) return thumbnails[resource.id];
-    return explicit || inferredUploadedThumbnailUrl(resource);
+    return null;
 }

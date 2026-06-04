@@ -1,13 +1,15 @@
-import React, { useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { Resource } from '../../aardvark/model';
 import { Link } from '../Link';
 import { displayThumbnailUrl } from '../../services/thumbnailUrl';
 import { ResourceThumbnail } from '../shared/ResourceThumbnail';
+import { useThumbnailQueue } from '../../hooks/useThumbnailQueue';
 
 const ITEMS_PER_PAGE = 4;
 
 export const SimilarResourcesCarousel: React.FC<{ items: Resource[] }> = ({ items }) => {
     const [currentPage, setCurrentPage] = useState(0);
+    const { thumbnails, register } = useThumbnailQueue();
     const totalPages = Math.ceil(items.length / ITEMS_PER_PAGE);
 
     const handlePrev = () => {
@@ -18,7 +20,14 @@ export const SimilarResourcesCarousel: React.FC<{ items: Resource[] }> = ({ item
         setCurrentPage(p => Math.min(totalPages - 1, p + 1));
     };
 
-    const currentItems = items.slice(currentPage * ITEMS_PER_PAGE, (currentPage + 1) * ITEMS_PER_PAGE);
+    const currentItems = useMemo(
+        () => items.slice(currentPage * ITEMS_PER_PAGE, (currentPage + 1) * ITEMS_PER_PAGE),
+        [currentPage, items],
+    );
+
+    useEffect(() => {
+        for (const item of currentItems) register(item.id, item);
+    }, [currentItems, register]);
 
     if (items.length === 0) return null;
 
@@ -29,7 +38,7 @@ export const SimilarResourcesCarousel: React.FC<{ items: Resource[] }> = ({ item
                 {/* Grid for items */}
                 <div className="grid grid-cols-4 gap-6 mb-6">
                     {currentItems.map((item) => {
-                        const thumbnailUrl = displayThumbnailUrl(item, {});
+                        const thumbnailUrl = displayThumbnailUrl(item, thumbnails);
                         return (
                         <Link
                             key={item.id}

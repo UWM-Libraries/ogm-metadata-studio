@@ -1,4 +1,4 @@
-import React, { useLayoutEffect, useMemo, useRef } from 'react';
+import React, { useEffect, useLayoutEffect, useMemo, useRef } from 'react';
 import maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import { Resource } from '../../aardvark/model';
@@ -6,6 +6,7 @@ import { CopyButton } from './CopyButton';
 import { textToLngLatBounds, type LngLatBoundsTuple } from '../viewers/maplibreBounds';
 import { displayThumbnailUrl } from '../../services/thumbnailUrl';
 import { ResourceThumbnail } from '../shared/ResourceThumbnail';
+import { useThumbnailQueue } from '../../hooks/useThumbnailQueue';
 
 const MAP_STYLE = "https://demotiles.maplibre.org/style.json";
 
@@ -35,6 +36,7 @@ function firstReferenceUrl(refs: Record<string, unknown>, keys: string[]): strin
 export const ResourceSidebar: React.FC<ResourceSidebarProps> = ({ resource }) => {
     const containerRef = useRef<HTMLDivElement>(null);
     const mapRef = useRef<maplibregl.Map | null>(null);
+    const { thumbnails, register } = useThumbnailQueue();
 
     // Parse Bounds for Mini Map (lat,lng for display; MapLibre uses [lng, lat])
     const bounds = useMemo<LngLatBoundsTuple | null>(() => textToLngLatBounds(resource.dcat_bbox || undefined), [resource.dcat_bbox]);
@@ -97,7 +99,11 @@ export const ResourceSidebar: React.FC<ResourceSidebarProps> = ({ resource }) =>
         } catch { return {}; }
     }, [resource.dct_references_s]);
 
-    const thumbnailUrl = useMemo(() => displayThumbnailUrl(resource, {}), [resource]);
+    useEffect(() => {
+        register(resource.id, resource);
+    }, [register, resource]);
+
+    const thumbnailUrl = useMemo(() => displayThumbnailUrl(resource, thumbnails), [resource, thumbnails]);
 
     const downloadLink = useMemo(() => firstReferenceUrl(references, [
         "http://schema.org/downloadUrl",

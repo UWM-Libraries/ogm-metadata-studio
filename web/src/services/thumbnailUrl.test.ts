@@ -78,4 +78,18 @@ describe("thumbnailUrl", () => {
             [r.id]: "http://localhost:8787/api/artifacts/vector-preview?url=https%3A%2F%2Fexample.com%2Fsource.zip",
         })).toBe("http://localhost:8787/api/artifacts/vector-preview?url=https%3A%2F%2Fexample.com%2Fsource.zip");
     });
+
+    it("does not render generated Studio thumbnails directly before queue processing", () => {
+        const r = resource({
+            dct_source_sm: [
+                "https://s3.amazonaws.com/ogm-metadata-studio/uploads/geodata-f8279ca9012a19eb/original_file/source.zip",
+            ],
+        });
+
+        expect(displayThumbnailUrl(r, {})).toBeNull();
+        expect(displayThumbnailUrl({
+            ...r,
+            thumbnail: "https://s3.amazonaws.com/ogm-metadata-studio/uploads/geodata-f8279ca9012a19eb/thumbnail/thumbnail.jpg",
+        }, {})).toBeNull();
+    });
 });
