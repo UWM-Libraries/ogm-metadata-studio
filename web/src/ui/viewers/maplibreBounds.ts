@@ -2,6 +2,7 @@
  * Parse GeoJSON (geometry or bbox) to MapLibre LngLatBounds-like [[west, south], [east, north]].
  */
 export type LngLatBoundsTuple = [[number, number], [number, number]];
+export type LngLatBbox = [number, number, number, number];
 
 const ENVELOPE_RE = /ENVELOPE\s*\(\s*([-+]?\d*\.?\d+(?:e[-+]?\d+)?)\s*,\s*([-+]?\d*\.?\d+(?:e[-+]?\d+)?)\s*,\s*([-+]?\d*\.?\d+(?:e[-+]?\d+)?)\s*,\s*([-+]?\d*\.?\d+(?:e[-+]?\d+)?)\s*\)/i;
 
@@ -46,11 +47,71 @@ export function textToLngLatBounds(value: string | undefined): LngLatBoundsTuple
     return validBoundsOrNull([[west, south], [east, north]]);
 }
 
-export function geoJsonToBounds(geojson: string | undefined): LngLatBoundsTuple | null {
+export function bboxToBounds(bbox: LngLatBbox): LngLatBoundsTuple {
+    const [west, south, east, north] = bbox;
+    return [[west, south], [east, north]];
+}
+
+export function intersectLngLatBbox(a: LngLatBbox, b: LngLatBbox): LngLatBbox | null {
+    const west = Math.max(a[0], b[0]);
+    const south = Math.max(a[1], b[1]);
+    const east = Math.min(a[2], b[2]);
+    const north = Math.min(a[3], b[3]);
+    if (east <= west || north <= south) return null;
+    return [west, south, east, north];
+}
+
+function collectGeoJsonCoordinates(value: unknown, output: [number, number][]) {
+    if (!Array.isArray(value)) return;
+    if (value.length >= 2 && isFiniteNumber(value[0]) && isFiniteNumber(value[1])) {
+        output.push([value[0], value[1]]);
+        return;
+    }
+    for (const child of value) collectGeoJsonCoordinates(child, output);
+}
+
+function collectGeoJsonGeometryBounds(value: unknown, output: [number, number][]) {
+    if (!value || typeof value !== 'object') return;
+    const object = value as {
+        type?: unknown;
+        coordinates?: unknown;
+        geometry?: unknown;
+        features?: unknown;
+        geometries?: unknown;
+    };
+
+    if (object.type === 'Feature') {
+        collectGeoJsonGeometryBounds(object.geometry, output);
+        return;
+    }
+
+    if (object.type === 'FeatureCollection' && Array.isArray(object.features)) {
+        for (const feature of object.features) collectGeoJsonGeometryBounds(feature, output);
+        return;
+    }
+
+    if (object.type === 'GeometryCollection' && Array.isArray(object.geometries)) {
+        for (const geometry of object.geometries) collectGeoJsonGeometryBounds(geometry, output);
+        return;
+    }
+
+    collectGeoJsonCoordinates(object.coordinates, output);
+}
+
+export function geoJsonToBounds(geojson: unknown): LngLatBoundsTuple | null {
     if (!geojson) return null;
-    let obj: { bbox?: number[]; type?: string; coordinates?: number[][][] | number[][] };
+    let obj: {
+        bbox?: unknown;
+        type?: unknown;
+        coordinates?: unknown;
+        geometry?: unknown;
+        features?: unknown;
+        geometries?: unknown;
+    };
     try {
-        obj = typeof geojson === 'string' ? JSON.parse(geojson) : geojson;
+        const parsed = typeof geojson === 'string' ? JSON.parse(geojson) : geojson;
+        if (!parsed || typeof parsed !== 'object') return null;
+        obj = parsed as typeof obj;
     } catch {
         return null;
     }
@@ -58,18 +119,18 @@ export function geoJsonToBounds(geojson: string | undefined): LngLatBoundsTuple 
         const [minX, minY, maxX, maxY] = obj.bbox;
         return validBoundsOrNull([[minX, minY], [maxX, maxY]]);
     }
-    if (obj.type === 'Polygon' && Array.isArray(obj.coordinates)) {
-        const ring = obj.coordinates[0];
-        if (!ring || !Array.isArray(ring) || ring.length < 3) return null;
-        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-        for (const pt of ring) {
-            const [x, y] = Array.isArray(pt) ? pt : [];
-            if (typeof x === 'number' && typeof y === 'number') {
-                minX = Math.min(minX, x); maxX = Math.max(maxX, x);
-                minY = Math.min(minY, y); maxY = Math.max(maxY, y);
-            }
+
+    const coordinates: [number, number][] = [];
+    collectGeoJsonGeometryBounds(obj, coordinates);
+    if (coordinates.length > 0) {
+        let minX = coordinates[0][0];
+        let minY = coordinates[0][1];
+        let maxX = minX;
+        let maxY = minY;
+        for (const [x, y] of coordinates) {
+            minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+            minY = Math.min(minY, y); maxY = Math.max(maxY, y);
         }
-        if (minX === Infinity) return null;
         return validBoundsOrNull([[minX, minY], [maxX, maxY]]);
     }
     return null;

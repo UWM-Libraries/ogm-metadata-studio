@@ -2,6 +2,7 @@ import React, { useState } from "react";
 import { importCsv, saveDb, exportDbBlob, importJsonData, exportAardvarkJsonZip } from "../duckdb/duckdbClient";
 import { publishCurrentDataToRepoRoot } from "../publish/publishToRepo";
 import { GithubImport } from "./GithubImport";
+import { DEFAULT_RESOURCES_PARQUET, PARQUET_ARTIFACTS, usingDefaultResourceStarter } from "../config/parquetArtifacts";
 
 interface ImportPageProps {
     resourceCount?: number;
@@ -14,6 +15,7 @@ export const ImportPage: React.FC<ImportPageProps> = ({ resourceCount = 0, onImp
     const [mode, setMode] = useState<"local" | "github">("local");
     const [repoRootHandle, setRepoRootHandle] = useState<any | null>(null);
     const [repoRootName, setRepoRootName] = useState<string>("");
+    const usingStarterArtifact = usingDefaultResourceStarter();
 
     const handleExportJsonZip = async () => {
         try {
@@ -135,7 +137,7 @@ export const ImportPage: React.FC<ImportPageProps> = ({ resourceCount = 0, onImp
 
         try {
             setLoading(true);
-            setStatus("Writing current catalog into web/public/resources.parquet, web/public/resource_distributions.parquet, and web/public/records.duckdb...");
+            setStatus(`Writing current catalog into web/public/${PARQUET_ARTIFACTS.resources}, web/public/${PARQUET_ARTIFACTS.distributions}, and web/public/records.duckdb...`);
             const result = await publishCurrentDataToRepoRoot(repoRootHandle);
             const extraDuckdb = result.duckdbFileName
                 ? ` and snapshot ${result.publicDirPath}/${result.duckdbFileName}`
@@ -263,11 +265,16 @@ export const ImportPage: React.FC<ImportPageProps> = ({ resourceCount = 0, onImp
             <div className="bg-white dark:bg-slate-900 rounded-lg border border-gray-200 dark:border-slate-800 p-6 shadow-sm">
                 <h2 className="text-lg font-semibold mb-4 text-slate-900 dark:text-slate-200">3. Publish Workflow</h2>
                 <p className="text-slate-500 dark:text-slate-400 mb-6 text-sm">
-                    Choose your local repository root and write the current dataset into <code>web/public/resources.parquet</code>,
-                    <code>web/public/resource_distributions.parquet</code>, and a DuckDB snapshot at <code>web/public/records.duckdb</code>.
+                    Choose your local repository root and write the current dataset into <code>web/public/{PARQUET_ARTIFACTS.resources}</code>,
+                    <code>web/public/{PARQUET_ARTIFACTS.distributions}</code>, and a DuckDB snapshot at <code>web/public/records.duckdb</code>.
                     After that, all you need to do is commit and push those files. GitHub Pages will rebuild
                     the site with those published artifacts.
                 </p>
+                {usingStarterArtifact && (
+                    <div className="mb-4 rounded-md border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-200">
+                        <code>{DEFAULT_RESOURCES_PARQUET}</code> is reserved as the empty starter artifact. Set <code>VITE_RESOURCES_PARQUET</code> to a named file before publishing fork data.
+                    </div>
+                )}
 
                 <div className="space-y-4">
                     <div className="rounded border border-gray-200 dark:border-slate-700 bg-gray-50 dark:bg-slate-800 p-4">
@@ -296,13 +303,13 @@ export const ImportPage: React.FC<ImportPageProps> = ({ resourceCount = 0, onImp
                     <div className="rounded border border-emerald-200 dark:border-emerald-900/50 bg-emerald-50 dark:bg-emerald-950/20 p-4">
                         <h3 className="text-sm font-medium text-slate-900 dark:text-slate-200">Write Publishable Metadata</h3>
                         <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 mb-4">
-                            This writes the current in-browser dataset to <code>web/public/resources.parquet</code> plus
-                            <code>web/public/resource_distributions.parquet</code>.
+                            This writes the current in-browser dataset to <code>web/public/{PARQUET_ARTIFACTS.resources}</code> plus
+                            <code>web/public/{PARQUET_ARTIFACTS.distributions}</code>.
                             Once complete, commit and push both files so everyone sees the same dataset on GitHub Pages.
                         </p>
                         <button
                             onClick={handlePublishToMetadata}
-                            disabled={loading || !repoRootHandle || resourceCount === 0}
+                            disabled={loading || !repoRootHandle || resourceCount === 0 || usingStarterArtifact}
                             className="w-full bg-emerald-600 text-white px-4 py-2 rounded-md hover:bg-emerald-500 disabled:opacity-50 text-sm font-medium transition-colors"
                         >
                             {loading ? "Publishing..." : "Prepare Parquet files for commit"}

@@ -11,11 +11,24 @@ interface QueueItem {
     id: string;
     resource: Resource;
     distributions: Distribution[];
+    signature: string;
+}
+
+function thumbnailSignature(resource: Resource, distributions: Distribution[]): string {
+    const distributionSignature = distributions
+        .map((dist) => `${dist.relation_key || ""}:${dist.url || ""}:${dist.label || ""}`)
+        .join("|");
+    return [
+        resource.thumbnail || "",
+        resource.dct_references_s || "",
+        resource.dct_format_s || "",
+        distributionSignature,
+    ].join("\n");
 }
 
 export function useThumbnailQueue() {
     const [thumbnails, setThumbnails] = useState<Record<string, string | null>>({});
-    const processedRef = useRef<Set<string>>(new Set());
+    const processedRef = useRef<Map<string, string>>(new Map());
 
     // A queue map to dedup requests
     const queueRef = useRef<Map<string, QueueItem>>(new Map());
@@ -30,7 +43,8 @@ export function useThumbnailQueue() {
 
         pending.forEach(item => {
             // Mark as processed (started)
-            processedRef.current.add(item.id);
+            if (!(processedRef.current instanceof Map)) processedRef.current = new Map();
+            processedRef.current.set(item.id, item.signature);
 
             limit(async () => {
                 try {
@@ -65,10 +79,12 @@ export function useThumbnailQueue() {
 
     // Function to register an item for thumbnail fetching
     const register = useCallback((id: string, resource: Resource, distributions: Distribution[] = []) => {
-        if (processedRef.current.has(id)) return;
+        const signature = thumbnailSignature(resource, distributions);
+        if (!(processedRef.current instanceof Map)) processedRef.current = new Map();
+        if (processedRef.current.get(id) === signature) return;
         if (queueRef.current.has(id)) return; // Already queued
 
-        queueRef.current.set(id, { id, resource, distributions });
+        queueRef.current.set(id, { id, resource, distributions, signature });
 
         // Trigger processing
         processQueue();

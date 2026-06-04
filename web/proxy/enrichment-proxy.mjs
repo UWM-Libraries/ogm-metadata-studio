@@ -90,6 +90,9 @@ const S3_MULTIPART_PART_SIZE_BYTES = Math.max(5 * 1024 * 1024, Number(process.en
 const GEOSPATIAL_DERIVATIVE_TIMEOUT_MS = Number(process.env.ENRICHMENT_PROXY_GEOSPATIAL_DERIVATIVE_TIMEOUT_MS || 60 * 60 * 1000);
 const COG_PREVIEW_TIMEOUT_MS = Number(process.env.ENRICHMENT_PROXY_COG_PREVIEW_TIMEOUT_MS || 120_000);
 const COG_PREVIEW_MAX_DIMENSION = Number(process.env.ENRICHMENT_PROXY_COG_PREVIEW_MAX_DIMENSION || 1400);
+const PMTILES_PREVIEW_MAX_TILE_REQUESTS = Number(process.env.ENRICHMENT_PROXY_PMTILES_PREVIEW_MAX_TILE_REQUESTS || 64);
+const PMTILES_PREVIEW_MAX_FEATURES = Number(process.env.ENRICHMENT_PROXY_PMTILES_PREVIEW_MAX_FEATURES || 8000);
+const PMTILES_PREVIEW_MAX_COORDINATES = Number(process.env.ENRICHMENT_PROXY_PMTILES_PREVIEW_MAX_COORDINATES || 160000);
 const MAX_LIST_PAGES = Number(process.env.ENRICHMENT_PROXY_MAX_LIST_PAGES || 1000);
 const EMPTY_HASH = crypto.createHash("sha256").update("").digest("hex");
 const VISION_TEST_IMAGE = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=", "base64");
@@ -131,9 +134,107 @@ function sha256Text(value) {
   return crypto.createHash("sha256").update(String(value || "")).digest("hex");
 }
 
+const uploadJobs = new Map();
+const UPLOAD_JOB_TTL_MS = 6 * 60 * 60 * 1000;
+
+function pruneUploadJobs() {
+  const cutoff = Date.now() - UPLOAD_JOB_TTL_MS;
+  for (const [jobId, job] of uploadJobs.entries()) {
+    const updatedAt = Date.parse(job.updatedAt || job.startedAt || "");
+    if (Number.isFinite(updatedAt) && updatedAt < cutoff) uploadJobs.delete(jobId);
+  }
+}
+
+function summarizeUploadJob(job) {
+  const milestones = Array.isArray(job?.milestones) ? job.milestones : [];
+  const latest = milestones[milestones.length - 1] || null;
+  const cropSummary = {
+    provider: "",
+    phase: "",
+    cropCount: 0,
+    started: 0,
+    completed: 0,
+    failed: 0,
+    labels: 0,
+    claims: 0,
+    cacheHits: 0,
+  };
+  const providers = [
+    { prefix: "Kimi map-agent swarm", provider: "Kimi" },
+    { prefix: "Gemini map-label extraction", provider: "Gemini" },
+    { prefix: "OpenAI map-label reconciliation", provider: "OpenAI" },
+  ];
+  for (const milestone of milestones) {
+    const label = String(milestone?.label || "");
+    const detail = milestone?.detail || {};
+    const match = providers.find((item) => label.startsWith(item.prefix));
+    if (!match || !Number.isFinite(Number(detail.crop))) continue;
+    cropSummary.provider = match.provider;
+    cropSummary.cropCount = Math.max(cropSummary.cropCount, Number(detail.cropCount || 0));
+    if (label.endsWith("crop request started")) cropSummary.started += 1;
+    if (label.endsWith("crop response received")) {
+      cropSummary.completed += 1;
+      cropSummary.labels += Number(detail.labels || 0);
+      cropSummary.claims += Number(detail.claims || 0);
+      if (detail.cacheHit === true) cropSummary.cacheHits += 1;
+    }
+    if (label.endsWith("crop failed")) cropSummary.failed += 1;
+  }
+  if (cropSummary.cropCount > 0) {
+    const done = cropSummary.completed + cropSummary.failed;
+    cropSummary.phase = `${cropSummary.provider} crop processing`;
+    return {
+      kind: "crop",
+      label: `${cropSummary.provider} crops ${done}/${cropSummary.cropCount} complete (${cropSummary.completed} succeeded, ${cropSummary.failed} failed, ${Math.max(0, cropSummary.cropCount - done)} pending)`,
+      percent: Math.round((done / cropSummary.cropCount) * 100),
+      ...cropSummary,
+    };
+  }
+  return latest ? {
+    kind: "milestone",
+    label: latest.label,
+    percent: null,
+  } : null;
+}
+
+function uploadJobSnapshot(jobId) {
+  const job = uploadJobs.get(jobId);
+  if (!job) return null;
+  return {
+    jobId: job.jobId,
+    fileName: job.fileName,
+    status: job.status,
+    startedAt: job.startedAt,
+    updatedAt: job.updatedAt,
+    completedAt: job.completedAt,
+    error: job.error,
+    summary: summarizeUploadJob(job),
+    milestones: job.milestones,
+  };
+}
+
+function finishUploadJob(jobId, status, detail = {}) {
+  const job = uploadJobs.get(jobId);
+  if (!job) return;
+  job.status = status;
+  job.updatedAt = new Date().toISOString();
+  job.completedAt = job.updatedAt;
+  if (detail.error) job.error = detail.error;
+}
+
 function createUploadLogger(jobId, fileName) {
+  pruneUploadJobs();
   const startedAt = Date.now();
   const milestones = [];
+  const job = {
+    jobId,
+    fileName,
+    status: "active",
+    startedAt: new Date(startedAt).toISOString(),
+    updatedAt: new Date(startedAt).toISOString(),
+    milestones,
+  };
+  uploadJobs.set(jobId, job);
   return {
     milestones,
     log(label, detail = {}) {
@@ -144,6 +245,7 @@ function createUploadLogger(jobId, fileName) {
         detail,
       };
       milestones.push(entry);
+      job.updatedAt = entry.at;
       console.log(`[upload:${jobId}] ${label}`, safeJsonStringify({ fileName, elapsed_ms: entry.elapsed_ms, ...detail }));
     },
   };
@@ -237,6 +339,13 @@ function send(res, status, body) {
     "Access-Control-Expose-Headers": "Accept-Ranges, Content-Length, Content-Range, Content-Type, ETag, Last-Modified",
   });
   res.end(safeJsonStringify(body));
+}
+
+class HttpError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
 }
 
 async function readJson(req) {
@@ -609,6 +718,38 @@ async function proxyArtifactObject(config, req, res, rawUrl) {
   res.end(buffer);
 }
 
+async function uploadArtifactObject(config, body) {
+  const profile = findProfile(config, "storage", body.storageProfileId);
+  const key = String(body.key || "").replace(/^\/+/, "");
+  if (!key) throw new Error("Artifact upload requires a key.");
+
+  const uploadRoot = uploadBasePrefix(profile).replace(/\/+$/, "");
+  if (!key.startsWith(`${uploadRoot}/`)) {
+    throw new Error("Artifact upload key is outside the configured upload prefix.");
+  }
+
+  let buffer;
+  if (typeof body.base64 === "string" && body.base64.trim()) {
+    buffer = Buffer.from(body.base64, "base64");
+  } else if (typeof body.text === "string") {
+    buffer = Buffer.from(body.text, "utf8");
+  } else if (body.json && typeof body.json === "object") {
+    buffer = Buffer.from(safeJsonStringify(body.json, 2), "utf8");
+  } else {
+    throw new Error("Artifact upload requires base64, text, or json.");
+  }
+
+  const contentType = String(body.contentType || contentTypeForKey(key));
+  await putObjectBuffer(profile, key, buffer, contentType);
+  return {
+    ok: true,
+    key,
+    url: accessUrlFor(profile, key),
+    bytes: buffer.length,
+    contentType,
+  };
+}
+
 function parseCogPreviewDimension(value, fallback) {
   const parsed = Math.round(Number(value));
   if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
@@ -658,10 +799,15 @@ function cogPreviewRenderOptions(info) {
   const hasRgb = interpretations.includes("red") && interpretations.includes("green") && interpretations.includes("blue");
   const hasNonByteBand = nonAlphaBands.some((band) => String(band?.type || "").toLowerCase() !== "byte");
   const layerType = String(firstBand?.metadata?.[""]?.LAYER_TYPE || "").toLowerCase();
+  const nbits = Number(firstBand?.metadata?.IMAGE_STRUCTURE?.NBITS || 0);
+  const colorTableEntries = Array.isArray(firstBand?.colorTable?.entries) ? firstBand.colorTable.entries.length : 0;
+  const histogramBins = Number(firstBand?.metadata?.[""]?.STATISTICS_HISTONUMBINS || 0);
+  const isBinaryPalette = hasPalette && (nbits === 1 || colorTableEntries === 2 || histogramBins === 2);
   return {
     expandPalette: hasPalette,
     resampling: hasPalette || layerType === "thematic" ? "near" : "bilinear",
     scaleToByte: !hasPalette && (hasNonByteBand || (!hasRgb && nonAlphaBands.length <= 1)),
+    disableOverviews: isBinaryPalette,
   };
 }
 
@@ -685,6 +831,7 @@ async function renderCogPreviewWithSource(sourcePath, outputPath, bbox, width, h
     "-te", String(bbox.west), String(bbox.south), String(bbox.east), String(bbox.north),
     "-ts", String(width), String(height),
     "-r", renderOptions.resampling,
+    ...(renderOptions.disableOverviews ? ["-ovr", "NONE"] : []),
     "-dstalpha",
     "-multi",
     "-wo", "NUM_THREADS=ALL_CPUS",
@@ -725,7 +872,7 @@ function responseFromCogInfo(info) {
 
 async function inspectCogArtifact(config, res, rawUrl) {
   const { profile, key } = findArtifactProfileAndKey(config, rawUrl);
-  if (!/\.tiff?$/i.test(key)) throw new Error("COG metadata only supports GeoTIFF artifacts.");
+  if (!/\.tiff?$/i.test(key)) throw new HttpError(415, "COG metadata only supports GeoTIFF artifacts.");
   if (!await resolveCommandPath("gdalinfo")) {
     throw new Error("COG metadata requires GDAL gdalinfo to be installed.");
   }
@@ -755,7 +902,7 @@ async function inspectCogArtifact(config, res, rawUrl) {
 
 async function previewCogArtifact(config, res, rawUrl, searchParams) {
   const { profile, key } = findArtifactProfileAndKey(config, rawUrl);
-  if (!/\.tiff?$/i.test(key)) throw new Error("COG preview only supports GeoTIFF artifacts.");
+  if (!/\.tiff?$/i.test(key)) throw new HttpError(415, "COG preview only supports GeoTIFF artifacts.");
   if (!await resolveCommandPath("gdalwarp")) {
     throw new Error("COG preview requires GDAL gdalwarp to be installed.");
   }
@@ -808,6 +955,559 @@ async function previewCogArtifact(config, res, rawUrl, searchParams) {
   } finally {
     await rm(tempRoot, { recursive: true, force: true });
   }
+}
+
+function isRasterPreviewFileName(name) {
+  return /\.(?:tiff?|jp2|j2k|jpe?g|png|webp)$/i.test(String(name || ""));
+}
+
+async function rasterPreviewSourceFromArtifact(config, rawUrl) {
+  const { profile, key } = findArtifactProfileAndKey(config, rawUrl);
+  const buffer = await fetchObjectBuffer(profile, key);
+  if (!/\.zip$/i.test(key)) {
+    if (!isRasterPreviewFileName(key)) throw new HttpError(415, "Raster preview only supports image or ZIP package artifacts.");
+    return { buffer, name: path.basename(key) || "source.tif" };
+  }
+
+  const mod = await import("jszip");
+  const JSZip = mod.default || mod;
+  const zip = await JSZip.loadAsync(buffer);
+  const entry = Object.values(zip.files)
+    .filter((file) => !file.dir && isRasterPreviewFileName(file.name))
+    .sort((a, b) => {
+      const aIsTiff = /\.tiff?$/i.test(a.name) ? 0 : 1;
+      const bIsTiff = /\.tiff?$/i.test(b.name) ? 0 : 1;
+      return aIsTiff - bIsTiff || a.name.localeCompare(b.name);
+    })[0];
+  if (!entry) throw new Error("ZIP package did not contain a raster image that can be previewed.");
+  return { buffer: Buffer.from(await entry.async("nodebuffer")), name: entry.name };
+}
+
+async function previewRasterArtifact(config, res, rawUrl, searchParams) {
+  const sharp = await loadSharp();
+  if (!sharp) throw new Error("Raster preview requires the optional sharp package.");
+
+  const width = parseCogPreviewDimension(searchParams.get("width"), 800);
+  const height = parseCogPreviewDimension(searchParams.get("height"), 600);
+  const source = await rasterPreviewSourceFromArtifact(config, rawUrl);
+  const rendered = await sharp(source.buffer, { limitInputPixels: false })
+    .rotate()
+    .resize({ width, height, fit: "inside", withoutEnlargement: true })
+    .toColorspace("srgb")
+    .png()
+    .toBuffer();
+  res.writeHead(200, {
+    "Content-Type": "image/png",
+    "Cache-Control": "public, max-age=300",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type, Range",
+    "Access-Control-Allow-Methods": "GET,OPTIONS",
+  });
+  res.end(rendered);
+}
+
+function pmtilesArtifactSource(profile, key) {
+  const url = objectUrl(profile, key);
+  return {
+    getKey() {
+      return url.toString();
+    },
+    async getBytes(offset, length) {
+      const end = offset + length - 1;
+      const response = await signedFetch(profile, url, {
+        headers: { Range: `bytes=${offset}-${end}` },
+        timeoutMs: S3_OBJECT_TIMEOUT_MS,
+      });
+      if (![200, 206].includes(response.status)) {
+        const status = response.status === 404 ? 404 : 502;
+        throw new HttpError(status, `PMTiles range request failed with status ${response.status}.`);
+      }
+      const etag = response.headers.get("etag") || undefined;
+      return {
+        data: await response.arrayBuffer(),
+        etag: etag && !etag.startsWith("W/") ? etag : undefined,
+        cacheControl: response.headers.get("cache-control") || undefined,
+        expires: response.headers.get("expires") || undefined,
+      };
+    },
+  };
+}
+
+function validPmtilesPreviewBbox(bbox) {
+  if (!bbox) return null;
+  const west = Number(bbox.west);
+  const south = Number(bbox.south);
+  const east = Number(bbox.east);
+  const north = Number(bbox.north);
+  if (![west, south, east, north].every(Number.isFinite)) return null;
+  if (west < -180 || east > 180 || south < -90 || north > 90) return null;
+  if (!(east > west && north > south)) return null;
+  return { west, south, east, north };
+}
+
+function pmtilesHeaderBbox(header) {
+  return validPmtilesPreviewBbox({
+    west: header?.minLon,
+    south: header?.minLat,
+    east: header?.maxLon,
+    north: header?.maxLat,
+  });
+}
+
+function pmtilesPreviewBbox(searchParams, header) {
+  const bboxParam = searchParams.get("bbox");
+  if (bboxParam) return parseCogPreviewBbox(bboxParam);
+  return pmtilesHeaderBbox(header) || { west: -180, south: -85, east: 180, north: 85 };
+}
+
+const WEB_MERCATOR_MAX_LAT = 85.05112878;
+const TILE_SIZE = 256;
+
+function lngLatToWorldPixel(lng, lat, zoom) {
+  const scale = TILE_SIZE * (2 ** zoom);
+  const clampedLat = clampNumber(lat, -WEB_MERCATOR_MAX_LAT, WEB_MERCATOR_MAX_LAT);
+  const sin = Math.sin((clampedLat * Math.PI) / 180);
+  return {
+    x: ((lng + 180) / 360) * scale,
+    y: (0.5 - Math.log((1 + sin) / (1 - sin)) / (4 * Math.PI)) * scale,
+  };
+}
+
+function bestPmtilesPreviewZoom(bbox, width, height, minZoom, maxZoom) {
+  const padding = 0.82;
+  let best = minZoom;
+  for (let zoom = minZoom; zoom <= maxZoom; zoom += 1) {
+    const nw = lngLatToWorldPixel(bbox.west, bbox.north, zoom);
+    const se = lngLatToWorldPixel(bbox.east, bbox.south, zoom);
+    const fits = Math.abs(se.x - nw.x) <= width * padding && Math.abs(se.y - nw.y) <= height * padding;
+    if (fits) best = zoom;
+    else if (zoom > best) break;
+  }
+  return best;
+}
+
+function pmtilesPreviewView(bbox, width, height, zoom) {
+  const center = lngLatToWorldPixel((bbox.west + bbox.east) / 2, (bbox.south + bbox.north) / 2, zoom);
+  const worldSize = TILE_SIZE * (2 ** zoom);
+  const minX = center.x - width / 2;
+  const minY = center.y - height / 2;
+  const maxX = center.x + width / 2;
+  const maxY = center.y + height / 2;
+  const tileLimit = (2 ** zoom) - 1;
+  const minTileX = clampNumber(Math.floor(minX / TILE_SIZE), 0, tileLimit);
+  const maxTileX = clampNumber(Math.floor((maxX - 1) / TILE_SIZE), 0, tileLimit);
+  const minTileY = clampNumber(Math.floor(minY / TILE_SIZE), 0, tileLimit);
+  const maxTileY = clampNumber(Math.floor((maxY - 1) / TILE_SIZE), 0, tileLimit);
+  return {
+    zoom,
+    width,
+    height,
+    minX: clampNumber(minX, 0, worldSize),
+    minY: clampNumber(minY, 0, worldSize),
+    minTileX,
+    maxTileX,
+    minTileY,
+    maxTileY,
+  };
+}
+
+function pmtilesPreviewTileCount(view) {
+  return Math.max(0, view.maxTileX - view.minTileX + 1) * Math.max(0, view.maxTileY - view.minTileY + 1);
+}
+
+function pmtilesPreviewViews(bbox, width, height, header) {
+  const minZoom = Math.max(0, Math.min(22, Number(header.minZoom || 0)));
+  const maxZoom = Math.max(minZoom, Math.min(22, Number(header.maxZoom || minZoom)));
+  const preferred = bestPmtilesPreviewZoom(bbox, width, height, minZoom, maxZoom);
+  const views = [];
+  const seen = new Set();
+  const push = (zoom) => {
+    if (seen.has(zoom)) return;
+    seen.add(zoom);
+    const view = pmtilesPreviewView(bbox, width, height, zoom);
+    if (pmtilesPreviewTileCount(view) <= PMTILES_PREVIEW_MAX_TILE_REQUESTS) views.push(view);
+  };
+  for (let zoom = preferred; zoom >= minZoom; zoom -= 1) push(zoom);
+  for (let zoom = preferred + 1; zoom <= maxZoom && views.length < 6; zoom += 1) push(zoom);
+  return views;
+}
+
+function svgNumber(value) {
+  return String(Math.round(Number(value) * 10) / 10);
+}
+
+function includeSvgStatePoint(state, x, y) {
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+  state.bounds.minX = Math.min(state.bounds.minX, x);
+  state.bounds.minY = Math.min(state.bounds.minY, y);
+  state.bounds.maxX = Math.max(state.bounds.maxX, x);
+  state.bounds.maxY = Math.max(state.bounds.maxY, y);
+}
+
+function emptyPmtilesSvgState() {
+  return {
+    polygons: [],
+    lines: [],
+    points: [],
+    featureCount: 0,
+    coordinateCount: 0,
+    bounds: { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity },
+  };
+}
+
+function appendVectorFeatureSvg(feature, tileX, tileY, view, state) {
+  if (state.featureCount >= PMTILES_PREVIEW_MAX_FEATURES || state.coordinateCount >= PMTILES_PREVIEW_MAX_COORDINATES) return false;
+  const geometry = feature.loadGeometry();
+  const scale = TILE_SIZE / Number(feature.extent || 4096);
+  const project = (point) => {
+    const x = tileX * TILE_SIZE + point.x * scale - view.minX;
+    const y = tileY * TILE_SIZE + point.y * scale - view.minY;
+    includeSvgStatePoint(state, x, y);
+    return [x, y];
+  };
+
+  state.featureCount += 1;
+  if (feature.type === 1) {
+    for (const line of geometry) {
+      const point = line[0];
+      if (!point) continue;
+      const [x, y] = project(point);
+      state.points.push(`<circle cx="${svgNumber(x)}" cy="${svgNumber(y)}" r="2.4"/>`);
+      state.coordinateCount += 1;
+    }
+    return true;
+  }
+
+  for (const line of geometry) {
+    if (!Array.isArray(line) || line.length === 0) continue;
+    const commands = [];
+    for (let index = 0; index < line.length; index += 1) {
+      const [x, y] = project(line[index]);
+      commands.push(`${index === 0 ? "M" : "L"}${svgNumber(x)} ${svgNumber(y)}`);
+      state.coordinateCount += 1;
+      if (state.coordinateCount >= PMTILES_PREVIEW_MAX_COORDINATES) break;
+    }
+    if (commands.length === 0) continue;
+    if (feature.type === 3) {
+      state.polygons.push(`${commands.join(" ")} Z`);
+    } else {
+      state.lines.push(commands.join(" "));
+    }
+    if (state.coordinateCount >= PMTILES_PREVIEW_MAX_COORDINATES) break;
+  }
+  return true;
+}
+
+async function collectPmtilesPreviewSvgState(archive, view, modules) {
+  const state = emptyPmtilesSvgState();
+  const { VectorTile, Pbf } = modules;
+  for (let x = view.minTileX; x <= view.maxTileX; x += 1) {
+    for (let y = view.minTileY; y <= view.maxTileY; y += 1) {
+      if (state.featureCount >= PMTILES_PREVIEW_MAX_FEATURES || state.coordinateCount >= PMTILES_PREVIEW_MAX_COORDINATES) return state;
+      const tile = await archive.getZxy(view.zoom, x, y);
+      if (!tile?.data) continue;
+      const vectorTile = new VectorTile(new Pbf(new Uint8Array(tile.data)));
+      for (const layer of Object.values(vectorTile.layers || {})) {
+        for (let index = 0; index < layer.length; index += 1) {
+          const keepGoing = appendVectorFeatureSvg(layer.feature(index), x, y, view, state);
+          if (!keepGoing) return state;
+        }
+      }
+    }
+  }
+  return state;
+}
+
+function pmtilesSvgContentTransform(width, height, state) {
+  const { minX, minY, maxX, maxY } = state.bounds;
+  if (![minX, minY, maxX, maxY].every(Number.isFinite)) return "";
+  const contentWidth = maxX - minX;
+  const contentHeight = maxY - minY;
+  if (!(contentWidth > 0) || !(contentHeight > 0)) return "";
+  const paddingX = Math.max(18, width * 0.08);
+  const paddingY = Math.max(18, height * 0.08);
+  const scale = Math.min((width - paddingX * 2) / contentWidth, (height - paddingY * 2) / contentHeight);
+  if (!Number.isFinite(scale) || scale <= 0) return "";
+  const tx = (width - contentWidth * scale) / 2 - minX * scale;
+  const ty = (height - contentHeight * scale) / 2 - minY * scale;
+  if (!Number.isFinite(tx) || !Number.isFinite(ty)) return "";
+  return ` transform="translate(${svgNumber(tx)} ${svgNumber(ty)}) scale(${svgNumber(scale)})"`;
+}
+
+function pmtilesPreviewSvg(width, height, state) {
+  const polygons = state.polygons.length > 0
+    ? `<path d="${state.polygons.join(" ")}" fill="#60a5fa" fill-opacity="0.32" fill-rule="evenodd" stroke="#2563eb" stroke-opacity="0.82" stroke-width="1" vector-effect="non-scaling-stroke"/>`
+    : "";
+  const lines = state.lines.length > 0
+    ? `<path d="${state.lines.join(" ")}" fill="none" stroke="#1d4ed8" stroke-opacity="0.95" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" vector-effect="non-scaling-stroke"/>`
+    : "";
+  const points = state.points.length > 0
+    ? `<g fill="#2563eb" fill-opacity="0.92" stroke="#ffffff" stroke-width="0.9">${state.points.join("")}</g>`
+    : "";
+  const fallback = !polygons && !lines && !points
+    ? `<rect x="${width * 0.22}" y="${height * 0.22}" width="${width * 0.56}" height="${height * 0.56}" rx="2" fill="#60a5fa" fill-opacity="0.2" stroke="#2563eb" stroke-width="2"/>`
+    : "";
+  const contentTransform = pmtilesSvgContentTransform(width, height, state);
+  return `
+    <svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
+      <defs>
+        <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+          <path d="M32 0H0V32" fill="none" stroke="#e2e8f0" stroke-width="1"/>
+        </pattern>
+      </defs>
+      <rect width="${width}" height="${height}" fill="#f8fafc"/>
+      <rect width="${width}" height="${height}" fill="url(#grid)" opacity="0.75"/>
+      ${fallback}
+      <g${contentTransform}>
+        ${polygons}
+        ${lines}
+        ${points}
+      </g>
+      <rect x="0.5" y="0.5" width="${width - 1}" height="${height - 1}" fill="none" stroke="#cbd5e1"/>
+    </svg>
+  `;
+}
+
+async function previewPmtilesArtifact(config, res, rawUrl, searchParams) {
+  const sharp = await loadSharp();
+  if (!sharp) throw new Error("PMTiles preview requires the optional sharp package.");
+
+  const { profile, key } = findArtifactProfileAndKey(config, rawUrl);
+  if (!/\.pmtiles$/i.test(key)) throw new HttpError(415, "PMTiles preview only supports .pmtiles artifacts.");
+
+  const [{ PMTiles, TileType }, vectorTileModule, pbfModule] = await Promise.all([
+    import("pmtiles"),
+    import("@mapbox/vector-tile"),
+    import("pbf"),
+  ]);
+  const VectorTile = vectorTileModule.VectorTile || vectorTileModule.default?.VectorTile;
+  const Pbf = pbfModule.default || pbfModule;
+  if (!VectorTile || !Pbf) throw new Error("PMTiles preview could not load vector tile parsers.");
+
+  const width = parseCogPreviewDimension(searchParams.get("width"), 800);
+  const height = parseCogPreviewDimension(searchParams.get("height"), 600);
+  const archive = new PMTiles(pmtilesArtifactSource(profile, key));
+  const header = await archive.getHeader();
+  if (header.tileType !== TileType.Mvt) throw new Error("PMTiles preview only supports vector PMTiles archives.");
+
+  const bbox = pmtilesPreviewBbox(searchParams, header);
+  const views = pmtilesPreviewViews(bbox, width, height, header);
+  let state = emptyPmtilesSvgState();
+  for (const view of views) {
+    state = await collectPmtilesPreviewSvgState(archive, view, { VectorTile, Pbf });
+    if (state.polygons.length > 0 || state.lines.length > 0 || state.points.length > 0) break;
+  }
+
+  const rendered = await sharp(Buffer.from(pmtilesPreviewSvg(width, height, state)))
+    .png()
+    .toBuffer();
+  res.writeHead(200, {
+    "Content-Type": "image/png",
+    "Cache-Control": "public, max-age=300",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type, Range",
+    "Access-Control-Allow-Methods": "GET,OPTIONS",
+  });
+  res.end(rendered);
+}
+
+async function vectorPackageGeojsonBuffer(config, rawUrl) {
+  const { profile, key } = findArtifactProfileAndKey(config, rawUrl);
+  if (!/\.zip$/i.test(key)) throw new HttpError(415, "Vector package preview only supports zipped shapefile artifacts.");
+
+  const sourceBuffer = await fetchObjectBuffer(profile, key);
+  const entries = await zipEntriesFromBuffer(sourceBuffer);
+  const shapefile = findShapefileSet(entries);
+  if (!shapefile) throw new Error("ZIP package did not contain a shapefile.");
+
+  const analysis = analyzeShapefilePackage(entries, shapefile, path.basename(key));
+  const nativeGeojson = geojsonFromShapefile(shapefile.shp.buffer, analysis.dbf, analysis.manifest);
+  if (nativeGeojson) return Buffer.from(safeJsonStringify(nativeGeojson), "utf8");
+
+  const ogr2ogrPath = await resolveCommandPath("ogr2ogr");
+  if (!ogr2ogrPath) throw new Error("Vector package preview requires ogr2ogr for projected shapefiles.");
+
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "ogm-vector-preview-"));
+  try {
+    await writeEntriesToDirectory(entries, tempRoot);
+    const shpPath = path.join(tempRoot, shapefile.shp.name);
+    const geojsonPath = path.join(tempRoot, `${analysis.manifest.dataset.baseName}.geojson`);
+    const result = await tryExecFile("ogr2ogr", [
+      "-t_srs", "EPSG:4326",
+      "-f", "GeoJSON",
+      geojsonPath,
+      shpPath,
+    ], { timeoutMs: GEOSPATIAL_DERIVATIVE_TIMEOUT_MS, env: { SHAPE_RESTORE_SHX: "YES" } });
+    if (!result.ok || !existsSync(geojsonPath)) {
+      throw new Error(result.error || "ogr2ogr did not create a GeoJSON preview.");
+    }
+    return await readFile(geojsonPath);
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+}
+
+function geoJsonFeatures(value) {
+  if (!value || typeof value !== "object") return [];
+  if (value.type === "FeatureCollection") return Array.isArray(value.features) ? value.features : [];
+  if (value.type === "Feature") return [value];
+  if (value.type && value.coordinates) return [{ type: "Feature", geometry: value, properties: {} }];
+  return [];
+}
+
+function collectGeoJsonBounds(node, bounds) {
+  if (!Array.isArray(node)) return;
+  if (node.length >= 2 && typeof node[0] === "number" && typeof node[1] === "number") {
+    const x = Number(node[0]);
+    const y = Number(node[1]);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+    bounds.minX = Math.min(bounds.minX, x);
+    bounds.minY = Math.min(bounds.minY, y);
+    bounds.maxX = Math.max(bounds.maxX, x);
+    bounds.maxY = Math.max(bounds.maxY, y);
+    return;
+  }
+  node.forEach((item) => collectGeoJsonBounds(item, bounds));
+}
+
+function geoJsonPreviewBounds(geojson) {
+  const bounds = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
+  for (const feature of geoJsonFeatures(geojson)) collectGeoJsonBounds(feature?.geometry?.coordinates, bounds);
+  return [bounds.minX, bounds.minY, bounds.maxX, bounds.maxY].every(Number.isFinite) ? bounds : null;
+}
+
+function geoJsonPathForLine(line, project, close = false) {
+  if (!Array.isArray(line)) return "";
+  const commands = [];
+  for (const coord of line) {
+    if (!Array.isArray(coord) || coord.length < 2) continue;
+    const projected = project(coord);
+    if (!projected) continue;
+    commands.push(`${commands.length === 0 ? "M" : "L"}${svgNumber(projected[0])} ${svgNumber(projected[1])}`);
+  }
+  if (commands.length < 2) return "";
+  return `${commands.join(" ")}${close ? " Z" : ""}`;
+}
+
+function appendGeoJsonGeometrySvg(geometry, project, parts) {
+  if (!geometry || typeof geometry !== "object") return;
+  const { type, coordinates } = geometry;
+  if (type === "Polygon") {
+    for (const ring of coordinates || []) {
+      const pathData = geoJsonPathForLine(ring, project, true);
+      if (pathData) parts.polygons.push(pathData);
+    }
+  } else if (type === "MultiPolygon") {
+    for (const polygon of coordinates || []) {
+      for (const ring of polygon || []) {
+        const pathData = geoJsonPathForLine(ring, project, true);
+        if (pathData) parts.polygons.push(pathData);
+      }
+    }
+  } else if (type === "LineString") {
+    const pathData = geoJsonPathForLine(coordinates, project);
+    if (pathData) parts.lines.push(pathData);
+  } else if (type === "MultiLineString") {
+    for (const line of coordinates || []) {
+      const pathData = geoJsonPathForLine(line, project);
+      if (pathData) parts.lines.push(pathData);
+    }
+  } else if (type === "Point") {
+    const point = project(coordinates);
+    if (point) parts.points.push(`<circle cx="${svgNumber(point[0])}" cy="${svgNumber(point[1])}" r="2.4"/>`);
+  } else if (type === "MultiPoint") {
+    for (const coord of coordinates || []) {
+      const point = project(coord);
+      if (point) parts.points.push(`<circle cx="${svgNumber(point[0])}" cy="${svgNumber(point[1])}" r="2.4"/>`);
+    }
+  }
+}
+
+function geoJsonPreviewSvg(geojson, width, height) {
+  const bounds = geoJsonPreviewBounds(geojson);
+  const paddingX = Math.max(18, width * 0.08);
+  const paddingY = Math.max(18, height * 0.08);
+  const parts = { polygons: [], lines: [], points: [] };
+  const project = (coord) => {
+    if (!bounds || !Array.isArray(coord) || coord.length < 2) return null;
+    const x = Number(coord[0]);
+    const y = Number(coord[1]);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+    const spanX = bounds.maxX > bounds.minX ? bounds.maxX - bounds.minX : 1;
+    const spanY = bounds.maxY > bounds.minY ? bounds.maxY - bounds.minY : 1;
+    const contentWidth = Math.max(1, width - paddingX * 2);
+    const contentHeight = Math.max(1, height - paddingY * 2);
+    const scale = Math.min(contentWidth / spanX, contentHeight / spanY);
+    const drawWidth = spanX * scale;
+    const drawHeight = spanY * scale;
+    const originX = (width - drawWidth) / 2;
+    const originY = (height - drawHeight) / 2;
+    return [
+      originX + (x - bounds.minX) * scale,
+      originY + (bounds.maxY - y) * scale,
+    ];
+  };
+
+  for (const feature of geoJsonFeatures(geojson)) appendGeoJsonGeometrySvg(feature.geometry, project, parts);
+  const polygonPath = parts.polygons.length
+    ? `<path d="${parts.polygons.join(" ")}" fill="#60a5fa" fill-opacity="0.32" fill-rule="evenodd" stroke="#2563eb" stroke-opacity="0.82" stroke-width="1"/>`
+    : "";
+  const linePath = parts.lines.length
+    ? `<path d="${parts.lines.join(" ")}" fill="none" stroke="#1d4ed8" stroke-opacity="0.95" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>`
+    : "";
+  const pointGroup = parts.points.length
+    ? `<g fill="#2563eb" fill-opacity="0.92" stroke="#ffffff" stroke-width="0.9">${parts.points.join("")}</g>`
+    : "";
+  const fallback = !polygonPath && !linePath && !pointGroup
+    ? `<rect x="${width * 0.22}" y="${height * 0.22}" width="${width * 0.56}" height="${height * 0.56}" rx="2" fill="#60a5fa" fill-opacity="0.2" stroke="#2563eb" stroke-width="2"/>`
+    : "";
+  return `
+    <svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
+      <defs>
+        <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+          <path d="M32 0H0V32" fill="none" stroke="#e2e8f0" stroke-width="1"/>
+        </pattern>
+      </defs>
+      <rect width="${width}" height="${height}" fill="#f8fafc"/>
+      <rect width="${width}" height="${height}" fill="url(#grid)" opacity="0.75"/>
+      ${fallback}
+      ${polygonPath}
+      ${linePath}
+      ${pointGroup}
+      <rect x="0.5" y="0.5" width="${width - 1}" height="${height - 1}" fill="none" stroke="#cbd5e1"/>
+    </svg>
+  `;
+}
+
+async function proxyVectorGeoJsonArtifact(config, res, rawUrl) {
+  const geojson = await vectorPackageGeojsonBuffer(config, rawUrl);
+  res.writeHead(200, {
+    "Content-Type": "application/geo+json",
+    "Cache-Control": "public, max-age=300",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type, Range",
+    "Access-Control-Allow-Methods": "GET,OPTIONS",
+  });
+  res.end(geojson);
+}
+
+async function previewVectorPackageArtifact(config, res, rawUrl, searchParams) {
+  const sharp = await loadSharp();
+  if (!sharp) throw new Error("Vector package preview requires the optional sharp package.");
+  const width = parseCogPreviewDimension(searchParams.get("width"), 800);
+  const height = parseCogPreviewDimension(searchParams.get("height"), 600);
+  const geojson = JSON.parse((await vectorPackageGeojsonBuffer(config, rawUrl)).toString("utf8"));
+  const rendered = await sharp(Buffer.from(geoJsonPreviewSvg(geojson, width, height)))
+    .png()
+    .toBuffer();
+  res.writeHead(200, {
+    "Content-Type": "image/png",
+    "Cache-Control": "public, max-age=300",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type, Range",
+    "Access-Control-Allow-Methods": "GET,OPTIONS",
+  });
+  res.end(rendered);
 }
 
 function sanitizeFileName(name) {
@@ -869,6 +1569,29 @@ function geospatialUploadKeys(profile, resourceId, fileName) {
     archivalSupplement: `${root}/archival_accession_supplement.md`,
     archivalSupplementJson: `${root}/archival_accession_supplement.json`,
     aardvark: `${root}/aardvark.json`,
+  };
+}
+
+function geospatialUploadKeysFromRoot(root, fileName = "geospatial_package.zip", originalKey = "") {
+  const cleanRoot = String(root || "").replace(/\/+$/g, "");
+  const safeName = sanitizeFileName(fileName || "geospatial_package.zip");
+  const baseName = safeName.replace(/\.[^.]+$/, "") || "dataset";
+  return {
+    root: cleanRoot,
+    original: originalKey || `${cleanRoot}/original_file/${safeName}`,
+    manifest: `${cleanRoot}/dataset_manifest.json`,
+    geojson: `${cleanRoot}/derivatives/${baseName}.geojson`,
+    geoParquet: `${cleanRoot}/derivatives/${baseName}.parquet`,
+    pmtiles: `${cleanRoot}/derivatives/${baseName}.pmtiles`,
+    cog: `${cleanRoot}/derivatives/${baseName}.cog.tif`,
+    iiif: `${cleanRoot}/iiif`,
+    thumbnail: `${cleanRoot}/thumbnail/thumbnail.jpg`,
+    extraction: `${cleanRoot}/enrichment_response.json`,
+    metadataSources: `${cleanRoot}/metadata_sources`,
+    archivalSupplement: `${cleanRoot}/archival_accession_supplement.md`,
+    archivalSupplementJson: `${cleanRoot}/archival_accession_supplement.json`,
+    aiEnrichments: `${cleanRoot}/ai-enrichments.json`,
+    aardvark: `${cleanRoot}/aardvark.json`,
   };
 }
 
@@ -3487,6 +4210,51 @@ function geospatialArtifactUrlsForResource(profile, keys, resource, fallback = {
   };
 }
 
+function isLikelyGeospatialResource(fileName, resource) {
+  const lowerName = String(fileName || "").toLowerCase();
+  const format = String(resource?.dct_format_s || "").toLowerCase();
+  const refs = referencesFromResource(resource);
+  return lowerName.endsWith(".zip") ||
+    format.includes("geotiff") ||
+    format.includes("shapefile") ||
+    Boolean(refs["https://opengeometadata.org/reference/dataset-manifest"]) ||
+    Boolean(refs.geojson) ||
+    Boolean(refs.pmtiles) ||
+    Boolean(refs["https://www.cogeo.org/"]);
+}
+
+function resourceHasGeometry(resource) {
+  return Boolean(
+    String(resource?.dcat_bbox || "").trim() ||
+    String(resource?.locn_geometry || "").trim() ||
+    String(resource?.dcat_centroid || "").trim()
+  );
+}
+
+function applyManifestGeometry(resource, manifest) {
+  const bbox = manifest?.dataset?.bbox;
+  if (!bbox) return resource;
+  return {
+    ...resource,
+    dcat_bbox: resource.dcat_bbox || bboxToAardvarkEnvelope(bbox),
+    locn_geometry: resource.locn_geometry || bboxToPolygonJson(bbox),
+    dcat_centroid: resource.dcat_centroid || bboxToCentroidJson(bbox),
+    gbl_georeferenced_b: true,
+  };
+}
+
+function applyExtractionGeometry(resource, extraction) {
+  const { bboxString, locnGeometry, centroid } = bboxFields(extraction);
+  if (!bboxString && !locnGeometry && !centroid) return resource;
+  return {
+    ...resource,
+    dcat_bbox: resource.dcat_bbox || bboxString,
+    locn_geometry: resource.locn_geometry || locnGeometry,
+    dcat_centroid: resource.dcat_centroid || centroid,
+    gbl_georeferenced_b: true,
+  };
+}
+
 function checksumFromResource(resource) {
   const identifiers = Array.isArray(resource?.dct_identifier_sm) ? resource.dct_identifier_sm : [];
   return identifiers.map(String).find((value) => /^[a-f0-9]{64}$/i.test(value)) || "";
@@ -3537,30 +4305,49 @@ function ensureReferenceJson(resource, artifacts) {
   const downloadRefs = Array.isArray(refs["http://schema.org/downloadUrl"])
     ? refs["http://schema.org/downloadUrl"]
     : refs["http://schema.org/downloadUrl"] ? [refs["http://schema.org/downloadUrl"]] : [];
+  const mergedDownloadRefs = [];
+  const seenDownloadUrls = new Set();
+  const addDownloadRef = (entry, fallbackLabel = "") => {
+    const item = typeof entry === "string"
+      ? { url: entry, label: fallbackLabel }
+      : entry && typeof entry === "object"
+        ? { ...entry, url: String(entry.url || entry["@id"] || entry.id || ""), label: String(entry.label || fallbackLabel) }
+        : { url: "", label: "" };
+    if (!item.url || seenDownloadUrls.has(item.url)) return;
+    seenDownloadUrls.add(item.url);
+    mergedDownloadRefs.push(item.label ? item : { url: item.url });
+  };
+  downloadRefs.forEach((entry) => addDownloadRef(entry));
+  addDownloadRef(artifacts.geoParquetUrl, "GeoParquet derivative");
+  addDownloadRef(artifacts.pmtilesUrl, "PMTiles vector tile derivative");
+  addDownloadRef(artifacts.geojsonUrl, "GeoJSON viewer derivative");
+  addDownloadRef(artifacts.cogUrl, "Cloud Optimized GeoTIFF derivative");
   const nextRefs = {
     ...refs,
     "http://schema.org/url": artifacts.originalUrl,
-    "http://schema.org/thumbnailUrl": artifacts.thumbnailUrl,
-    "http://iiif.io/api/image": String(artifacts.iiifInfoUrl || "").replace(/\/info\.json$/i, ""),
+    ...(artifacts.thumbnailUrl ? { "http://schema.org/thumbnailUrl": artifacts.thumbnailUrl } : {}),
+    ...(artifacts.iiifInfoUrl ? { "http://iiif.io/api/image": String(artifacts.iiifInfoUrl || "").replace(/\/info\.json$/i, "") } : {}),
+    ...(mergedDownloadRefs.length > 0 ? { "http://schema.org/downloadUrl": mergedDownloadRefs } : {}),
     ...(artifacts.cogUrl ? {
-      "http://schema.org/downloadUrl": [
-        ...downloadRefs,
-        { url: artifacts.cogUrl, label: "Cloud Optimized GeoTIFF derivative" },
-      ],
       "https://www.cogeo.org/": { url: artifacts.cogUrl, label: "Cloud Optimized GeoTIFF" },
     } : {}),
+    ...(artifacts.geojsonUrl ? { geojson: { url: artifacts.geojsonUrl, label: "GeoJSON viewer derivative" } } : {}),
+    ...(artifacts.pmtilesUrl ? { pmtiles: { url: artifacts.pmtilesUrl, label: "PMTiles vector tiles" } } : {}),
+    ...(artifacts.manifestUrl ? { "https://opengeometadata.org/reference/dataset-manifest": { url: artifacts.manifestUrl, label: "Dataset manifest" } } : {}),
     ...(artifacts.archivalSupplementUrl ? {
       [ARCHIVAL_ACCESSION_SUPPLEMENT_RELATION]: { url: artifacts.archivalSupplementUrl, label: "Archival accession processing supplement" },
     } : {}),
     ...(artifacts.archivalSupplementJsonUrl ? {
       [ARCHIVAL_ACCESSION_SUPPLEMENT_JSON_RELATION]: { url: artifacts.archivalSupplementJsonUrl, label: "Archival accession supplement JSON" },
     } : {}),
-    "https://opengeometadata.org/reference/enrichment-response": artifacts.extractionUrl,
+    ...(artifacts.extractionUrl ? { "https://opengeometadata.org/reference/enrichment-response": artifacts.extractionUrl } : {}),
     ...(artifacts.aiEnrichmentsUrl ? {
       [AI_ENRICHMENTS_RELATION]: { url: artifacts.aiEnrichmentsUrl, label: "OpenGeoMetadata AI Enrichments JSON" },
     } : {}),
     "https://opengeometadata.org/reference/aardvark-json": artifacts.aardvarkUrl,
   };
+  if (!artifacts.thumbnailUrl) delete nextRefs["http://schema.org/thumbnailUrl"];
+  if (!artifacts.iiifInfoUrl) delete nextRefs["http://iiif.io/api/image"];
   return {
     ...resource,
     dct_references_s: safeJsonStringify(nextRefs),
@@ -3612,6 +4399,11 @@ async function listProcessedUploadResources(profile, { includeIncomplete = false
         hasAiEnrichments: false,
         hasThumbnail: false,
         hasIiif: false,
+        hasManifest: false,
+        hasGeojson: false,
+        hasGeoParquet: false,
+        hasPmtiles: false,
+        hasCog: false,
         hasArchivalSupplement: false,
         metadataSourceCount: 0,
         updatedAt: "",
@@ -3648,6 +4440,21 @@ async function listProcessedUploadResources(profile, { includeIncomplete = false
     match = key.match(/^(.*)\/iiif\/info\.json$/);
     if (match) touch(match[1]).hasIiif = true;
 
+    match = key.match(/^(.*)\/dataset_manifest\.json$/);
+    if (match) touch(match[1]).hasManifest = true;
+
+    match = key.match(/^(.*)\/derivatives\/[^/]+\.geojson$/);
+    if (match) touch(match[1]).hasGeojson = true;
+
+    match = key.match(/^(.*)\/derivatives\/[^/]+\.parquet$/);
+    if (match) touch(match[1]).hasGeoParquet = true;
+
+    match = key.match(/^(.*)\/derivatives\/[^/]+\.pmtiles$/);
+    if (match) touch(match[1]).hasPmtiles = true;
+
+    match = key.match(/^(.*)\/derivatives\/[^/]+\.cog\.tiff?$/);
+    if (match) touch(match[1]).hasCog = true;
+
     match = key.match(/^(.*)\/archival_accession_supplement\.md$/);
     if (match) touch(match[1]).hasArchivalSupplement = true;
 
@@ -3662,9 +4469,12 @@ async function listProcessedUploadResources(profile, { includeIncomplete = false
   }
 
   return Array.from(byRoot.values())
-    .filter((item) => includeIncomplete || (item.hasAardvark && item.hasExtraction))
+    .filter((item) => includeIncomplete || (item.hasAardvark && (item.hasExtraction || item.hasManifest)))
     .map((item) => {
-      const keys = uploadKeysFromRoot(item.root, item.fileName || "original", item.originalKey);
+      const isGeospatial = item.hasManifest || item.hasGeojson || item.hasGeoParquet || item.hasPmtiles || item.hasCog || /\.zip$/i.test(item.fileName || "");
+      const keys = isGeospatial
+        ? geospatialUploadKeysFromRoot(item.root, item.fileName || "geospatial_package.zip", item.originalKey)
+        : uploadKeysFromRoot(item.root, item.fileName || "original", item.originalKey);
       return {
         ...item,
         fileName: item.fileName || item.resourceId,
@@ -3672,9 +4482,14 @@ async function listProcessedUploadResources(profile, { includeIncomplete = false
         artifacts: {
           originalUrl: accessUrlFor(profile, keys.original),
           thumbnailUrl: accessUrlFor(profile, keys.thumbnail),
-          iiifInfoUrl: `${accessUrlFor(profile, keys.iiif)}/info.json`,
-          extractionUrl: accessUrlFor(profile, keys.extraction),
+          ...(keys.iiif ? { iiifInfoUrl: `${accessUrlFor(profile, keys.iiif)}/info.json` } : {}),
+          ...(keys.extraction ? { extractionUrl: accessUrlFor(profile, keys.extraction) } : {}),
           aiEnrichmentsUrl: accessUrlFor(profile, keys.aiEnrichments),
+          ...(keys.manifest ? { manifestUrl: accessUrlFor(profile, keys.manifest) } : {}),
+          ...(keys.geojson ? { geojsonUrl: accessUrlFor(profile, keys.geojson) } : {}),
+          ...(keys.geoParquet ? { geoParquetUrl: accessUrlFor(profile, keys.geoParquet) } : {}),
+          ...(keys.pmtiles ? { pmtilesUrl: accessUrlFor(profile, keys.pmtiles) } : {}),
+          ...(keys.cog ? { cogUrl: accessUrlFor(profile, keys.cog) } : {}),
           archivalSupplementUrl: accessUrlFor(profile, keys.archivalSupplement),
           archivalSupplementJsonUrl: accessUrlFor(profile, keys.archivalSupplementJson),
           aardvarkUrl: accessUrlFor(profile, keys.aardvark),
@@ -5234,6 +6049,7 @@ async function tryExecFile(command, args, options = {}) {
     await execFileAsync(resolved, args, {
       timeout: options.timeoutMs || 180_000,
       maxBuffer: 1024 * 1024 * 8,
+      ...(options.env ? { env: { ...process.env, ...options.env } } : {}),
     });
     return { ok: true };
   } catch (error) {
@@ -5251,6 +6067,7 @@ async function tryExecFileOutput(command, args, options = {}) {
     const { stdout, stderr } = await execFileAsync(resolved, args, {
       timeout: options.timeoutMs || 180_000,
       maxBuffer: options.maxBuffer || 1024 * 1024 * 16,
+      ...(options.env ? { env: { ...process.env, ...options.env } } : {}),
     });
     return { ok: true, stdout: String(stdout || ""), stderr: String(stderr || "") };
   } catch (error) {
@@ -5381,6 +6198,45 @@ function cogTranslateArgs(sourcePath, cogPath, creationOptions) {
   ];
 }
 
+function rasterThumbnailOutsizeArgs(info, maxDimension = 512) {
+  const size = Array.isArray(info?.size) ? info.size : [];
+  const width = Number(size[0] || 0);
+  const height = Number(size[1] || 0);
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    return ["-outsize", String(maxDimension), String(maxDimension)];
+  }
+  return width >= height
+    ? ["-outsize", String(maxDimension), "0"]
+    : ["-outsize", "0", String(maxDimension)];
+}
+
+async function createRasterThumbnailDerivative({ profile, keys, sourcePath, manifest, info, statuses, uploaded, log }) {
+  if (!await resolveCommandPath("gdal_translate")) {
+    statuses.push({ kind: "thumbnail", status: "missing_dependency", command: "gdal_translate", reason: "Install GDAL to create raster thumbnails." });
+    return;
+  }
+
+  const thumbnailPath = path.join(path.dirname(sourcePath), `${manifest.dataset.baseName}.thumbnail.jpg`);
+  const result = await tryExecFile("gdal_translate", [
+    "-of", "JPEG",
+    ...rasterThumbnailOutsizeArgs(info),
+    "-r", "average",
+    "-co", "QUALITY=86",
+    sourcePath,
+    thumbnailPath,
+  ], { timeoutMs: GEOSPATIAL_DERIVATIVE_TIMEOUT_MS });
+
+  if (result.ok && existsSync(thumbnailPath)) {
+    const thumbnailInfo = await stat(thumbnailPath);
+    await putObjectFile(profile, keys.thumbnail, thumbnailPath, "image/jpeg");
+    uploaded.thumbnailUrl = accessUrlFor(profile, keys.thumbnail);
+    statuses.push({ kind: "thumbnail", status: "created", key: keys.thumbnail, bytes: thumbnailInfo.size });
+    log("Raster thumbnail uploaded", { key: keys.thumbnail, bytes: thumbnailInfo.size });
+  } else {
+    statuses.push({ kind: "thumbnail", status: "failed", reason: result.error || "gdal_translate did not create a thumbnail image." });
+  }
+}
+
 async function createCogDerivative({ profile, keys, sourcePath, manifest, info, statuses, uploaded, log }) {
   if (!await resolveCommandPath("gdal_translate")) {
     statuses.push({ kind: "cog", status: "missing_dependency", command: "gdal_translate", reason: "Install GDAL to create Cloud Optimized GeoTIFF derivatives." });
@@ -5413,6 +6269,9 @@ async function createRasterGeospatialDerivatives({ profile, keys, entries, raste
     await writeEntriesToDirectory(entries, tempRoot);
     const rasterPath = path.join(tempRoot, raster.source.name);
     const info = await inspectRasterWithGdal(rasterPath, manifest, statuses, log);
+    if (info) {
+      await createRasterThumbnailDerivative({ profile, keys, sourcePath: rasterPath, manifest, info, statuses, uploaded, log });
+    }
     if (hasRasterGeoreference(manifest, info)) {
       await createCogDerivative({ profile, keys, sourcePath: rasterPath, manifest, info, statuses, uploaded, log });
     } else {
@@ -5449,7 +6308,7 @@ async function createVectorGeospatialDerivatives({ profile, keys, entries, shape
         "-f", "GeoJSON",
         geojsonPath,
         shpPath,
-      ]);
+      ], { timeoutMs: GEOSPATIAL_DERIVATIVE_TIMEOUT_MS, env: { SHAPE_RESTORE_SHX: "YES" } });
       if (result.ok && existsSync(geojsonPath)) {
         geojsonBuffer = await readFile(geojsonPath);
         await putObjectBuffer(profile, keys.geojson, geojsonBuffer, "application/geo+json");
@@ -5470,7 +6329,7 @@ async function createVectorGeospatialDerivatives({ profile, keys, entries, shape
         "-f", "Parquet",
         parquetPath,
         shpPath,
-      ]);
+      ], { timeoutMs: GEOSPATIAL_DERIVATIVE_TIMEOUT_MS, env: { SHAPE_RESTORE_SHX: "YES" } });
       if (result.ok && existsSync(parquetPath)) {
         const parquetBuffer = await readFile(parquetPath);
         await putObjectBuffer(profile, keys.geoParquet, parquetBuffer, "application/vnd.apache.parquet");
@@ -5549,6 +6408,7 @@ function buildAardvarkForGeospatialPackage({ resourceId, checksum, fileName, fil
     ...(artifacts.geojsonUrl ? { geojson: { url: artifacts.geojsonUrl, label: "GeoJSON viewer derivative" } } : {}),
     ...(artifacts.pmtilesUrl ? { pmtiles: { url: artifacts.pmtilesUrl, label: "PMTiles vector tiles" } } : {}),
     ...(artifacts.cogUrl ? { "https://www.cogeo.org/": { url: artifacts.cogUrl, label: "Cloud Optimized GeoTIFF" } } : {}),
+    ...(artifacts.thumbnailUrl ? { "http://schema.org/thumbnailUrl": { url: artifacts.thumbnailUrl, label: "Thumbnail" } } : {}),
     "https://opengeometadata.org/reference/dataset-manifest": { url: artifacts.manifestUrl, label: "Dataset manifest" },
     ...(artifacts.archivalSupplementUrl ? { [ARCHIVAL_ACCESSION_SUPPLEMENT_RELATION]: { url: artifacts.archivalSupplementUrl, label: "Archival accession processing supplement" } } : {}),
     ...(artifacts.archivalSupplementJsonUrl ? { [ARCHIVAL_ACCESSION_SUPPLEMENT_JSON_RELATION]: { url: artifacts.archivalSupplementJsonUrl, label: "Archival accession supplement JSON" } } : {}),
@@ -7569,7 +8429,7 @@ async function fetchAardvarkForS3Resource(config, body) {
 
   const storageProfile = findProfile(config, "storage", body.storageProfileId);
   const fileName = sanitizeFileName(requested.fileName || requested.resourceId || root.split("/").pop() || "resource");
-  const keys = {
+  let keys = {
     ...uploadKeysFromRoot(root, fileName, requested.originalKey || requested.keys?.original || ""),
     ...(requested.keys || {}),
   };
@@ -7578,11 +8438,66 @@ async function fetchAardvarkForS3Resource(config, body) {
 
   const aardvarkJson = await fetchJsonObject(storageProfile, keys.aardvark);
   const resourceId = String(aardvarkJson.id || requested.resourceId || root.split("/").pop() || "");
-  const artifacts = artifactUrlsForResource(storageProfile, keys, aardvarkJson);
-  if (!await objectExists(storageProfile, keys.aiEnrichments).catch(() => false)) {
+  const isGeospatial = isLikelyGeospatialResource(fileName, aardvarkJson);
+  if (isGeospatial) {
+    keys = {
+      ...geospatialUploadKeysFromRoot(root, fileName, requested.originalKey || requested.keys?.original || ""),
+      ...(requested.keys || {}),
+    };
+    keys.root = root;
+    keys.metadataSources = keys.metadataSources || `${root}/metadata_sources`;
+  }
+
+  const hasThumbnail = requested.hasThumbnail === true || await objectExists(storageProfile, keys.thumbnail).catch(() => false);
+  const hasIiif = requested.hasIiif === true || await objectExists(storageProfile, `${keys.iiif}/info.json`).catch(() => false);
+  const hasAiEnrichments = requested.hasAiEnrichments === true || await objectExists(storageProfile, keys.aiEnrichments).catch(() => false);
+  const hasArchivalSupplement = requested.hasArchivalSupplement === true || await objectExists(storageProfile, keys.archivalSupplement).catch(() => false);
+  const hasArchivalSupplementJson = await objectExists(storageProfile, keys.archivalSupplementJson).catch(() => false);
+  const hasExtraction = requested.hasExtraction === true || await objectExists(storageProfile, keys.extraction).catch(() => false);
+  const hasCog = isGeospatial && await objectExists(storageProfile, keys.cog).catch(() => false);
+  const hasManifest = isGeospatial && await objectExists(storageProfile, keys.manifest).catch(() => false);
+  const hasGeojson = isGeospatial && await objectExists(storageProfile, keys.geojson).catch(() => false);
+  const hasGeoParquet = isGeospatial && await objectExists(storageProfile, keys.geoParquet).catch(() => false);
+  const hasPmtiles = isGeospatial && await objectExists(storageProfile, keys.pmtiles).catch(() => false);
+
+  const fallbackArtifacts = {
+    originalUrl: accessUrlFor(storageProfile, keys.original),
+    aardvarkUrl: accessUrlFor(storageProfile, keys.aardvark),
+    ...(hasThumbnail ? { thumbnailUrl: accessUrlFor(storageProfile, keys.thumbnail) } : {}),
+    ...(hasIiif ? { iiifInfoUrl: `${accessUrlFor(storageProfile, keys.iiif)}/info.json` } : {}),
+    ...(hasExtraction ? { extractionUrl: accessUrlFor(storageProfile, keys.extraction) } : {}),
+    ...(hasAiEnrichments ? { aiEnrichmentsUrl: accessUrlFor(storageProfile, keys.aiEnrichments) } : {}),
+    ...(hasArchivalSupplement ? { archivalSupplementUrl: accessUrlFor(storageProfile, keys.archivalSupplement) } : {}),
+    ...(hasArchivalSupplementJson ? { archivalSupplementJsonUrl: accessUrlFor(storageProfile, keys.archivalSupplementJson) } : {}),
+    ...(hasManifest ? { manifestUrl: accessUrlFor(storageProfile, keys.manifest) } : {}),
+    ...(hasGeojson ? { geojsonUrl: accessUrlFor(storageProfile, keys.geojson) } : {}),
+    ...(hasGeoParquet ? { geoParquetUrl: accessUrlFor(storageProfile, keys.geoParquet) } : {}),
+    ...(hasPmtiles ? { pmtilesUrl: accessUrlFor(storageProfile, keys.pmtiles) } : {}),
+    ...(hasCog ? { cogUrl: accessUrlFor(storageProfile, keys.cog) } : {}),
+  };
+
+  const artifacts = isGeospatial
+    ? geospatialArtifactUrlsForResource(storageProfile, keys, aardvarkJson, fallbackArtifacts)
+    : artifactUrlsForResource(storageProfile, keys, aardvarkJson);
+  if (!hasThumbnail) delete artifacts.thumbnailUrl;
+  if (!hasIiif) delete artifacts.iiifInfoUrl;
+  if (!hasExtraction) delete artifacts.extractionUrl;
+  if (!hasAiEnrichments) {
     delete artifacts.aiEnrichmentsUrl;
   }
-  const resource = ensureReferenceJson({ ...aardvarkJson, id: resourceId }, artifacts);
+  if (!hasArchivalSupplement) delete artifacts.archivalSupplementUrl;
+  if (!hasArchivalSupplementJson) delete artifacts.archivalSupplementJsonUrl;
+
+  let resource = { ...aardvarkJson, id: resourceId };
+  if (!resourceHasGeometry(resource) && hasManifest) {
+    const manifest = await fetchJsonObject(storageProfile, keys.manifest).catch(() => null);
+    resource = applyManifestGeometry(resource, manifest);
+  }
+  if (!resourceHasGeometry(resource) && hasExtraction) {
+    const extraction = await fetchJsonObject(storageProfile, keys.extraction).catch(() => null);
+    resource = applyExtractionGeometry(resource, extraction);
+  }
+  resource = ensureReferenceJson(resource, artifacts);
 
   return {
     resourceId,
@@ -8052,11 +8967,27 @@ async function route(req, res) {
   if ((req.method === "GET" || req.method === "HEAD") && url.pathname === "/api/artifacts/proxy") {
     return proxyArtifactObject(config, req, res, url.searchParams.get("url"));
   }
+  if (req.method === "POST" && url.pathname === "/api/artifacts/upload") {
+    const body = await readJson(req);
+    return send(res, 200, await uploadArtifactObject(config, body));
+  }
   if (req.method === "GET" && url.pathname === "/api/artifacts/cog-info") {
     return inspectCogArtifact(config, res, url.searchParams.get("url"));
   }
   if (req.method === "GET" && url.pathname === "/api/artifacts/cog-preview") {
     return previewCogArtifact(config, res, url.searchParams.get("url"), url.searchParams);
+  }
+  if (req.method === "GET" && url.pathname === "/api/artifacts/pmtiles-preview") {
+    return previewPmtilesArtifact(config, res, url.searchParams.get("url"), url.searchParams);
+  }
+  if (req.method === "GET" && url.pathname === "/api/artifacts/raster-preview") {
+    return previewRasterArtifact(config, res, url.searchParams.get("url"), url.searchParams);
+  }
+  if (req.method === "GET" && url.pathname === "/api/artifacts/vector-geojson") {
+    return proxyVectorGeoJsonArtifact(config, res, url.searchParams.get("url"));
+  }
+  if (req.method === "GET" && url.pathname === "/api/artifacts/vector-preview") {
+    return previewVectorPackageArtifact(config, res, url.searchParams.get("url"), url.searchParams);
   }
   if (req.method === "GET" && url.pathname === "/api/config") {
     return send(res, 200, config);
@@ -8187,15 +9118,34 @@ async function route(req, res) {
     }
     return send(res, 200, { ...openai, derivatives });
   }
+  const uploadProgressMatch = url.pathname.match(/^\/api\/uploads\/jobs\/([^/]+)\/progress$/);
+  if (req.method === "GET" && uploadProgressMatch) {
+    const jobId = decodeURIComponent(uploadProgressMatch[1]);
+    const snapshot = uploadJobSnapshot(jobId);
+    if (!snapshot) return send(res, 404, { error: `Upload job not found: ${jobId}` });
+    return send(res, 200, snapshot);
+  }
   if (req.method === "POST" && url.pathname === "/api/uploads/process-image") {
     const body = await readJson(req);
-    const result = await processUploadedImage(config, body);
-    return send(res, 200, result);
+    try {
+      const result = await processUploadedImage(config, body);
+      finishUploadJob(body.jobId, "complete", { resourceId: result.resourceId });
+      return send(res, 200, result);
+    } catch (error) {
+      finishUploadJob(body.jobId, "error", { error: error.message || String(error) });
+      throw error;
+    }
   }
   if (req.method === "POST" && url.pathname === "/api/uploads/process-geospatial-package") {
     const body = await readJson(req);
-    const result = await processGeospatialPackage(config, body);
-    return send(res, 200, result);
+    try {
+      const result = await processGeospatialPackage(config, body);
+      finishUploadJob(body.jobId, "complete", { resourceId: result.resourceId });
+      return send(res, 200, result);
+    } catch (error) {
+      finishUploadJob(body.jobId, "error", { error: error.message || String(error) });
+      throw error;
+    }
   }
   if (req.method === "POST" && url.pathname === "/api/uploads/geospatial-sessions") {
     const body = await readJson(req);
@@ -8208,8 +9158,14 @@ async function route(req, res) {
   }
   if (req.method === "POST" && url.pathname === "/api/uploads/geospatial-sessions/complete") {
     const body = await readJson(req);
-    const result = await completeGeospatialUploadSession(config, body);
-    return send(res, 200, result);
+    try {
+      const result = await completeGeospatialUploadSession(config, body);
+      finishUploadJob(body.jobId, "complete", { resourceId: result.resourceId });
+      return send(res, 200, result);
+    } catch (error) {
+      finishUploadJob(body.jobId, "error", { error: error.message || String(error) });
+      throw error;
+    }
   }
 
   return send(res, 404, { error: "Not found" });
@@ -8218,7 +9174,8 @@ async function route(req, res) {
 const server = http.createServer((req, res) => {
   route(req, res).catch((error) => {
     console.error(error);
-    send(res, 500, { error: error.message || String(error) });
+    const status = Number(error?.status || 500);
+    send(res, Number.isInteger(status) && status >= 400 && status < 600 ? status : 500, { error: error.message || String(error) });
   });
 });
 
@@ -8231,6 +9188,8 @@ if (fileURLToPath(import.meta.url) === path.resolve(process.argv[1] || "")) {
 
 export {
   consolidateOcrTextEntries,
+  cogPreviewRenderOptions,
   deriveMapLabelPlacenames,
+  rasterThumbnailOutsizeArgs,
   selectTextReconciliationTiles,
 };

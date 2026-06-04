@@ -7,6 +7,8 @@ import { useResourceSearch, FacetConfig } from "../hooks/useResourceSearch";
 import { GalleryView } from "./GalleryView";
 import { ResultsMapView } from "./ResultsMapView";
 import { DashboardResultsList } from "./DashboardResultsList";
+import { displayThumbnailUrl } from "../services/thumbnailUrl";
+import { ResourceThumbnail } from "./shared/ResourceThumbnail";
 
 
 import { ActiveFilterBar } from "./ActiveFilterBar";
@@ -276,7 +278,9 @@ export const Dashboard: React.FC<DashboardProps> = ({ onEdit, onSelect }) => {
                                 <div className="flex h-64 items-center justify-center text-slate-500">Loading...</div>
                             ) : (
                                 <ul className="divide-y divide-gray-100 dark:divide-slate-800">
-                                    {resources.map(r => (
+                                    {resources.map(r => {
+                                        const thumbnailUrl = displayThumbnailUrl(r, thumbnails);
+                                        return (
                                         <li
                                             key={r.id}
                                             className="p-3 hover:bg-gray-50 dark:hover:bg-slate-800/50 transition-colors group cursor-pointer"
@@ -287,15 +291,13 @@ export const Dashboard: React.FC<DashboardProps> = ({ onEdit, onSelect }) => {
                                             <div className="flex gap-3">
                                                 {/* Thumbnail */}
                                                 <div className="w-16 h-16 flex-shrink-0 bg-gray-100 dark:bg-slate-800 rounded overflow-hidden relative border border-gray-200 dark:border-slate-700">
-                                                    {thumbnails[r.id] ? (
-                                                        <img src={thumbnails[r.id] || undefined} alt="" className="w-full h-full object-cover" />
-                                                    ) : (
-                                                        <div className="flex items-center justify-center h-full text-slate-300 dark:text-slate-600">
-                                                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-6 h-6">
-                                                                <path fillRule="evenodd" d="M1 5.25A2.25 2.25 0 013.25 3h13.5A2.25 2.25 0 0119 5.25v9.5A2.25 2.25 0 0116.75 17H3.25A2.25 2.25 0 011 14.75v-9.5zm1.5 5.81v3.69c0 .414.336.75.75.75h13.5a.75.75 0 00.75-.75v-2.69l-2.22-2.219a.75.75 0 00-1.06 0l-1.91 1.909.47.47a.75.75 0 11-1.06 1.06L6.53 8.091a.75.75 0 00-1.06 0l-2.97 2.97z" clipRule="evenodd" />
-                                                            </svg>
-                                                        </div>
-                                                    )}
+                                                    <div className="flex h-full w-full items-center justify-center text-slate-300 dark:text-slate-600">
+                                                        <ResourceThumbnail
+                                                            resource={r}
+                                                            src={thumbnailUrl}
+                                                            fallbackClassName="text-2xl opacity-30 grayscale select-none"
+                                                        />
+                                                    </div>
                                                 </div>
                                                 {/* Meta */}
                                                 <div className="flex-1 min-w-0 flex flex-col justify-center">
@@ -308,7 +310,8 @@ export const Dashboard: React.FC<DashboardProps> = ({ onEdit, onSelect }) => {
                                                 </div>
                                             </div>
                                         </li>
-                                    ))}
+                                    );
+                                    })}
                                 </ul>
                             )}
                         </div>

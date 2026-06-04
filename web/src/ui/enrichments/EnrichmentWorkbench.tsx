@@ -14,6 +14,7 @@ import {
     type ProcessGeospatialPackageResponse,
     type ProcessUploadedImageResponse,
     ProxyConfig,
+    type UploadJobProgressResponse,
 } from "../../services/EnrichmentProxyClient";
 import { DUCKDB_RESTORED_EVENT, DUCKDB_RESTORE_PROGRESS_EVENT, getDuckDbRestoreStatus } from "../../duckdb/dbInit";
 import { safeJsonStringify } from "../../duckdb/json";
@@ -638,6 +639,7 @@ export const EnrichmentWorkbench: React.FC = () => {
     const inventoryAbortRef = useRef<AbortController | null>(null);
     const runAbortRef = useRef<AbortController | null>(null);
     const uploadAbortRef = useRef<AbortController | null>(null);
+    const liveProxyMilestoneKeysRef = useRef<Record<string, Set<string>>>({});
     const directoryInputRef = useRef<HTMLInputElement | null>(null);
     const [activePanel, setActivePanel] = useState<Panel>("upload");
     const [config, setConfig] = useState<ProxyConfig>({ storageProfiles: [], modelProfiles: [], visionProfiles: [] });
@@ -984,18 +986,68 @@ export const EnrichmentWorkbench: React.FC = () => {
         proxyMilestones: Array<{ at: string; elapsed_ms: number; label: string; detail?: Record<string, unknown> }> = [],
     ) => {
         if (proxyMilestones.length === 0) return;
-        const converted = proxyMilestones.slice().reverse().map((milestone) => ({
-            id: crypto.randomUUID(),
-            at: milestoneTime(new Date(milestone.at)),
-            status: "done" as const,
-            label: `Proxy: ${milestone.label}`,
-            detail: `${formatElapsed(Math.round(milestone.elapsed_ms / 1000))}${milestone.detail ? ` · ${safeJsonStringify(milestone.detail)}` : ""}`,
-        }));
+        const seen = liveProxyMilestoneKeysRef.current[id] ?? new Set<string>();
+        liveProxyMilestoneKeysRef.current[id] = seen;
+        const converted = proxyMilestones.filter((milestone) => {
+            const key = `${milestone.at}|${milestone.label}|${safeJsonStringify(milestone.detail || {})}`;
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        }).slice().reverse().map((milestone) => {
+            const lower = milestone.label.toLowerCase();
+            const status: EnrichmentMilestone["status"] = lower.includes("failed") || lower.includes("error")
+                ? "error"
+                : lower.includes("started") || lower.includes("waiting")
+                    ? "active"
+                    : "done";
+            return {
+                id: crypto.randomUUID(),
+                at: milestoneTime(new Date(milestone.at)),
+                status,
+                label: `Proxy: ${milestone.label}`,
+                detail: `${formatElapsed(Math.round(milestone.elapsed_ms / 1000))}${milestone.detail ? ` · ${safeJsonStringify(milestone.detail)}` : ""}`,
+            };
+        });
+        if (converted.length === 0) return;
         setUploadItems((prev) => prev.map((item) => (
             item.id === id
                 ? { ...item, milestones: [...converted, ...(item.milestones || [])].slice(0, 24) }
                 : item
         )));
+    };
+
+    const proxyProgressMessage = (progress: UploadJobProgressResponse, elapsedSeconds: number, fallbackDetail: string) => {
+        const summary = progress.summary;
+        if (summary?.kind === "crop") {
+            const extras = [
+                typeof summary.labels === "number" ? `${summary.labels.toLocaleString()} labels` : "",
+                typeof summary.claims === "number" && summary.claims > 0 ? `${summary.claims.toLocaleString()} claims` : "",
+                typeof summary.cacheHits === "number" && summary.cacheHits > 0 ? `${summary.cacheHits.toLocaleString()} cache hit${summary.cacheHits === 1 ? "" : "s"}` : "",
+            ].filter(Boolean).join(" · ");
+            return `${formatElapsed(elapsedSeconds)} in proxy: ${summary.label}${extras ? ` · ${extras}` : ""}.`;
+        }
+        const latest = progress.milestones[progress.milestones.length - 1];
+        if (latest) {
+            return `${formatElapsed(Math.max(elapsedSeconds, Math.round(latest.elapsed_ms / 1000)))} in proxy: ${latest.label}${latest.detail ? ` · ${safeJsonStringify(latest.detail)}` : ""}`;
+        }
+        return `Still processing in proxy: ${fallbackDetail}`;
+    };
+
+    const pollUploadJobProgress = async (
+        itemId: string,
+        jobId: string,
+        elapsedSeconds: number,
+        fallbackDetail: string,
+        signal: AbortSignal,
+    ) => {
+        try {
+            const progress = await enrichmentProxyClient.getUploadJobProgress(jobId, signal);
+            appendProxyMilestones(itemId, progress.milestones);
+            updateUploadItem(itemId, { message: proxyProgressMessage(progress, elapsedSeconds, fallbackDetail) });
+        } catch (error: any) {
+            if (signal.aborted || String(error.message || "").includes("canceled")) return;
+            console.debug("[Upload pipeline]", { jobId, phase: "proxy-progress-poll", error: error.message || String(error) });
+        }
     };
 
     const metadataForImage = (item: UploadItem): MetadataUploadItem[] => {
@@ -1378,20 +1430,27 @@ export const EnrichmentWorkbench: React.FC = () => {
                             error: undefined,
                         });
                         let heartbeatCount = 0;
+                        let progressPollInFlight = false;
                         const heartbeat = window.setInterval(() => {
                             heartbeatCount += 1;
-                            const elapsed = heartbeatCount * 20;
+                            const elapsed = heartbeatCount * 5;
                             const detail = item.kind === "geospatial"
                                 ? `${formatElapsed(elapsed)} waiting on proxy. The active step may be S3 upload, shapefile analysis, derivative generation, or Aardvark writing.`
                                 : `${formatElapsed(elapsed)} waiting on proxy. The active step may be S3 upload, IIIF tile generation, or ${selectedVisionProfile ? selectedTextExtractionModelProfile ? "Google Vision OCR / label reconciliation" : "Google Vision OCR" : "OpenAI extraction"}.`;
-                            updateUploadItem(item.id, {
-                                message: `Still processing in proxy: ${detail}`,
-                            });
+                            if (!progressPollInFlight) {
+                                progressPollInFlight = true;
+                                void pollUploadJobProgress(item.id, jobId, elapsed, detail, controller.signal)
+                                    .finally(() => { progressPollInFlight = false; });
+                            } else if (heartbeatCount % 4 === 0) {
+                                updateUploadItem(item.id, {
+                                    message: `Still processing in proxy: ${detail}`,
+                                });
+                            }
                             console.debug("[Upload pipeline]", { file: item.name, jobId, elapsedSeconds: elapsed, phase: "proxy-wait" });
-                            if (heartbeatCount % 3 === 0) {
+                            if (heartbeatCount % 12 === 0) {
                                 appendUploadMilestone(item.id, "active", "Still waiting on proxy", detail);
                             }
-                        }, 20_000);
+                        }, 5_000);
                         try {
                             if (item.kind === "geospatial") {
                                 response = await enrichmentProxyClient.processGeospatialPackage({

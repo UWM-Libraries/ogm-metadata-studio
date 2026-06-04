@@ -8,6 +8,7 @@ import { ensureSchema, DISTRIBUTIONS_TABLE, RESOURCES_MV_TABLE, RESOURCES_TABLE 
 import { REPEATABLE_STRING_FIELDS } from "../aardvark/model";
 import { backfillCentroidAndH3 } from "./backfill";
 import { safeJsonStringify } from "./json";
+import { PARQUET_ARTIFACTS, usingDefaultResourceStarter } from "../config/parquetArtifacts";
 
 export const DB_FILENAME = "records.duckdb";
 export const INDEXEDDB_NAME = "aardvark-duckdb";
@@ -17,6 +18,7 @@ export const SNAPSHOT_KEY = "records.snapshot.json";
 export const ENRICHMENT_SNAPSHOT_KEY = "enrichments.snapshot.json";
 export const RECORDS_META_KEY = "records.meta.json";
 export const DELETED_RECORD_IDS_KEY = "records.deleted.ids.json";
+const STARTER_RESOURCE_CACHE_RESET_KEY = "starter.empty-baseline.resources-reset.v1";
 const INDEXEDDB_VERSION = 2;
 export const DUCKDB_RESTORE_PROGRESS_EVENT = "duckdb-restore-progress";
 export const DUCKDB_RESTORED_EVENT = "duckdb-restored";
@@ -72,9 +74,14 @@ async function startBackgroundRestore(db: duckdb.AsyncDuckDB, options: { loadedF
     if (restorePromise) return restorePromise;
 
     restorePromise = (async () => {
-        const recordsMeta = await loadRecordsMetaFromIndexedDB();
+        let recordsMeta = await loadRecordsMetaFromIndexedDB();
+        const usingStarterBaseline = options.loadedFromParquet && usingDefaultResourceStarter();
+        if (usingStarterBaseline) {
+            recordsMeta = await clearStarterResourceCacheOnce(recordsMeta);
+        }
+
         let recordsMode = recordsMeta?.mode;
-        const shouldRestoreRecords = !options.loadedFromParquet || recordsMeta?.dirty === true || recordsMeta === null;
+        const shouldRestoreRecords = !options.loadedFromParquet || recordsMeta?.dirty === true || (recordsMeta === null && !usingStarterBaseline);
         let records: AardvarkJson[] = [];
 
         if (shouldRestoreRecords) {
@@ -215,8 +222,8 @@ async function loadInitialDataFromParquet(
                 ? new URL(basePath, window.location.href).toString()
                 : basePath;
 
-        const resourcesUrl = new URL("resources.parquet", absoluteBase).toString();
-        const distributionsUrl = new URL("resource_distributions.parquet", absoluteBase).toString();
+        const resourcesUrl = new URL(PARQUET_ARTIFACTS.resources, absoluteBase).toString();
+        const distributionsUrl = new URL(PARQUET_ARTIFACTS.distributions, absoluteBase).toString();
 
         const fetchParquet = async (url: string): Promise<Uint8Array | null> => {
             try {
@@ -230,10 +237,13 @@ async function loadInitialDataFromParquet(
             }
         };
 
-        const [resourcesBuf, distributionsBuf] = await Promise.all([
-            fetchParquet(resourcesUrl),
-            fetchParquet(distributionsUrl),
-        ]);
+        const resourcesBuf = await fetchParquet(resourcesUrl);
+        const distributionsBuf = resourcesBuf ? await fetchParquet(distributionsUrl) : null;
+
+        if (!resourcesBuf && usingDefaultResourceStarter()) {
+            console.log("[Parquet bootstrap] Using the empty starter resources.parquet baseline.");
+            return true;
+        }
 
         if (!resourcesBuf && !distributionsBuf) {
             return false;
@@ -253,12 +263,12 @@ async function loadInitialDataFromParquet(
                     const countResult = await conn.query(`SELECT count(*) as c FROM ${RESOURCES_TABLE}`);
                     const count = Number(countResult.toArray()[0]?.c ?? 0);
                     loadedResources = count > 0;
-                    console.log(`[Parquet bootstrap] Loaded ${count.toLocaleString()} resources from published Parquet.`);
+                    console.log(`[Parquet bootstrap] Loaded ${count.toLocaleString()} resources from ${PARQUET_ARTIFACTS.resources}.`);
                     await db.dropFile(fileName);
                 })(),
             );
         } else {
-            console.warn("[Parquet bootstrap] resources.parquet was not available; local overlay will not be treated as a published baseline.");
+            console.warn(`[Parquet bootstrap] ${PARQUET_ARTIFACTS.resources} was not available; local overlay will not be treated as a published baseline.`);
         }
 
         if (distributionsBuf) {
@@ -712,6 +722,58 @@ export async function loadRecordsMetaFromIndexedDB(): Promise<RecordsCacheMeta |
         req.onerror = () => {
             console.warn("[IndexedDB] Failed to open DB for records metadata", req.error);
             resolve(null);
+        };
+    });
+}
+
+async function clearStarterResourceCacheOnce(currentMeta: RecordsCacheMeta | null): Promise<RecordsCacheMeta | null> {
+    return new Promise((resolve) => {
+        const req = indexedDB.open(INDEXEDDB_NAME, INDEXEDDB_VERSION);
+        req.onupgradeneeded = (e: any) => {
+            const db = e.target.result as IDBDatabase;
+            if (!db.objectStoreNames.contains(INDEXEDDB_STORE)) db.createObjectStore(INDEXEDDB_STORE);
+            if (!db.objectStoreNames.contains(INDEXEDDB_RECORDS_STORE)) db.createObjectStore(INDEXEDDB_RECORDS_STORE, { keyPath: "id" });
+        };
+        req.onsuccess = (e: any) => {
+            const db = e.target.result as IDBDatabase;
+            const tx = db.transaction([INDEXEDDB_RECORDS_STORE, INDEXEDDB_STORE], "readwrite");
+            const recordsStore = tx.objectStore(INDEXEDDB_RECORDS_STORE);
+            const legacyStore = tx.objectStore(INDEXEDDB_STORE);
+            let nextMeta = currentMeta;
+
+            const markerGet = legacyStore.get(STARTER_RESOURCE_CACHE_RESET_KEY);
+            markerGet.onsuccess = () => {
+                if (markerGet.result) return;
+
+                nextMeta = {
+                    dirty: false,
+                    count: 0,
+                    savedAt: new Date().toISOString(),
+                    source: "empty-starter-cache-reset",
+                    mode: "overlay",
+                };
+                recordsStore.clear();
+                legacyStore.put(safeJsonStringify(nextMeta), RECORDS_META_KEY);
+                legacyStore.put("1", STARTER_RESOURCE_CACHE_RESET_KEY);
+                legacyStore.delete(SNAPSHOT_KEY);
+                legacyStore.delete(DB_FILENAME);
+                legacyStore.delete(DELETED_RECORD_IDS_KEY);
+                console.log("[IndexedDB] Cleared cached resource records for the empty starter baseline.");
+            };
+
+            tx.oncomplete = () => resolve(nextMeta);
+            tx.onerror = () => {
+                console.warn("[IndexedDB] Failed to clear starter resource cache", tx.error);
+                resolve(currentMeta);
+            };
+            tx.onabort = () => {
+                console.warn("[IndexedDB] Starter resource cache clear aborted", tx.error);
+                resolve(currentMeta);
+            };
+        };
+        req.onerror = () => {
+            console.warn("[IndexedDB] Failed to open DB for starter resource cache clear", req.error);
+            resolve(currentMeta);
         };
     });
 }

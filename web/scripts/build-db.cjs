@@ -2,11 +2,24 @@ const duckdb = require('duckdb');
 const fs = require('fs');
 const path = require('path');
 const { latLngToCell } = require('h3-js');
-// const glob = require('glob'); // Not using this, DuckDB handles globs
 
+const WEB_DIR = path.join(__dirname, '..');
+const PUBLIC_DIR = path.join(WEB_DIR, 'public');
 const METADATA_DIR = path.join(__dirname, '../../metadata');
-const OUTPUT_FILE = path.join(__dirname, '../public/resources.parquet');
 const SINGLE_JSON_FILE = path.join(METADATA_DIR, 'resources.json');
+const DEFAULT_RESOURCES_PARQUET = 'resources.parquet';
+
+loadEnvFiles([
+    path.join(WEB_DIR, '.env'),
+    path.join(WEB_DIR, '.env.local'),
+]);
+
+const RESOURCE_PARQUET_FILE_NAME = configuredArtifactName(
+    ['VITE_RESOURCES_PARQUET', 'RESOURCES_PARQUET'],
+    DEFAULT_RESOURCES_PARQUET
+);
+const OUTPUT_FILE = path.resolve(PUBLIC_DIR, RESOURCE_PARQUET_FILE_NAME);
+const USING_DEFAULT_STARTER = RESOURCE_PARQUET_FILE_NAME === DEFAULT_RESOURCES_PARQUET;
 
 const REPEATABLE_STRING_FIELDS = [
     "dct_alternative_sm",
@@ -46,6 +59,58 @@ const COMMA_SPLIT_REPEATABLE_FIELDS = new Set([
 ]);
 
 const H3_RES_COLUMNS = ["h3_res2", "h3_res3", "h3_res4", "h3_res5", "h3_res6", "h3_res7", "h3_res8"];
+
+function loadEnvFiles(files) {
+    for (const file of files) {
+        if (!fs.existsSync(file)) continue;
+        const lines = fs.readFileSync(file, 'utf8').split(/\r?\n/);
+        for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith('#')) continue;
+            const equalsIndex = trimmed.indexOf('=');
+            if (equalsIndex <= 0) continue;
+
+            const key = trimmed.slice(0, equalsIndex).trim();
+            if (process.env[key] !== undefined) continue;
+
+            let value = trimmed.slice(equalsIndex + 1).trim();
+            const quote = value[0];
+            if ((quote === '"' || quote === "'") && value[value.length - 1] === quote) {
+                value = value.slice(1, -1);
+            }
+            process.env[key] = value;
+        }
+    }
+}
+
+function configuredArtifactName(envKeys, fallback) {
+    const value = envKeys
+        .map((key) => process.env[key])
+        .find((candidate) => typeof candidate === 'string' && candidate.trim());
+    const artifactName = String(value || fallback).trim();
+    const resolved = path.resolve(PUBLIC_DIR, artifactName);
+    const publicRoot = path.resolve(PUBLIC_DIR);
+    if (resolved !== publicRoot && !resolved.startsWith(`${publicRoot}${path.sep}`)) {
+        throw new Error(`Parquet artifact must live under web/public: ${artifactName}`);
+    }
+    return artifactName;
+}
+
+function ensureDefaultStarterFile(outputFile) {
+    if (!fs.existsSync(outputFile)) {
+        fs.closeSync(fs.openSync(outputFile, 'w'));
+    }
+
+    const size = fs.statSync(outputFile).size;
+    if (size === 0) {
+        console.log(`Keeping ${DEFAULT_RESOURCES_PARQUET} as the empty starter artifact.`);
+    } else {
+        console.warn(
+            `${DEFAULT_RESOURCES_PARQUET} is reserved as the starter artifact but is not empty. ` +
+            `Set VITE_RESOURCES_PARQUET=resources.your-name.parquet to build a publishable data artifact.`
+        );
+    }
+}
 
 function normalizeRepeatableStringValue(field, value) {
     const text = String(value ?? "").trim();
@@ -174,11 +239,17 @@ function parseEnvelopeCenter(value) {
 async function buildDatabase() {
     console.log('Building DuckDB/Parquet artifact...');
     console.log(`Scanning looking for JSONs in: ${METADATA_DIR}`);
+    console.log(`Resource parquet target: ${RESOURCE_PARQUET_FILE_NAME}`);
 
     // Ensure public dir exists
-    const publicDir = path.dirname(OUTPUT_FILE);
-    if (!fs.existsSync(publicDir)) {
-        fs.mkdirSync(publicDir, { recursive: true });
+    const outputDir = path.dirname(OUTPUT_FILE);
+    if (!fs.existsSync(outputDir)) {
+        fs.mkdirSync(outputDir, { recursive: true });
+    }
+
+    if (USING_DEFAULT_STARTER) {
+        ensureDefaultStarterFile(OUTPUT_FILE);
+        return;
     }
 
     const db = new duckdb.Database(':memory:');
@@ -205,7 +276,7 @@ async function buildDatabase() {
             return false;
         }
 
-        const tempJson = path.join(publicDir, `.resources-normalized-${Date.now()}.json`);
+        const tempJson = path.join(outputDir, `.resources-normalized-${Date.now()}.json`);
         fs.writeFileSync(tempJson, JSON.stringify(normalized.rows));
         try {
             await run('DROP TABLE resources');
@@ -257,7 +328,7 @@ async function buildDatabase() {
             return false;
         }
 
-        const tempJson = path.join(publicDir, `.resources-h3-${Date.now()}.json`);
+        const tempJson = path.join(outputDir, `.resources-h3-${Date.now()}.json`);
         fs.writeFileSync(tempJson, JSON.stringify(updates));
         try {
             await run(`
@@ -298,13 +369,9 @@ async function buildDatabase() {
         console.log(`Glob pattern: ${globPattern}`);
         console.log(`Preferred source file: ${SINGLE_JSON_FILE}`);
 
-        // Check if any files exist first to avoid DuckDB error
-        const files = require('glob').sync(globPattern); // We need glob if we want to check beforehand, 
-        // OR we can just try/catch the SQL.
-        // But wait, I commented out glob require.
-        // Let's just create an empty table if read_json_auto fails or returns 0.
-
-        // Actually, easiest is to wrap the create table in try/catch or check if dir is empty.
+        // Check if any resource files exist first to avoid DuckDB errors.
+        const files = require('glob').sync(globPattern)
+            .filter((file) => path.basename(file) !== 'resource_distributions.json');
 
         if (!fs.existsSync(METADATA_DIR) || files.length === 0) {
             console.log("No metadata files found locally. Skipping local Parquet generation (Decoupled Mode).");

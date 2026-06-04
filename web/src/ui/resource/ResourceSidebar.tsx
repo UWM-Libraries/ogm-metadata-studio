@@ -4,11 +4,32 @@ import 'maplibre-gl/dist/maplibre-gl.css';
 import { Resource } from '../../aardvark/model';
 import { CopyButton } from './CopyButton';
 import { textToLngLatBounds, type LngLatBoundsTuple } from '../viewers/maplibreBounds';
+import { displayThumbnailUrl } from '../../services/thumbnailUrl';
+import { ResourceThumbnail } from '../shared/ResourceThumbnail';
 
 const MAP_STYLE = "https://demotiles.maplibre.org/style.json";
 
 interface ResourceSidebarProps {
     resource: Resource;
+}
+
+function referenceUrlValue(value: unknown): string | null {
+    if (typeof value === "string" && value.trim()) return value;
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const url = (value as { url?: unknown }).url;
+    return typeof url === "string" && url.trim() ? url : null;
+}
+
+function firstReferenceUrl(refs: Record<string, unknown>, keys: string[]): string | null {
+    for (const key of keys) {
+        const value = refs[key];
+        const values = Array.isArray(value) ? value : [value];
+        for (const item of values) {
+            const url = referenceUrlValue(item);
+            if (url) return url;
+        }
+    }
+    return null;
 }
 
 export const ResourceSidebar: React.FC<ResourceSidebarProps> = ({ resource }) => {
@@ -68,13 +89,22 @@ export const ResourceSidebar: React.FC<ResourceSidebarProps> = ({ resource }) =>
         };
     }, [bounds]);
 
-    const downloadLink = useMemo(() => {
-        if (!resource.dct_references_s) return null;
+    const references = useMemo<Record<string, unknown>>(() => {
+        if (!resource.dct_references_s) return {};
         try {
             const refs = JSON.parse(resource.dct_references_s);
-            return refs["http://schema.org/downloadUrl"] || refs["http://schema.org/url"];
-        } catch { return null; }
+            return refs && typeof refs === "object" && !Array.isArray(refs) ? refs : {};
+        } catch { return {}; }
     }, [resource.dct_references_s]);
+
+    const thumbnailUrl = useMemo(() => displayThumbnailUrl(resource, {}), [resource]);
+
+    const downloadLink = useMemo(() => firstReferenceUrl(references, [
+        "http://schema.org/downloadUrl",
+        "https://schema.org/downloadUrl",
+        "http://schema.org/url",
+        "https://schema.org/url",
+    ]), [references]);
 
     const citationText = useMemo(() => {
         const parts = [];
@@ -88,6 +118,20 @@ export const ResourceSidebar: React.FC<ResourceSidebarProps> = ({ resource }) =>
 
     return (
         <div className="w-full lg:w-96 p-6 flex flex-col gap-6 bg-gray-50 dark:bg-slate-900/50">
+            {thumbnailUrl && (
+                <div className="bg-white dark:bg-slate-800 rounded-lg shadow-sm border border-gray-200 dark:border-slate-700 overflow-hidden">
+                    <div className="p-3 border-b border-gray-200 dark:border-slate-700 font-semibold text-sm">Thumbnail</div>
+                    <a href={thumbnailUrl} target="_blank" rel="noopener noreferrer" className="flex h-80 items-center justify-center bg-slate-100 dark:bg-slate-950">
+                        <ResourceThumbnail
+                            resource={resource}
+                            src={thumbnailUrl}
+                            alt={`Thumbnail for ${resource.dct_title_s}`}
+                            className="max-h-full w-full object-contain"
+                        />
+                    </a>
+                </div>
+            )}
+
             <div className="bg-white dark:bg-slate-800 rounded-lg shadow-sm border border-gray-200 dark:border-slate-700 overflow-hidden">
                 <div className="p-3 border-b border-gray-200 dark:border-slate-700 font-semibold text-sm">Location</div>
                 <div className="h-64 relative z-0">

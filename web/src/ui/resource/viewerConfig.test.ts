@@ -228,6 +228,25 @@ describe('viewerConfig', () => {
             });
         });
 
+        it('infers generated GeoJSON from original zipped shapefile package URLs', () => {
+            const resource = {
+                ...baseResource,
+                dct_format_s: "Shapefile",
+                dct_references_s: JSON.stringify({
+                    "http://schema.org/downloadUrl": [
+                        { url: "http://example.com/uploads/geodata-1/original_file/county_boundaries.zip", label: "Original zipped shapefile package" },
+                    ],
+                })
+            };
+            const endpoint = "http://localhost:8787/api/artifacts/vector-geojson?url=http%3A%2F%2Fexample.com%2Fuploads%2Fgeodata-1%2Foriginal_file%2Fcounty_boundaries.zip";
+            expect(detectViewerConfig(resource)).toEqual({
+                protocol: "geojson",
+                endpoint,
+                geometry: undefined,
+                attributeTableEndpoint: endpoint
+            });
+        });
+
         it('detects GeoJSON vector derivatives', () => {
             const resource = {
                 ...baseResource,

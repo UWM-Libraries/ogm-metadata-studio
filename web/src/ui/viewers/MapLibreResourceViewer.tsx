@@ -2,7 +2,7 @@ import React, { useCallback, useLayoutEffect, useRef, useState } from 'react';
 import maplibregl from 'maplibre-gl';
 import { PMTiles, Protocol } from 'pmtiles';
 import 'maplibre-gl/dist/maplibre-gl.css';
-import { geoJsonToBounds, getBoundsFromGeometry } from './maplibreBounds';
+import { bboxToBounds, geoJsonToBounds, getBoundsFromGeometry, intersectLngLatBbox, type LngLatBbox } from './maplibreBounds';
 import { cogInfoArtifactUrl, cogPreviewArtifactUrl, proxiedArtifactUrl } from './artifactProxy';
 import type { GeoJsonGeometry, SelectableGeoJsonFeature } from './geospatialFeature';
 
@@ -26,7 +26,7 @@ export interface MapLibreResourceViewerProps {
 }
 
 interface CogInfoResponse {
-    bbox?: [number, number, number, number];
+    bbox?: LngLatBbox;
 }
 
 function buildWmsGetMapUrl(baseUrl: string, layerId: string, bounds: { getSouth: () => number; getWest: () => number; getNorth: () => number; getEast: () => number }, width: number, height: number): string {
@@ -145,7 +145,7 @@ function mapViewportSize(map: maplibregl.Map): { width: number; height: number }
     return { width: Math.round(width), height: Math.round(height) };
 }
 
-function isValidCogBbox(value: unknown): value is [number, number, number, number] {
+function isValidCogBbox(value: unknown): value is LngLatBbox {
     if (!Array.isArray(value) || value.length !== 4) return false;
     const [west, south, east, north] = value;
     return [west, south, east, north].every((item) => typeof item === 'number' && Number.isFinite(item))
@@ -156,8 +156,14 @@ function addCogLayer(map: maplibregl.Map, url: string, opacity: number, setError
     const sourceId = 'cog-overlay';
     const layerId = 'cog-overlay-layer';
     let canceled = false;
+    let cogBbox: LngLatBbox | null = null;
 
-    const imageForBounds = (bbox: [number, number, number, number]) => {
+    const removeImage = () => {
+        if (map.getLayer(layerId)) map.removeLayer(layerId);
+        if (map.getSource(sourceId)) map.removeSource(sourceId);
+    };
+
+    const imageForBounds = (bbox: LngLatBbox) => {
         const size = mapViewportSize(map);
         if (!size) return null;
         const [west, south, east, north] = bbox;
@@ -174,7 +180,7 @@ function addCogLayer(map: maplibregl.Map, url: string, opacity: number, setError
         };
     };
 
-    const addOrUpdateImage = (bbox: [number, number, number, number]) => {
+    const addOrUpdateImage = (bbox: LngLatBbox) => {
         if (canceled) return;
         const image = imageForBounds(bbox);
         if (!image) {
@@ -203,11 +209,15 @@ function addCogLayer(map: maplibregl.Map, url: string, opacity: number, setError
     };
 
     const updateImage = () => {
-        if (canceled || !map.getSource(sourceId)) return;
+        if (canceled || !cogBbox) return;
         const bounds = map.getBounds();
-        const sw = bounds.getSouthWest();
-        const ne = bounds.getNorthEast();
-        addOrUpdateImage([sw.lng, sw.lat, ne.lng, ne.lat]);
+        const viewportBbox: LngLatBbox = [bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth()];
+        const visibleBbox = intersectLngLatBbox(viewportBbox, cogBbox);
+        if (!visibleBbox) {
+            removeImage();
+            return;
+        }
+        addOrUpdateImage(visibleBbox);
     };
 
     const fitToCogBounds = async () => {
@@ -218,7 +228,8 @@ function addCogLayer(map: maplibregl.Map, url: string, opacity: number, setError
             if (!response.ok) throw new Error(`COG metadata returned ${response.status}`);
             const info = await response.json() as CogInfoResponse;
             if (!isValidCogBbox(info.bbox) || canceled) return;
-            const [west, south, east, north] = info.bbox;
+            cogBbox = info.bbox;
+            const [[west, south], [east, north]] = bboxToBounds(info.bbox);
             addOrUpdateImage(info.bbox);
             map.fitBounds([[west, south], [east, north]], { padding: 40, maxZoom: 16, duration: 0 });
             updateImage();
@@ -235,20 +246,21 @@ function addCogLayer(map: maplibregl.Map, url: string, opacity: number, setError
         canceled = true;
         map.off('moveend', updateImage);
         map.off('resize', updateImage);
-        if (map.getLayer(layerId)) map.removeLayer(layerId);
-        if (map.getSource(sourceId)) map.removeSource(sourceId);
+        removeImage();
     };
 }
 
-function addGeoJsonLayer(map: maplibregl.Map, url: string, opacity: number): () => void {
+function addGeoJsonLayer(map: maplibregl.Map, url: string, opacity: number, setError: (message: string | null) => void): () => void {
     const sourceId = 'geojson-overlay';
     const fillId = 'geojson-fill';
     const polygonLineId = 'geojson-polygon-line';
     const lineId = 'geojson-line';
     const pointId = 'geojson-point';
+    const dataUrl = proxiedArtifactUrl(url);
+    const controller = new AbortController();
     map.addSource(sourceId, {
         type: 'geojson',
-        data: proxiedArtifactUrl(url),
+        data: dataUrl,
     });
     map.addLayer({
         id: fillId,
@@ -278,8 +290,26 @@ function addGeoJsonLayer(map: maplibregl.Map, url: string, opacity: number): () 
         filter: ['==', '$type', 'Point'],
         paint: { 'circle-color': '#2563eb', 'circle-radius': 4, 'circle-stroke-color': '#ffffff', 'circle-stroke-width': 1, 'circle-opacity': opacity },
     });
+    fetch(dataUrl, { signal: controller.signal })
+        .then((response) => {
+            if (!response.ok) throw new Error(`GeoJSON returned ${response.status}`);
+            return response.json();
+        })
+        .then((json) => {
+            if (controller.signal.aborted) return;
+            const bounds = geoJsonToBounds(json);
+            if (!bounds) return;
+            setError(null);
+            map.fitBounds(bounds, { padding: 40, maxZoom: 16, duration: 0 });
+        })
+        .catch((caught: unknown) => {
+            const name = caught instanceof Error ? caught.name : '';
+            if (name === 'AbortError') return;
+            setError(caught instanceof Error ? caught.message : 'Failed to load GeoJSON.');
+        });
     const cleanupIdentify = installFeatureIdentify(map, [pointId, lineId, polygonLineId, fillId]);
     return () => {
+        controller.abort();
         cleanupIdentify();
         for (const id of [pointId, lineId, polygonLineId, fillId]) {
             if (map.getLayer(id)) map.removeLayer(id);
@@ -787,7 +817,7 @@ export const MapLibreResourceViewer: React.FC<MapLibreResourceViewerProps> = ({
             } else if (protocol === 'xyz') {
                 cleanupOverlayRef.current = addXyzLayer(map, url, op);
             } else if (protocol === 'geojson') {
-                cleanupOverlayRef.current = addGeoJsonLayer(map, url, op);
+                cleanupOverlayRef.current = addGeoJsonLayer(map, url, op, reportError);
             } else if (protocol === 'pmtiles') {
                 cleanupOverlayRef.current = addPmtilesLayer(map, url, op, reportError);
             } else if (protocol === 'cog') {

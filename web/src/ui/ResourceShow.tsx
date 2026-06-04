@@ -20,6 +20,20 @@ interface ResourceShowProps {
     onBack: () => void;
 }
 
+function referenceUrlEntries(value: unknown): Array<{ url: string; label?: string }> {
+    const values = Array.isArray(value) ? value : [value];
+    return values.flatMap((item) => {
+        if (typeof item === "string" && item.trim()) return [{ url: item }];
+        if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+        const candidate = item as { url?: unknown; label?: unknown };
+        if (typeof candidate.url !== "string" || !candidate.url.trim()) return [];
+        return [{
+            url: candidate.url,
+            ...(typeof candidate.label === "string" && candidate.label.trim() ? { label: candidate.label } : {}),
+        }];
+    });
+}
+
 function distributionsFromReferences(resource: Resource): Distribution[] {
     if (!resource.dct_references_s) return [];
     try {
@@ -27,13 +41,12 @@ function distributionsFromReferences(resource: Resource): Distribution[] {
         if (!refs || typeof refs !== "object") return [];
         const distributions: Distribution[] = [];
         for (const [relation_key, value] of Object.entries(refs)) {
-            const urls = Array.isArray(value) ? value : [value];
-            for (const url of urls) {
-                if (typeof url !== "string" || url.trim() === "") continue;
+            for (const entry of referenceUrlEntries(value)) {
                 distributions.push({
                     resource_id: resource.id,
                     relation_key,
-                    url,
+                    url: entry.url,
+                    label: entry.label,
                 });
             }
         }

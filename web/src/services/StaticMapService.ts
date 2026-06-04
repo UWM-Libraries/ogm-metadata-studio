@@ -3,6 +3,45 @@ import { Resource } from "../aardvark/model";
 // Constants for Web Mercator
 const TILE_SIZE = 256;
 const MAX_ZOOM = 19;
+const POINT_BBOX_DEGREES = 0.08;
+
+const ROUGH_PLACE_BBOXES: Array<{ patterns: RegExp[]; bbox: BBox }> = [
+    {
+        patterns: [/\bely\b/i],
+        bbox: { minLng: -115.05, minLat: 39.15, maxLng: -114.75, maxLat: 39.35 },
+    },
+    {
+        patterns: [/\baustin\b/i, /\breese river\b/i, /\blander county\b/i],
+        bbox: { minLng: -117.15, minLat: 39.35, maxLng: -116.85, maxLat: 39.65 },
+    },
+    {
+        patterns: [/\breno\b/i],
+        bbox: { minLng: -120.05, minLat: 39.35, maxLng: -119.55, maxLat: 39.75 },
+    },
+    {
+        patterns: [/\bbullfrog\b/i, /\brhyolite\b/i],
+        bbox: { minLng: -117.1, minLat: 36.8, maxLng: -116.65, maxLat: 37.1 },
+    },
+    {
+        patterns: [/\bboulder city\b/i],
+        bbox: { minLng: -114.95, minLat: 35.85, maxLng: -114.75, maxLat: 36.05 },
+    },
+    {
+        patterns: [/\bnevada\b/i, /\bnv\d*\b/i, /\bndot\b/i],
+        bbox: { minLng: -120.1, minLat: 35, maxLng: -114, maxLat: 42.1 },
+    },
+];
+
+const AI_ENRICHMENT_REFERENCE_KEYS = new Set([
+    "https://opengeometadata.org/reference/ai-enrichments",
+    "http://opengeometadata.org/reference/ai-enrichments",
+    "ai-enrichments",
+    "ai_enrichments",
+    "https://opengeometadata.org/reference/enrichment-response",
+    "http://opengeometadata.org/reference/enrichment-response",
+    "enrichment_response",
+    "extraction",
+]);
 
 interface BBox {
     minLat: number;
@@ -19,7 +58,7 @@ export class StaticMapService {
     }
 
     public async generate(width = 200, height = 200): Promise<Blob | null> {
-        const bbox = this.parseBBox();
+        const bbox = await this.resolveBBox();
         if (!bbox) return null;
 
         const zoom = this.getBestZoom(bbox, width, height);
@@ -101,26 +140,309 @@ export class StaticMapService {
         }
     }
 
-    private parseBBox(): BBox | null {
-        const geom = this.resource.dcat_bbox || this.resource.locn_geometry;
+    private async resolveBBox(): Promise<BBox | null> {
+        return this.parseResourceBBox() ||
+            this.parseResourceCentroid() ||
+            await this.parseBBoxFromReferences() ||
+            this.parseBBoxFromRoughPlaceText();
+    }
+
+    private parseResourceBBox(): BBox | null {
+        return this.parseGeometryText(this.resource.dcat_bbox) || this.parseGeometryText(this.resource.locn_geometry);
+    }
+
+    private parseResourceCentroid(): BBox | null {
+        const point = this.parsePoint(this.resource.dcat_centroid);
+        return point ? this.bboxFromPoint(point.lng, point.lat) : null;
+    }
+
+    private parseBBoxFromRoughPlaceText(): BBox | null {
+        const text = [
+            this.resource.dct_title_s,
+            ...(Array.isArray(this.resource.dct_spatial_sm) ? this.resource.dct_spatial_sm : []),
+            ...(Array.isArray(this.resource.dct_description_sm) ? this.resource.dct_description_sm : []),
+            ...(Array.isArray(this.resource.dct_subject_sm) ? this.resource.dct_subject_sm : []),
+            ...(Array.isArray(this.resource.dcat_keyword_sm) ? this.resource.dcat_keyword_sm : []),
+        ].filter(Boolean).join(" ");
+
+        if (!text.trim()) return null;
+        for (const entry of ROUGH_PLACE_BBOXES) {
+            if (entry.patterns.some((pattern) => pattern.test(text))) return entry.bbox;
+        }
+        return null;
+    }
+
+    private parseGeometryText(value: unknown): BBox | null {
+        if (!value || typeof value !== "string") return null;
+        const geom = value.trim();
         if (!geom) return null;
 
-        const envMatch = geom.match(/ENVELOPE\s*\(\s*([\d.-]+)\s*,\s*([\d.-]+)\s*,\s*([\d.-]+)\s*,\s*([\d.-]+)\s*\)/i);
+        const envMatch = geom.match(/ENVELOPE\s*\(\s*([+-]?\d+(?:\.\d+)?)\s*,\s*([+-]?\d+(?:\.\d+)?)\s*,\s*([+-]?\d+(?:\.\d+)?)\s*,\s*([+-]?\d+(?:\.\d+)?)\s*\)/i);
         if (envMatch) {
-            const w = parseFloat(envMatch[1]);
-            const e = parseFloat(envMatch[2]);
-            const n = parseFloat(envMatch[3]);
-            const s = parseFloat(envMatch[4]);
-            if (!isNaN(w) && !isNaN(e) && !isNaN(n) && !isNaN(s)) {
-                return { minLat: s, minLng: w, maxLat: n, maxLng: e };
+            const w = Number(envMatch[1]);
+            const e = Number(envMatch[2]);
+            const n = Number(envMatch[3]);
+            const s = Number(envMatch[4]);
+            return this.normalizeBBox(w, s, e, n);
+        }
+
+        const parts = geom.split(',').map(p => Number(p.trim()));
+        if (parts.length === 4 && parts.every(Number.isFinite)) {
+            return this.normalizeBBox(parts[0], parts[1], parts[2], parts[3]);
+        }
+
+        try {
+            return this.bboxFromGeoJson(JSON.parse(geom));
+        } catch {
+            return null;
+        }
+    }
+
+    private async parseBBoxFromReferences(): Promise<BBox | null> {
+        for (const url of this.getReferenceUrls(AI_ENRICHMENT_REFERENCE_KEYS)) {
+            const json = await this.fetchJson(url);
+            const bbox = this.extractBBoxFromEnrichment(json);
+            if (bbox) return bbox;
+        }
+        return null;
+    }
+
+    private extractBBoxFromEnrichment(payload: any): BBox | null {
+        if (!payload || typeof payload !== "object") return null;
+
+        return this.bboxFromMapExtent(payload.mapExtent || payload.map_extent || payload.map_bbox_estimate || payload.mapBboxEstimate) ||
+            this.bboxFromResourceLike(payload.resource || payload.aardvarkJson || payload.aardvark_json) ||
+            this.bboxFromResourceLike(payload) ||
+            this.bboxFromPlacenames(payload);
+    }
+
+    private bboxFromResourceLike(value: any): BBox | null {
+        if (!value || typeof value !== "object") return null;
+        return this.parseGeometryText(value.dcat_bbox) ||
+            this.parseGeometryText(value.locn_geometry) ||
+            this.bboxFromPointValue(value.dcat_centroid);
+    }
+
+    private bboxFromMapExtent(value: any): BBox | null {
+        if (!value || typeof value !== "object") return null;
+        const confidence = Number(value.confidence ?? 1);
+        if (Number.isFinite(confidence) && confidence <= 0) return null;
+
+        const fromArray = this.bboxFromArray(value.bbox);
+        if (fromArray) return fromArray;
+        return this.normalizeBBox(value.west, value.south, value.east, value.north);
+    }
+
+    private bboxFromPlacenames(payload: any): BBox | null {
+        const groups = [
+            payload.derivedPlacenames,
+            payload.placenames,
+            payload.places,
+            payload.placeCandidates,
+            payload.gazetteerMatches,
+        ];
+
+        for (const group of groups) {
+            if (!Array.isArray(group)) continue;
+            for (const place of group) {
+                const bbox = this.bboxFromPlace(place);
+                if (bbox) return bbox;
+            }
+        }
+        return null;
+    }
+
+    private bboxFromPlace(place: any): BBox | null {
+        if (!place || typeof place !== "object") return null;
+
+        const direct = this.bboxFromArray(place.bbox || place.bounds) ||
+            this.bboxFromMapExtent(place.mapExtent || place.map_extent) ||
+            this.bboxFromPointValue(place.coordinates || place.coordinate || place.centroid);
+        if (direct) return direct;
+
+        const nestedGroups = [
+            place.gazetteerMatches,
+            place.matches,
+            place.candidates,
+            place.geocoding?.candidates,
+            place.extensions?.canonicalGazetteer?.matches,
+        ];
+        for (const group of nestedGroups) {
+            if (!Array.isArray(group)) continue;
+            for (const match of group) {
+                const bbox = this.bboxFromPlace(match);
+                if (bbox) return bbox;
             }
         }
 
-        const parts = geom.split(',').map(p => parseFloat(p.trim()));
-        if (parts.length === 4 && parts.every(p => !isNaN(p))) {
-            return { minLat: parts[1], minLng: parts[0], maxLat: parts[3], maxLng: parts[2] };
+        return this.bboxFromPointValue(place.extensions?.canonicalGazetteer?.projectedCoordinates);
+    }
+
+    private bboxFromGeoJson(value: any): BBox | null {
+        const direct = this.bboxFromArray(value?.bbox);
+        if (direct) return direct;
+
+        if (value?.type === "Point") return this.bboxFromPointValue(value);
+
+        const coordinates: [number, number][] = [];
+        const collect = (node: unknown) => {
+            if (!Array.isArray(node)) return;
+            if (node.length >= 2 && typeof node[0] === "number" && typeof node[1] === "number") {
+                coordinates.push([node[0], node[1]]);
+                return;
+            }
+            node.forEach(collect);
+        };
+
+        if (value?.type === "Feature") collect(value.geometry?.coordinates);
+        else if (value?.type === "FeatureCollection") {
+            for (const feature of value.features || []) collect(feature?.geometry?.coordinates);
+        } else {
+            collect(value?.coordinates);
+        }
+
+        if (coordinates.length === 0) return null;
+        if (coordinates.length === 1) return this.bboxFromPoint(coordinates[0][0], coordinates[0][1]);
+        return this.normalizeBBox(
+            Math.min(...coordinates.map(coord => coord[0])),
+            Math.min(...coordinates.map(coord => coord[1])),
+            Math.max(...coordinates.map(coord => coord[0])),
+            Math.max(...coordinates.map(coord => coord[1])),
+        );
+    }
+
+    private bboxFromArray(value: unknown): BBox | null {
+        if (!Array.isArray(value) || value.length < 4) return null;
+        return this.normalizeBBox(value[0], value[1], value[2], value[3]);
+    }
+
+    private bboxFromPointValue(value: unknown): BBox | null {
+        const point = this.parsePoint(value);
+        return point ? this.bboxFromPoint(point.lng, point.lat) : null;
+    }
+
+    private parsePoint(value: unknown): { lat: number; lng: number } | null {
+        if (!value) return null;
+        if (typeof value === "string") {
+            const text = value.trim();
+            if (!text) return null;
+            try {
+                return this.parsePoint(JSON.parse(text));
+            } catch {
+                const pair = text.split(",").map(part => Number(part.trim()));
+                if (pair.length !== 2 || !pair.every(Number.isFinite)) return null;
+                return this.pointFromPair(pair[0], pair[1]);
+            }
+        }
+        if (Array.isArray(value) && value.length >= 2) {
+            return this.pointFromPair(Number(value[0]), Number(value[1]));
+        }
+        if (typeof value === "object") {
+            const object = value as Record<string, any>;
+            if (object.type === "Point" && Array.isArray(object.coordinates)) {
+                return this.pointFromPair(Number(object.coordinates[0]), Number(object.coordinates[1]));
+            }
+            const lng = Number(object.lng ?? object.lon ?? object.longitude);
+            const lat = Number(object.lat ?? object.latitude);
+            if (this.validLatLng(lat, lng)) return { lat, lng };
+            if (object.coordinates) return this.parsePoint(object.coordinates);
         }
         return null;
+    }
+
+    private pointFromPair(first: number, second: number): { lat: number; lng: number } | null {
+        if (this.validLatLng(second, first)) return { lat: second, lng: first };
+        if (this.validLatLng(first, second)) return { lat: first, lng: second };
+        return null;
+    }
+
+    private bboxFromPoint(lng: number, lat: number): BBox | null {
+        if (!this.validLatLng(lat, lng)) return null;
+        const half = POINT_BBOX_DEGREES / 2;
+        return this.normalizeBBox(lng - half, lat - half, lng + half, lat + half);
+    }
+
+    private normalizeBBox(westValue: unknown, southValue: unknown, eastValue: unknown, northValue: unknown): BBox | null {
+        const west = Number(westValue);
+        const south = Number(southValue);
+        const east = Number(eastValue);
+        const north = Number(northValue);
+        if (![west, south, east, north].every(Number.isFinite)) return null;
+        if (west < -180 || east > 180 || south < -90 || north > 90) return null;
+        if (!(east > west && north > south)) return null;
+        return { minLat: south, minLng: west, maxLat: north, maxLng: east };
+    }
+
+    private validLatLng(lat: number, lng: number): boolean {
+        return Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180;
+    }
+
+    private getReferenceUrls(keys: Set<string>): string[] {
+        const refs = this.parseResourceReferences();
+        if (!refs) return [];
+
+        const urls: string[] = [];
+        const push = (url?: string | null) => {
+            const trimmed = String(url || "").trim();
+            if (!trimmed || urls.includes(trimmed)) return;
+            urls.push(trimmed);
+        };
+
+        for (const [key, value] of Object.entries(refs)) {
+            if (!keys.has(key)) continue;
+            for (const url of this.extractUrls(value)) push(url);
+        }
+        return urls;
+    }
+
+    private parseResourceReferences(): Record<string, unknown> | null {
+        const raw = this.resource.dct_references_s;
+        if (!raw || typeof raw !== "string") return null;
+        try {
+            const parsed = JSON.parse(raw);
+            return parsed && typeof parsed === "object" ? parsed as Record<string, unknown> : null;
+        } catch {
+            return null;
+        }
+    }
+
+    private extractUrls(value: unknown): string[] {
+        const urls: string[] = [];
+        const visit = (entry: unknown) => {
+            if (typeof entry === "string") {
+                const url = entry.trim();
+                if (url) urls.push(url);
+                return;
+            }
+            if (Array.isArray(entry)) {
+                entry.forEach(visit);
+                return;
+            }
+            if (!entry || typeof entry !== "object") return;
+            const object = entry as Record<string, unknown>;
+            const direct = object.url || object["@id"] || object.id;
+            if (typeof direct === "string" && direct.trim()) {
+                urls.push(direct.trim());
+                return;
+            }
+            for (const nested of Object.values(object)) visit(nested);
+        };
+        visit(value);
+        return urls;
+    }
+
+    private async fetchJson(url: string): Promise<any> {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 5000);
+        try {
+            const res = await fetch(url, { signal: controller.signal });
+            if (!res.ok) return null;
+            return await res.json();
+        } catch {
+            return null;
+        } finally {
+            clearTimeout(timeout);
+        }
     }
 
     private latLngToPoint(lat: number, lng: number, zoom: number) {
