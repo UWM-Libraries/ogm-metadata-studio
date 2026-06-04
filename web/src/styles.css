@@ -1,10 +1,31 @@
+@import url("https://fonts.googleapis.com/css2?family=Work+Sans:wght@400;500;600;700;800&display=swap");
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 @layer base {
   body {
-    @apply bg-slate-950 text-slate-100 antialiased;
+    @apply antialiased;
+    font-family: "Work Sans", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #f6f0d8;
+    color: #141414;
   }
 }
 
+@layer utilities {
+  .ogm-grid-bg {
+    background-color: #f6f0d8;
+    background-image:
+      linear-gradient(rgba(17, 17, 17, 0.07) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(17, 17, 17, 0.07) 1px, transparent 1px);
+    background-size: 24px 24px;
+  }
+
+  .dark .ogm-grid-bg {
+    background-color: #111111;
+    background-image:
+      linear-gradient(rgba(255, 253, 243, 0.08) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255, 253, 243, 0.08) 1px, transparent 1px);
+  }
+}

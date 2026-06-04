@@ -27,12 +27,12 @@ describe('ImportPage', () => {
 
     it('renders welcome message when resourceCount is 0', () => {
         render(<ImportPage resourceCount={0} />);
-        expect(screen.getByText(/Welcome to Aardvark Metadata Studio/)).toBeDefined();
+        expect(screen.getByText(/Welcome to OpenGeoMetadata Studio/)).toBeDefined();
     });
 
     it('does not render welcome message when resources exist', () => {
         render(<ImportPage resourceCount={5} />);
-        expect(screen.queryByText(/Welcome to Aardvark Metadata Studio/)).toBeNull();
+        expect(screen.queryByText(/Welcome to OpenGeoMetadata Studio/)).toBeNull();
     });
 
     it('switches tabs', () => {
