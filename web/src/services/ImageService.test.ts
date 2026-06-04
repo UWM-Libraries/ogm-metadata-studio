@@ -152,7 +152,7 @@ describe('ImageService', () => {
         expect(url).toBe('http://proxy.test/api/artifacts/cog-preview?url=https%3A%2F%2Fs3.amazonaws.com%2Fogm-metadata-studio%2Fuploads%2Fgeodata-1%2Fsource.tif&bbox=-115%2C39%2C-114%2C40&width=512&height=512&v=raster-thumb-v2');
     });
 
-    it('prefers explicit thumbnail references over cached blob thumbnails', async () => {
+    it('refreshes stale generated Studio thumbnail references over cached blob thumbnails', async () => {
         vi.stubEnv('VITE_ENRICHMENT_PROXY_URL', 'http://proxy.test');
         const res = {
             ...mockResource,
@@ -172,9 +172,30 @@ describe('ImageService', () => {
         };
 
         const service = new ImageService(res, []);
+        const urls = await service.getThumbnailUrls();
+
+        expect(urls).toEqual([
+            'http://proxy.test/api/artifacts/proxy?url=https%3A%2F%2Fs3.amazonaws.com%2Fogm-metadata-studio%2Fuploads%2Fgeodata-1%2Fthumbnail%2Fthumbnail.jpg',
+            'http://proxy.test/api/artifacts/cog-preview?url=https%3A%2F%2Fs3.amazonaws.com%2Fogm-metadata-studio%2Fuploads%2Fgeodata-1%2Fderivatives%2Fmap.cog.tif&bbox=-115%2C39%2C-114%2C40&width=512&height=512&v=raster-thumb-v2',
+        ]);
+    });
+
+    it('proxies generated Studio thumbnails when no generated preview is available', async () => {
+        const res = {
+            ...mockResource,
+            dct_references_s: JSON.stringify({
+                'http://schema.org/thumbnailUrl': {
+                    url: 'https://s3.amazonaws.com/ogm-metadata-studio/uploads/geodata-1/thumbnail/thumbnail.jpg',
+                    label: 'Stale stored thumbnail reference'
+                }
+            })
+        };
+
+        const service = new ImageService(res, []);
         const url = await service.getThumbnailUrl();
 
-        expect(url).toBe('https://s3.amazonaws.com/ogm-metadata-studio/uploads/geodata-1/thumbnail/thumbnail.jpg');
+        expect(mockFetch).not.toHaveBeenCalled();
+        expect(url).toBe('http://localhost:8787/api/artifacts/proxy?url=https%3A%2F%2Fs3.amazonaws.com%2Fogm-metadata-studio%2Fuploads%2Fgeodata-1%2Fthumbnail%2Fthumbnail.jpg');
     });
 
     it('refreshes stale cached blob thumbnails for GeoTIFF preview records without explicit thumbnails', async () => {
@@ -335,9 +356,12 @@ describe('ImageService', () => {
         };
 
         const service = new ImageService(res, []);
-        const url = await service.getThumbnailUrl();
+        const urls = await service.getThumbnailUrls();
 
-        expect(url).toBe('http://proxy.test/api/artifacts/vector-preview?url=https%3A%2F%2Fs3.amazonaws.com%2Fogm-metadata-studio%2Fuploads%2Fgeodata-1%2Foriginal_file%2Ffootprints.zip&width=512&height=512&v=vector-thumb-v1');
+        expect(urls).toEqual([
+            'http://proxy.test/api/artifacts/proxy?url=https%3A%2F%2Fs3.amazonaws.com%2Fogm-metadata-studio%2Fuploads%2Fgeodata-1%2Fthumbnail%2Fthumbnail.jpg',
+            'http://proxy.test/api/artifacts/vector-preview?url=https%3A%2F%2Fs3.amazonaws.com%2Fogm-metadata-studio%2Fuploads%2Fgeodata-1%2Foriginal_file%2Ffootprints.zip&width=512&height=512&v=vector-thumb-v1',
+        ]);
     });
 
     it('constructs a PMTiles preview thumbnail from Princeton PMTiles references', async () => {

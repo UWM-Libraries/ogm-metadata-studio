@@ -1,4 +1,5 @@
 import { Resource, Distribution, REFERENCE_URI_MAPPING } from "../aardvark/model";
+import { isGeneratedStudioThumbnailUrl, proxiedStudioThumbnailUrl } from "./thumbnailUrl";
 
 const DEFAULT_ENRICHMENT_PROXY_URL = "http://localhost:8787";
 const GENERATED_RASTER_THUMBNAIL_SIZE = 512;
@@ -39,34 +40,70 @@ export class ImageService {
      * This may require fetching a IIIF manifest, so it returns a Promise.
      */
     async getThumbnailUrl(): Promise<string | null> {
+        return (await this.getThumbnailUrls())[0] || null;
+    }
+
+    async getThumbnailUrls(): Promise<string[]> {
+        const candidates: string[] = [];
+        const push = (url: string | null | undefined) => {
+            const trimmed = String(url || "").trim();
+            if (trimmed && !candidates.includes(trimmed)) candidates.push(trimmed);
+        };
+
         const explicitThumbnailUrl = this.getExplicitThumbnailSourceUrl();
+
+        if (explicitThumbnailUrl && isGeneratedStudioThumbnailUrl(explicitThumbnailUrl)) {
+            push(proxiedStudioThumbnailUrl(explicitThumbnailUrl));
+            push(await this.getGeneratedPreviewUrl());
+            return candidates;
+        }
+
+        if (this.resource.thumbnail && !explicitThumbnailUrl && isGeneratedStudioThumbnailUrl(this.resource.thumbnail)) {
+            push(proxiedStudioThumbnailUrl(this.resource.thumbnail));
+            push(await this.getGeneratedPreviewUrl());
+            return candidates;
+        }
 
         // 0. Check Cache (already populated in Resource)
         if (this.resource.thumbnail && !explicitThumbnailUrl && this.shouldBypassCachedThumbnail()) {
-            const refreshedRasterPreview = await this.getGeoTiffPreviewUrl() || this.getRasterPreviewUrl() || this.getPmtilesPreviewUrl() || this.getVectorPackagePreviewUrl();
-            if (refreshedRasterPreview) return refreshedRasterPreview;
+            const refreshedRasterPreview = await this.getGeneratedPreviewUrl();
+            if (refreshedRasterPreview) {
+                push(refreshedRasterPreview);
+                return candidates;
+            }
         }
 
         if (this.resource.thumbnail && !explicitThumbnailUrl) {
             // console.debug(`[ImageService] Cache Hit for ${this.resource.id}`);
-            return this.resource.thumbnail;
+            push(this.resource.thumbnail);
+            return candidates;
         }
 
         // Check for restricted access rights - actually we might show thumbnails for restricted items if public?
         // Python code skips restricted:
         if (this.resource.dct_accessRights_s?.toLowerCase() === "restricted") {
             console.debug(`[ImageService] Access Restricted for ${this.resource.id}`);
-            return null;
+            return candidates;
         }
 
         const sourceUrl = explicitThumbnailUrl || this.getThumbnailSourceUrl();
         if (!sourceUrl) {
-            return await this.getGeoTiffPreviewUrl() || this.getRasterPreviewUrl() || this.getPmtilesPreviewUrl() || this.getVectorPackagePreviewUrl();
+            push(await this.getGeneratedPreviewUrl());
+            return candidates;
+        }
+
+        if (isGeneratedStudioThumbnailUrl(sourceUrl)) {
+            push(proxiedStudioThumbnailUrl(sourceUrl));
+            push(await this.getGeneratedPreviewUrl());
+            return candidates;
         }
 
         if (this.isGeoTiffLikeUrl(sourceUrl)) {
             const preview = await this.getGeoTiffPreviewUrl(sourceUrl) || this.getRasterPreviewUrl(sourceUrl);
-            if (preview) return preview;
+            if (preview) {
+                push(preview);
+                return candidates;
+            }
         }
 
         // Check if it is a IIIF Manifest URL
@@ -80,20 +117,29 @@ export class ImageService {
                         const final = this.standardizeIiifUrl(thumb);
                         console.log(`[ImageService] ✅ Resolved Thumbnail for ${this.resource.id}:`, final);
                         // Cache handled by queue
-                        return final;
+                        push(final);
+                        return candidates;
                     }
                 }
             } catch (e) {
                 console.warn(`[ImageService] Failed to fetch/parse manifest for ${this.resource.id}`, e);
             }
-            return null;
+            return candidates;
         }
 
         // Direct image URL
         const final = this.standardizeIiifUrl(sourceUrl);
         console.log(`[ImageService] ✅ Found Direct Thumbnail for ${this.resource.id}:`, final);
         // Cache handled by queue
-        return final;
+        push(final);
+        return candidates;
+    }
+
+    private async getGeneratedPreviewUrl(): Promise<string | null> {
+        return await this.getGeoTiffPreviewUrl() ||
+            this.getRasterPreviewUrl() ||
+            this.getPmtilesPreviewUrl() ||
+            this.getVectorPackagePreviewUrl();
     }
 
     private getExplicitThumbnailSourceUrl(): string | null {

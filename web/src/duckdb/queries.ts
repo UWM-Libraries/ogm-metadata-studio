@@ -652,7 +652,8 @@ export async function getThumbnail(id: string): Promise<string | null> {
     const ctx = await getDuckDbContext();
     if (!ctx) return null;
     try {
-        const result = await ctx.conn.query(`SELECT data FROM resources_image_service WHERE id = '${id}'`);
+        const safeId = id.replace(/'/g, "''");
+        const result = await ctx.conn.query(`SELECT data FROM resources_image_service WHERE id = '${safeId}'`);
         if (result.numRows === 0) return null;
         const row = result.get(0);
         if (!row || !row['data']) return null;

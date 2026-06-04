@@ -60,16 +60,21 @@ export function useThumbnailQueue() {
                     }
 
                     const service = new ImageService(item.resource, dists);
-                    const url = await service.getThumbnailUrl();
-                    if (url) {
-                        // Fetch blob
-                        const resp = await fetch(url);
-                        if (resp.ok) {
-                            const blob = await resp.blob();
-                            await upsertThumbnail(item.id, blob);
-                            setThumbnails(prev => ({ ...prev, [item.id]: URL.createObjectURL(blob) }));
-                        } else {
-                            setThumbnails(prev => Object.prototype.hasOwnProperty.call(prev, item.id) ? prev : ({ ...prev, [item.id]: null }));
+                    const urls = await service.getThumbnailUrls();
+                    if (urls.length > 0) {
+                        setThumbnails(prev => ({ ...prev, [item.id]: prev[item.id] || urls[0] }));
+
+                        for (const url of urls) {
+                            try {
+                                const resp = await fetch(url);
+                                if (!resp.ok) continue;
+                                const blob = await resp.blob();
+                                await upsertThumbnail(item.id, blob);
+                                setThumbnails(prev => ({ ...prev, [item.id]: URL.createObjectURL(blob) }));
+                                return;
+                            } catch {
+                                // Keep the direct/proxied URL visible and try the next candidate.
+                            }
                         }
                     } else {
                         // Mark as null to indicate "checked but none found" (optional, allows UI to stop loading state)

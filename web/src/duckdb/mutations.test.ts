@@ -8,6 +8,7 @@ vi.mock('./dbInit', () => ({
     getDuckDbContext: vi.fn(),
     saveResourceOverlayToIndexedDB: vi.fn(),
     saveResourceDeleteOverlayToIndexedDB: vi.fn(),
+    saveThumbnailToIndexedDB: vi.fn(),
 }));
 
 vi.mock('./queries', () => ({
@@ -136,6 +137,11 @@ describe('DuckDB Mutations', () => {
             await upsertThumbnail('img-1', blob as any);
 
             expect(mockConn.query).toHaveBeenCalledWith(expect.stringContaining('INSERT INTO resources_image_service'));
+            expect(dbInit.saveThumbnailToIndexedDB).toHaveBeenCalledWith(expect.objectContaining({
+                id: 'img-1',
+                data: expect.any(String),
+                mime_type: 'image/png',
+            }));
         });
 
         it('upsertStaticMap stores base64 data', async () => {

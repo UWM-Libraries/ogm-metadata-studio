@@ -79,17 +79,19 @@ describe("thumbnailUrl", () => {
         })).toBe("http://localhost:8787/api/artifacts/vector-preview?url=https%3A%2F%2Fexample.com%2Fsource.zip");
     });
 
-    it("keeps generated Studio thumbnails visible until queue processing replaces them", () => {
+    it("proxies generated Studio thumbnails before queue processing", () => {
         const r = resource({
             dct_source_sm: [
                 "https://s3.amazonaws.com/ogm-metadata-studio/uploads/geodata-f8279ca9012a19eb/original_file/source.zip",
             ],
         });
 
-        expect(displayThumbnailUrl(r, {})).toBe("https://s3.amazonaws.com/ogm-metadata-studio/uploads/geodata-f8279ca9012a19eb/thumbnail/thumbnail.jpg");
+        const proxied = "http://localhost:8787/api/artifacts/proxy?url=https%3A%2F%2Fs3.amazonaws.com%2Fogm-metadata-studio%2Fuploads%2Fgeodata-f8279ca9012a19eb%2Fthumbnail%2Fthumbnail.jpg";
+
+        expect(displayThumbnailUrl(r, {})).toBe(proxied);
         expect(displayThumbnailUrl({
             ...r,
             thumbnail: "https://s3.amazonaws.com/ogm-metadata-studio/uploads/geodata-f8279ca9012a19eb/thumbnail/thumbnail.jpg",
-        }, {})).toBe("https://s3.amazonaws.com/ogm-metadata-studio/uploads/geodata-f8279ca9012a19eb/thumbnail/thumbnail.jpg");
+        }, {})).toBe(proxied);
     });
 });

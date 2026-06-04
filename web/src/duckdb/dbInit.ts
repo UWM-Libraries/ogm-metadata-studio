@@ -4,7 +4,7 @@ import wasmUrl from "@duckdb/duckdb-wasm/dist/duckdb-eh.wasm?url";
 import mvpWorkerUrl from "@duckdb/duckdb-wasm/dist/duckdb-browser-mvp.worker.js?url";
 import mvpWasmUrl from "@duckdb/duckdb-wasm/dist/duckdb-mvp.wasm?url";
 import type { AardvarkJson } from "../aardvark/model";
-import { ensureSchema, DISTRIBUTIONS_TABLE, RESOURCES_MV_TABLE, RESOURCES_TABLE } from "./schema";
+import { ensureSchema, DISTRIBUTIONS_TABLE, IMAGE_SERVICE_TABLE, RESOURCES_MV_TABLE, RESOURCES_TABLE } from "./schema";
 import { REPEATABLE_STRING_FIELDS } from "../aardvark/model";
 import { backfillCentroidAndH3 } from "./backfill";
 import { safeJsonStringify } from "./json";
@@ -14,12 +14,13 @@ export const DB_FILENAME = "records.duckdb";
 export const INDEXEDDB_NAME = "aardvark-duckdb";
 export const INDEXEDDB_STORE = "database";
 export const INDEXEDDB_RECORDS_STORE = "records";
+export const INDEXEDDB_THUMBNAIL_STORE = "thumbnails";
 export const SNAPSHOT_KEY = "records.snapshot.json";
 export const ENRICHMENT_SNAPSHOT_KEY = "enrichments.snapshot.json";
 export const RECORDS_META_KEY = "records.meta.json";
 export const DELETED_RECORD_IDS_KEY = "records.deleted.ids.json";
 const STARTER_RESOURCE_CACHE_RESET_KEY = "starter.empty-baseline.resources-reset.v1";
-const INDEXEDDB_VERSION = 2;
+const INDEXEDDB_VERSION = 4;
 export const DUCKDB_RESTORE_PROGRESS_EVENT = "duckdb-restore-progress";
 export const DUCKDB_RESTORED_EVENT = "duckdb-restored";
 
@@ -42,10 +43,63 @@ export interface DuckDbContext {
     conn: duckdb.AsyncDuckDBConnection;
 }
 
+export interface ThumbnailCacheRecord {
+    id: string;
+    data: string;
+    last_updated: number;
+    mime_type?: string;
+}
+
 // Singleton connection
 let cached: Promise<DuckDbContext | null> | null = null;
 let restoreStatus: RestoreStatus = { inProgress: false, processed: 0, total: 0 };
 let restorePromise: Promise<void> | null = null;
+
+function ensureIndexedDbStores(db: IDBDatabase) {
+    if (!db.objectStoreNames.contains(INDEXEDDB_STORE)) db.createObjectStore(INDEXEDDB_STORE);
+    if (!db.objectStoreNames.contains(INDEXEDDB_RECORDS_STORE)) db.createObjectStore(INDEXEDDB_RECORDS_STORE, { keyPath: "id" });
+    if (!db.objectStoreNames.contains(INDEXEDDB_THUMBNAIL_STORE)) db.createObjectStore(INDEXEDDB_THUMBNAIL_STORE, { keyPath: "id" });
+}
+
+function hasIndexedDbStores(db: IDBDatabase): boolean {
+    return db.objectStoreNames.contains(INDEXEDDB_STORE) &&
+        db.objectStoreNames.contains(INDEXEDDB_RECORDS_STORE) &&
+        db.objectStoreNames.contains(INDEXEDDB_THUMBNAIL_STORE);
+}
+
+async function openIndexedDbWithStores(): Promise<IDBDatabase> {
+    const db = await openIndexedDb(INDEXEDDB_VERSION);
+    if (hasIndexedDbStores(db)) return db;
+
+    db.close();
+    throw new Error("IndexedDB thumbnail cache store is unavailable after schema migration.");
+}
+
+function openIndexedDb(version: number): Promise<IDBDatabase> {
+    return new Promise((resolve, reject) => {
+        const req = indexedDB.open(INDEXEDDB_NAME, version);
+        req.onupgradeneeded = (e: any) => {
+            ensureIndexedDbStores(e.target.result as IDBDatabase);
+        };
+        req.onsuccess = (e: any) => resolve(e.target.result as IDBDatabase);
+        req.onerror = () => reject(req.error);
+        req.onblocked = () => reject(new Error("IndexedDB schema upgrade is blocked by another open app tab."));
+    });
+}
+
+function validThumbnailCacheRecord(value: unknown): ThumbnailCacheRecord | null {
+    if (!value || typeof value !== "object") return null;
+    const record = value as Partial<ThumbnailCacheRecord>;
+    if (typeof record.id !== "string" || record.id.trim() === "") return null;
+    if (typeof record.data !== "string" || record.data.trim() === "") return null;
+    const lastUpdated = Number(record.last_updated || 0);
+    return {
+        id: record.id,
+        data: record.data,
+        last_updated: Number.isFinite(lastUpdated) && lastUpdated > 0 ? lastUpdated : Date.now(),
+        mime_type: typeof record.mime_type === "string" && record.mime_type ? record.mime_type : undefined,
+    };
+}
 
 function updateRestoreStatus(next: Partial<RestoreStatus>) {
     restoreStatus = { ...restoreStatus, ...next };
@@ -207,6 +261,26 @@ function chunk<T>(values: T[], size: number): T[][] {
         out.push(values.slice(i, i + size));
     }
     return out;
+}
+
+async function restoreThumbnailCacheIntoDuckDb(conn: duckdb.AsyncDuckDBConnection): Promise<void> {
+    const cachedThumbnails = await loadThumbnailCacheFromIndexedDB();
+    if (cachedThumbnails.length === 0) return;
+
+    for (const group of chunk(cachedThumbnails, 200)) {
+        const idList = group.map((record) => `'${record.id.replace(/'/g, "''")}'`).join(",");
+        const values = group.map((record) => {
+            const id = record.id.replace(/'/g, "''");
+            const data = record.data.replace(/'/g, "''");
+            const lastUpdated = Number.isFinite(record.last_updated) ? Math.floor(record.last_updated) : Date.now();
+            return `('${id}', '${data}', ${lastUpdated})`;
+        }).join(",");
+
+        await conn.query(`DELETE FROM ${IMAGE_SERVICE_TABLE} WHERE id IN (${idList})`);
+        await conn.query(`INSERT INTO ${IMAGE_SERVICE_TABLE} (id, data, last_updated) VALUES ${values}`);
+    }
+
+    console.log(`[IndexedDB] Restored ${cachedThumbnails.length} thumbnail(s) into DuckDB.`);
 }
 
 async function loadInitialDataFromParquet(
@@ -372,6 +446,7 @@ export async function getDuckDbContext(): Promise<DuckDbContext | null> {
             const loadedFromParquet = await loadInitialDataFromParquet(db, conn);
             // Then, ensure the schema is fully up to date (adds any missing columns/indexes).
             await ensureSchema(conn);
+            await restoreThumbnailCacheIntoDuckDb(conn);
             // If we bootstrapped from Parquet, rebuild resources_mv and search_index
             // so search and multivalue facets work.
             if (loadedFromParquet) {
@@ -423,9 +498,7 @@ export async function loadFromIndexedDB(): Promise<Uint8Array | null> {
         const req = indexedDB.open(INDEXEDDB_NAME, INDEXEDDB_VERSION);
         req.onupgradeneeded = (e: any) => {
             console.log("[IndexedDB] Creating object store...");
-            const db = e.target.result as IDBDatabase;
-            if (!db.objectStoreNames.contains(INDEXEDDB_STORE)) db.createObjectStore(INDEXEDDB_STORE);
-            if (!db.objectStoreNames.contains(INDEXEDDB_RECORDS_STORE)) db.createObjectStore(INDEXEDDB_RECORDS_STORE, { keyPath: "id" });
+            ensureIndexedDbStores(e.target.result as IDBDatabase);
         }
         req.onsuccess = (e: any) => {
             const db = e.target.result;
@@ -456,9 +529,7 @@ export async function loadSnapshotFromIndexedDB(): Promise<AardvarkJson[] | null
     return new Promise((resolve) => {
         const req = indexedDB.open(INDEXEDDB_NAME, INDEXEDDB_VERSION);
         req.onupgradeneeded = (e: any) => {
-            const db = e.target.result as IDBDatabase;
-            if (!db.objectStoreNames.contains(INDEXEDDB_STORE)) db.createObjectStore(INDEXEDDB_STORE);
-            if (!db.objectStoreNames.contains(INDEXEDDB_RECORDS_STORE)) db.createObjectStore(INDEXEDDB_RECORDS_STORE, { keyPath: "id" });
+            ensureIndexedDbStores(e.target.result as IDBDatabase);
         };
         req.onsuccess = (e: any) => {
             const db = e.target.result;
@@ -495,9 +566,7 @@ export async function saveToIndexedDB(buffer: Uint8Array): Promise<void> {
         console.log(`[IndexedDB] Saving ${buffer.byteLength} bytes...`);
         const req = indexedDB.open(INDEXEDDB_NAME, INDEXEDDB_VERSION);
         req.onupgradeneeded = (e: any) => {
-            const db = e.target.result as IDBDatabase;
-            if (!db.objectStoreNames.contains(INDEXEDDB_STORE)) db.createObjectStore(INDEXEDDB_STORE);
-            if (!db.objectStoreNames.contains(INDEXEDDB_RECORDS_STORE)) db.createObjectStore(INDEXEDDB_RECORDS_STORE, { keyPath: "id" });
+            ensureIndexedDbStores(e.target.result as IDBDatabase);
         }
         req.onsuccess = (e: any) => {
             const db = e.target.result;
@@ -517,9 +586,7 @@ export async function saveSnapshotToIndexedDB(snapshot: AardvarkJson[]): Promise
     return new Promise((resolve, reject) => {
         const req = indexedDB.open(INDEXEDDB_NAME, INDEXEDDB_VERSION);
         req.onupgradeneeded = (e: any) => {
-            const db = e.target.result as IDBDatabase;
-            if (!db.objectStoreNames.contains(INDEXEDDB_STORE)) db.createObjectStore(INDEXEDDB_STORE);
-            if (!db.objectStoreNames.contains(INDEXEDDB_RECORDS_STORE)) db.createObjectStore(INDEXEDDB_RECORDS_STORE, { keyPath: "id" });
+            ensureIndexedDbStores(e.target.result as IDBDatabase);
         };
         req.onsuccess = (e: any) => {
             try {
@@ -543,9 +610,7 @@ export async function loadEnrichmentSnapshotFromIndexedDB(): Promise<any | null>
     return new Promise((resolve) => {
         const req = indexedDB.open(INDEXEDDB_NAME, INDEXEDDB_VERSION);
         req.onupgradeneeded = (e: any) => {
-            const db = e.target.result as IDBDatabase;
-            if (!db.objectStoreNames.contains(INDEXEDDB_STORE)) db.createObjectStore(INDEXEDDB_STORE);
-            if (!db.objectStoreNames.contains(INDEXEDDB_RECORDS_STORE)) db.createObjectStore(INDEXEDDB_RECORDS_STORE, { keyPath: "id" });
+            ensureIndexedDbStores(e.target.result as IDBDatabase);
         };
         req.onsuccess = (e: any) => {
             const db = e.target.result;
@@ -579,9 +644,7 @@ export async function saveEnrichmentSnapshotToIndexedDB(snapshot: unknown): Prom
     return new Promise((resolve, reject) => {
         const req = indexedDB.open(INDEXEDDB_NAME, INDEXEDDB_VERSION);
         req.onupgradeneeded = (e: any) => {
-            const db = e.target.result as IDBDatabase;
-            if (!db.objectStoreNames.contains(INDEXEDDB_STORE)) db.createObjectStore(INDEXEDDB_STORE);
-            if (!db.objectStoreNames.contains(INDEXEDDB_RECORDS_STORE)) db.createObjectStore(INDEXEDDB_RECORDS_STORE, { keyPath: "id" });
+            ensureIndexedDbStores(e.target.result as IDBDatabase);
         };
         req.onsuccess = (e: any) => {
             try {
@@ -601,13 +664,65 @@ export async function saveEnrichmentSnapshotToIndexedDB(snapshot: unknown): Prom
     });
 }
 
+export async function loadThumbnailCacheFromIndexedDB(): Promise<ThumbnailCacheRecord[]> {
+    try {
+        const db = await openIndexedDbWithStores();
+        return await new Promise((resolve) => {
+            const tx = db.transaction([INDEXEDDB_THUMBNAIL_STORE], "readonly");
+            const getAll = tx.objectStore(INDEXEDDB_THUMBNAIL_STORE).getAll();
+            getAll.onsuccess = () => {
+                const records = (Array.isArray(getAll.result) ? getAll.result : [])
+                    .map(validThumbnailCacheRecord)
+                    .filter((record): record is ThumbnailCacheRecord => record !== null);
+                resolve(records);
+            };
+            getAll.onerror = () => {
+                console.warn("[IndexedDB] Failed to load thumbnail cache", getAll.error);
+                resolve([]);
+            };
+            tx.oncomplete = () => db.close();
+            tx.onabort = () => db.close();
+            tx.onerror = () => db.close();
+        });
+    } catch (e) {
+        console.warn("[IndexedDB] Failed to open DB for thumbnail cache", e);
+        return [];
+    }
+}
+
+export async function saveThumbnailToIndexedDB(record: ThumbnailCacheRecord): Promise<void> {
+    const normalized = validThumbnailCacheRecord(record);
+    if (!normalized) return;
+
+    const db = await openIndexedDbWithStores();
+    return new Promise((resolve, reject) => {
+        try {
+            const tx = db.transaction([INDEXEDDB_THUMBNAIL_STORE], "readwrite");
+            tx.objectStore(INDEXEDDB_THUMBNAIL_STORE).put(normalized);
+            tx.oncomplete = () => {
+                db.close();
+                resolve();
+            };
+            tx.onerror = () => {
+                db.close();
+                reject(tx.error);
+            };
+            tx.onabort = () => {
+                db.close();
+                reject(tx.error);
+            };
+        } catch (error) {
+            db.close();
+            reject(error);
+        }
+    });
+}
+
 export async function loadRecordsFromIndexedDB(): Promise<AardvarkJson[]> {
     return new Promise((resolve) => {
         const req = indexedDB.open(INDEXEDDB_NAME, INDEXEDDB_VERSION);
         req.onupgradeneeded = (e: any) => {
-            const db = e.target.result as IDBDatabase;
-            if (!db.objectStoreNames.contains(INDEXEDDB_STORE)) db.createObjectStore(INDEXEDDB_STORE);
-            if (!db.objectStoreNames.contains(INDEXEDDB_RECORDS_STORE)) db.createObjectStore(INDEXEDDB_RECORDS_STORE, { keyPath: "id" });
+            ensureIndexedDbStores(e.target.result as IDBDatabase);
         };
         req.onsuccess = (e: any) => {
             const db = e.target.result as IDBDatabase;
@@ -634,9 +749,7 @@ export async function loadResourceFromIndexedDB(id: string): Promise<AardvarkJso
     return new Promise((resolve) => {
         const req = indexedDB.open(INDEXEDDB_NAME, INDEXEDDB_VERSION);
         req.onupgradeneeded = (e: any) => {
-            const db = e.target.result as IDBDatabase;
-            if (!db.objectStoreNames.contains(INDEXEDDB_STORE)) db.createObjectStore(INDEXEDDB_STORE);
-            if (!db.objectStoreNames.contains(INDEXEDDB_RECORDS_STORE)) db.createObjectStore(INDEXEDDB_RECORDS_STORE, { keyPath: "id" });
+            ensureIndexedDbStores(e.target.result as IDBDatabase);
         };
         req.onsuccess = (e: any) => {
             const db = e.target.result as IDBDatabase;
@@ -661,9 +774,7 @@ export async function loadDeletedResourceIdsFromIndexedDB(): Promise<string[]> {
     return new Promise((resolve) => {
         const req = indexedDB.open(INDEXEDDB_NAME, INDEXEDDB_VERSION);
         req.onupgradeneeded = (e: any) => {
-            const db = e.target.result as IDBDatabase;
-            if (!db.objectStoreNames.contains(INDEXEDDB_STORE)) db.createObjectStore(INDEXEDDB_STORE);
-            if (!db.objectStoreNames.contains(INDEXEDDB_RECORDS_STORE)) db.createObjectStore(INDEXEDDB_RECORDS_STORE, { keyPath: "id" });
+            ensureIndexedDbStores(e.target.result as IDBDatabase);
         };
         req.onsuccess = (e: any) => {
             const db = e.target.result as IDBDatabase;
@@ -694,9 +805,7 @@ export async function loadRecordsMetaFromIndexedDB(): Promise<RecordsCacheMeta |
     return new Promise((resolve) => {
         const req = indexedDB.open(INDEXEDDB_NAME, INDEXEDDB_VERSION);
         req.onupgradeneeded = (e: any) => {
-            const db = e.target.result as IDBDatabase;
-            if (!db.objectStoreNames.contains(INDEXEDDB_STORE)) db.createObjectStore(INDEXEDDB_STORE);
-            if (!db.objectStoreNames.contains(INDEXEDDB_RECORDS_STORE)) db.createObjectStore(INDEXEDDB_RECORDS_STORE, { keyPath: "id" });
+            ensureIndexedDbStores(e.target.result as IDBDatabase);
         };
         req.onsuccess = (e: any) => {
             const db = e.target.result as IDBDatabase;
@@ -730,9 +839,7 @@ async function clearStarterResourceCacheOnce(currentMeta: RecordsCacheMeta | nul
     return new Promise((resolve) => {
         const req = indexedDB.open(INDEXEDDB_NAME, INDEXEDDB_VERSION);
         req.onupgradeneeded = (e: any) => {
-            const db = e.target.result as IDBDatabase;
-            if (!db.objectStoreNames.contains(INDEXEDDB_STORE)) db.createObjectStore(INDEXEDDB_STORE);
-            if (!db.objectStoreNames.contains(INDEXEDDB_RECORDS_STORE)) db.createObjectStore(INDEXEDDB_RECORDS_STORE, { keyPath: "id" });
+            ensureIndexedDbStores(e.target.result as IDBDatabase);
         };
         req.onsuccess = (e: any) => {
             const db = e.target.result as IDBDatabase;
@@ -785,9 +892,7 @@ export async function replaceRecordsInIndexedDB(
     return new Promise((resolve, reject) => {
         const req = indexedDB.open(INDEXEDDB_NAME, INDEXEDDB_VERSION);
         req.onupgradeneeded = (e: any) => {
-            const db = e.target.result as IDBDatabase;
-            if (!db.objectStoreNames.contains(INDEXEDDB_STORE)) db.createObjectStore(INDEXEDDB_STORE);
-            if (!db.objectStoreNames.contains(INDEXEDDB_RECORDS_STORE)) db.createObjectStore(INDEXEDDB_RECORDS_STORE, { keyPath: "id" });
+            ensureIndexedDbStores(e.target.result as IDBDatabase);
         };
         req.onsuccess = (e: any) => {
             const db = e.target.result as IDBDatabase;
@@ -836,9 +941,7 @@ export async function saveResourceOverlayToIndexedDB(
     return new Promise((resolve, reject) => {
         const req = indexedDB.open(INDEXEDDB_NAME, INDEXEDDB_VERSION);
         req.onupgradeneeded = (e: any) => {
-            const db = e.target.result as IDBDatabase;
-            if (!db.objectStoreNames.contains(INDEXEDDB_STORE)) db.createObjectStore(INDEXEDDB_STORE);
-            if (!db.objectStoreNames.contains(INDEXEDDB_RECORDS_STORE)) db.createObjectStore(INDEXEDDB_RECORDS_STORE, { keyPath: "id" });
+            ensureIndexedDbStores(e.target.result as IDBDatabase);
         };
         req.onsuccess = (e: any) => {
             const db = e.target.result as IDBDatabase;
@@ -891,9 +994,7 @@ export async function saveResourceDeleteOverlayToIndexedDB(
     return new Promise((resolve, reject) => {
         const req = indexedDB.open(INDEXEDDB_NAME, INDEXEDDB_VERSION);
         req.onupgradeneeded = (e: any) => {
-            const db = e.target.result as IDBDatabase;
-            if (!db.objectStoreNames.contains(INDEXEDDB_STORE)) db.createObjectStore(INDEXEDDB_STORE);
-            if (!db.objectStoreNames.contains(INDEXEDDB_RECORDS_STORE)) db.createObjectStore(INDEXEDDB_RECORDS_STORE, { keyPath: "id" });
+            ensureIndexedDbStores(e.target.result as IDBDatabase);
         };
         req.onsuccess = (e: any) => {
             const db = e.target.result as IDBDatabase;
@@ -942,9 +1043,7 @@ export async function clearLegacySnapshot(): Promise<void> {
     return new Promise((resolve, reject) => {
         const req = indexedDB.open(INDEXEDDB_NAME, INDEXEDDB_VERSION);
         req.onupgradeneeded = (e: any) => {
-            const db = e.target.result as IDBDatabase;
-            if (!db.objectStoreNames.contains(INDEXEDDB_STORE)) db.createObjectStore(INDEXEDDB_STORE);
-            if (!db.objectStoreNames.contains(INDEXEDDB_RECORDS_STORE)) db.createObjectStore(INDEXEDDB_RECORDS_STORE, { keyPath: "id" });
+            ensureIndexedDbStores(e.target.result as IDBDatabase);
         };
         req.onsuccess = (e: any) => {
             const db = e.target.result as IDBDatabase;
