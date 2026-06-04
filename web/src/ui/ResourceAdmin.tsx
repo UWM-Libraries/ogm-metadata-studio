@@ -7,7 +7,7 @@ import { textToLngLatBounds, type LngLatBoundsTuple } from './viewers/maplibreBo
 
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 
-const MAP_STYLE = "https://demotiles.maplibre.org/style.json";
+const MAP_STYLE = "https://tiles.openfreemap.org/styles/bright";
 
 const AdminStaticMap: React.FC<{ bounds: LngLatBoundsTuple }> = ({ bounds }) => {
     const containerRef = useRef<HTMLDivElement>(null);

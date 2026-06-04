@@ -4,7 +4,7 @@ import 'maplibre-gl/dist/maplibre-gl.css';
 import { Resource } from '../aardvark/model';
 import { textToLngLatBounds } from './viewers/maplibreBounds';
 
-const MAP_STYLE = "https://demotiles.maplibre.org/style.json";
+const MAP_STYLE = "https://tiles.openfreemap.org/styles/bright";
 
 interface ResultsMapViewProps {
     resources: Resource[];

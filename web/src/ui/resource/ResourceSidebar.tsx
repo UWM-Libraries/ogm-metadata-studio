@@ -8,7 +8,7 @@ import { displayThumbnailUrl } from '../../services/thumbnailUrl';
 import { ResourceThumbnail } from '../shared/ResourceThumbnail';
 import { useThumbnailQueue } from '../../hooks/useThumbnailQueue';
 
-const MAP_STYLE = "https://demotiles.maplibre.org/style.json";
+const MAP_STYLE = "https://tiles.openfreemap.org/styles/bright";
 
 interface ResourceSidebarProps {
     resource: Resource;
