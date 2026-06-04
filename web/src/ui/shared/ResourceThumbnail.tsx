@@ -19,18 +19,29 @@ export const ResourceThumbnail: React.FC<ResourceThumbnailProps> = ({
     title,
 }) => {
     const [failedSrc, setFailedSrc] = useState<string | null>(null);
+    const [retryToken, setRetryToken] = useState(0);
 
     useEffect(() => {
         setFailedSrc(null);
+        setRetryToken(0);
     }, [src]);
 
     if (src && src !== failedSrc) {
         return (
             <img
+                key={`${src}:${retryToken}`}
                 src={src}
                 alt={alt}
                 className={className}
-                onError={() => setFailedSrc(src)}
+                loading="eager"
+                decoding="async"
+                onError={() => {
+                    if (retryToken < 2) {
+                        window.setTimeout(() => setRetryToken((current) => current + 1), 150 * (retryToken + 1));
+                        return;
+                    }
+                    setFailedSrc(src);
+                }}
                 referrerPolicy="no-referrer"
                 title={title}
             />

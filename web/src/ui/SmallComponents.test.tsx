@@ -5,6 +5,7 @@ import { ActiveFilterBar } from './ActiveFilterBar';
 import { AutosuggestInput } from './AutosuggestInput';
 import { TagInput } from './TagInput';
 import { Link } from './Link';
+import { ResourceThumbnail } from './shared/ResourceThumbnail';
 import * as duckdb from '../duckdb/duckdbClient';
 
 // Mock dependencies
@@ -168,6 +169,41 @@ describe('Small UI Components', () => {
             fireEvent.click(link, { metaKey: true });
 
             expect(pushStateSpy).not.toHaveBeenCalled();
+        });
+    });
+
+    describe('ResourceThumbnail', () => {
+        beforeEach(() => {
+            vi.useFakeTimers();
+        });
+
+        afterEach(() => {
+            vi.useRealTimers();
+        });
+
+        it('retries a failing thumbnail before showing the fallback', () => {
+            const resource = {
+                id: 'resource-1',
+                dct_title_s: 'Retry Resource',
+                gbl_resourceClass_sm: ['Datasets'],
+            };
+
+            const { container } = render(<ResourceThumbnail resource={resource as any} src="https://example.com/thumb.jpg" />);
+
+            fireEvent.error(container.querySelector('img')!);
+            expect(screen.queryByTitle('No thumbnail for Retry Resource')).not.toBeInTheDocument();
+
+            React.act(() => {
+                vi.advanceTimersByTime(150);
+            });
+            fireEvent.error(container.querySelector('img')!);
+
+            React.act(() => {
+                vi.advanceTimersByTime(300);
+            });
+            fireEvent.error(container.querySelector('img')!);
+
+            expect(screen.getByTitle('No thumbnail for Retry Resource')).toBeInTheDocument();
         });
     });
 });

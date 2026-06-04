@@ -1,5 +1,7 @@
 import { Resource } from "../aardvark/model";
 
+const DEFAULT_ENRICHMENT_PROXY_URL = "http://localhost:8787";
+
 const THUMBNAIL_REFERENCE_KEYS = new Set([
     "http://schema.org/thumbnailUrl",
     "https://schema.org/thumbnailUrl",
@@ -29,12 +31,24 @@ function referenceUrlValue(value: unknown): string | null {
     return typeof url === "string" && url.trim() ? url : null;
 }
 
-function isGeneratedStudioThumbnailUrl(url: string | null): boolean {
+export function isGeneratedStudioThumbnailUrl(url: string | null): boolean {
     if (!url) return false;
     try {
         return /\/uploads\/[^/]+\/thumbnail\/thumbnail\.(?:jpe?g|png|webp)$/i.test(new URL(url, "http://localhost/").pathname);
     } catch {
         return false;
+    }
+}
+
+export function proxiedStudioThumbnailUrl(url: string | null): string | null {
+    if (!url || !isGeneratedStudioThumbnailUrl(url)) return null;
+    try {
+        const proxyBase = String(import.meta.env.VITE_ENRICHMENT_PROXY_URL || DEFAULT_ENRICHMENT_PROXY_URL).replace(/\/+$/, "");
+        const endpoint = new URL("/api/artifacts/proxy", proxyBase);
+        endpoint.searchParams.set("url", new URL(url).toString());
+        return endpoint.toString();
+    } catch {
+        return null;
     }
 }
 
@@ -92,7 +106,7 @@ export function displayThumbnailUrl(resource: Resource, thumbnails: Record<strin
     if (resource.thumbnail?.startsWith("blob:")) return resource.thumbnail;
 
     const explicit = explicitThumbnailUrl(resource);
-    if (explicit && !isGeneratedStudioThumbnailUrl(explicit)) return explicit;
+    if (explicit) return proxiedStudioThumbnailUrl(explicit) || explicit;
 
-    return explicit || inferredUploadedThumbnailUrl(resource);
+    return proxiedStudioThumbnailUrl(inferredUploadedThumbnailUrl(resource));
 }

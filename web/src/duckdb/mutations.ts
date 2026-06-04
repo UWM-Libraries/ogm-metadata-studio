@@ -1,4 +1,4 @@
-import { getDuckDbContext, saveResourceDeleteOverlayToIndexedDB, saveResourceOverlayToIndexedDB } from "./dbInit";
+import { getDuckDbContext, saveResourceDeleteOverlayToIndexedDB, saveResourceOverlayToIndexedDB, saveThumbnailToIndexedDB } from "./dbInit";
 import { Resource, Distribution, SCALAR_FIELDS, REPEATABLE_STRING_FIELDS, resourceToJson } from "../aardvark/model";
 import { buildDctReferencesS } from "../aardvark/mapping";
 import { fetchResourcesByIds } from "./queries";
@@ -57,12 +57,24 @@ export async function upsertThumbnail(id: string, data: Blob): Promise<void> {
     }
     const base64 = btoa(binary);
     const now = Date.now();
+    const safeId = id.replace(/'/g, "''");
 
     try {
-        await conn.query(`DELETE FROM resources_image_service WHERE id = '${id}'`);
-        await conn.query(`INSERT INTO resources_image_service (id, data, last_updated) VALUES ('${id}', '${base64}', ${now})`);
+        await conn.query(`DELETE FROM resources_image_service WHERE id = '${safeId}'`);
+        await conn.query(`INSERT INTO resources_image_service (id, data, last_updated) VALUES ('${safeId}', '${base64}', ${now})`);
     } catch (e) {
         console.warn("Failed to cache thumbnail", e);
+    }
+
+    try {
+        await saveThumbnailToIndexedDB({
+            id,
+            data: base64,
+            last_updated: now,
+            mime_type: data.type || undefined,
+        });
+    } catch (e) {
+        console.warn("Failed to persist thumbnail cache", e);
     }
 }
 
