@@ -37,10 +37,31 @@ export function envelopeToBounds(envelope: string | undefined): LngLatBoundsTupl
     return validBoundsOrNull([[west, south], [east, north]]);
 }
 
+export function wktToBounds(wkt: string | undefined): LngLatBoundsTuple | null {
+    if (!wkt || !/^(?:MULTI)?POLYGON\s*\(/i.test(wkt.trim())) return null;
+    const numbers = wkt.match(/[-+]?\d*\.?\d+(?:e[-+]?\d+)?/gi)?.map(Number) ?? [];
+    if (numbers.length < 4 || numbers.length % 2 !== 0) return null;
+    const coordinates: [number, number][] = [];
+    for (let index = 0; index + 1 < numbers.length; index += 2) {
+        coordinates.push([numbers[index], numbers[index + 1]]);
+    }
+    let minX = coordinates[0][0];
+    let minY = coordinates[0][1];
+    let maxX = minX;
+    let maxY = minY;
+    for (const [x, y] of coordinates) {
+        minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+        minY = Math.min(minY, y); maxY = Math.max(maxY, y);
+    }
+    return validBoundsOrNull([[minX, minY], [maxX, maxY]]);
+}
+
 export function textToLngLatBounds(value: string | undefined): LngLatBoundsTuple | null {
     if (!value) return null;
     const envelope = envelopeToBounds(value);
     if (envelope) return envelope;
+    const wkt = wktToBounds(value);
+    if (wkt) return wkt;
     const parts = value.split(',').map((part) => Number.parseFloat(part.trim()));
     if (parts.length !== 4 || !parts.every(isFiniteNumber)) return null;
     const [west, south, east, north] = parts;
@@ -139,5 +160,5 @@ export function geoJsonToBounds(geojson: unknown): LngLatBoundsTuple | null {
 const DEFAULT_BOUNDS: LngLatBoundsTuple = [[-100, -30], [100, 30]];
 
 export function getBoundsFromGeometry(geometry: string | undefined): LngLatBoundsTuple {
-    return geoJsonToBounds(geometry) ?? DEFAULT_BOUNDS;
+    return geoJsonToBounds(geometry) ?? wktToBounds(geometry) ?? envelopeToBounds(geometry) ?? DEFAULT_BOUNDS;
 }

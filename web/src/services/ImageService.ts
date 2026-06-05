@@ -765,6 +765,9 @@ export class ImageService {
             ]);
         }
 
+        const wkt = this.bboxFromWkt(text);
+        if (wkt) return wkt;
+
         const parts = text.split(",").map(part => Number(part.trim()));
         if (parts.length === 4) return this.normalizePreviewBBox(parts);
 
@@ -774,6 +777,24 @@ export class ImageService {
         } catch {
             return null;
         }
+    }
+
+    private bboxFromWkt(value: string): PreviewBBox | null {
+        if (!/^(?:MULTI)?POLYGON\s*\(/i.test(value.trim())) return null;
+        const numbers = value.match(/[-+]?\d*\.?\d+(?:e[-+]?\d+)?/gi)?.map(Number) ?? [];
+        if (numbers.length < 4 || numbers.length % 2 !== 0) return null;
+        const xs: number[] = [];
+        const ys: number[] = [];
+        for (let index = 0; index + 1 < numbers.length; index += 2) {
+            xs.push(numbers[index]);
+            ys.push(numbers[index + 1]);
+        }
+        return this.normalizePreviewBBox([
+            Math.min(...xs),
+            Math.min(...ys),
+            Math.max(...xs),
+            Math.max(...ys),
+        ]);
     }
 
     private bboxFromGeoJson(value: any): PreviewBBox | null {

@@ -1,42 +1,29 @@
-import React, { useEffect, useLayoutEffect, useMemo, useRef } from 'react';
+import React, { useLayoutEffect, useMemo, useRef } from 'react';
 import maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
-import { Resource } from '../../aardvark/model';
+import { Distribution, Resource } from '../../aardvark/model';
 import { CopyButton } from './CopyButton';
 import { textToLngLatBounds, type LngLatBoundsTuple } from '../viewers/maplibreBounds';
-import { displayThumbnailUrl } from '../../services/thumbnailUrl';
-import { ResourceThumbnail } from '../shared/ResourceThumbnail';
-import { useThumbnailQueue } from '../../hooks/useThumbnailQueue';
+import {
+    displayUrl,
+    downloadableDistributions,
+    distributionsFromReferences,
+    relationLabel,
+    shortRelationKey,
+    uniqueSortedDistributions,
+} from './distributionLinks';
 
 const MAP_STYLE = "https://tiles.openfreemap.org/styles/bright";
+const EMPTY_DISTRIBUTIONS: Distribution[] = [];
 
 interface ResourceSidebarProps {
     resource: Resource;
+    distributions?: Distribution[];
 }
 
-function referenceUrlValue(value: unknown): string | null {
-    if (typeof value === "string" && value.trim()) return value;
-    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-    const url = (value as { url?: unknown }).url;
-    return typeof url === "string" && url.trim() ? url : null;
-}
-
-function firstReferenceUrl(refs: Record<string, unknown>, keys: string[]): string | null {
-    for (const key of keys) {
-        const value = refs[key];
-        const values = Array.isArray(value) ? value : [value];
-        for (const item of values) {
-            const url = referenceUrlValue(item);
-            if (url) return url;
-        }
-    }
-    return null;
-}
-
-export const ResourceSidebar: React.FC<ResourceSidebarProps> = ({ resource }) => {
+export const ResourceSidebar: React.FC<ResourceSidebarProps> = ({ resource, distributions = EMPTY_DISTRIBUTIONS }) => {
     const containerRef = useRef<HTMLDivElement>(null);
     const mapRef = useRef<maplibregl.Map | null>(null);
-    const { thumbnails, register } = useThumbnailQueue();
 
     // Parse Bounds for Mini Map (lat,lng for display; MapLibre uses [lng, lat])
     const bounds = useMemo<LngLatBoundsTuple | null>(() => textToLngLatBounds(resource.dcat_bbox || undefined), [resource.dcat_bbox]);
@@ -91,26 +78,11 @@ export const ResourceSidebar: React.FC<ResourceSidebarProps> = ({ resource }) =>
         };
     }, [bounds]);
 
-    const references = useMemo<Record<string, unknown>>(() => {
-        if (!resource.dct_references_s) return {};
-        try {
-            const refs = JSON.parse(resource.dct_references_s);
-            return refs && typeof refs === "object" && !Array.isArray(refs) ? refs : {};
-        } catch { return {}; }
-    }, [resource.dct_references_s]);
+    const resourceDistributions = useMemo(() => {
+        return uniqueSortedDistributions([...distributions, ...distributionsFromReferences(resource)]);
+    }, [distributions, resource]);
 
-    useEffect(() => {
-        register(resource.id, resource);
-    }, [register, resource]);
-
-    const thumbnailUrl = useMemo(() => displayThumbnailUrl(resource, thumbnails), [resource, thumbnails]);
-
-    const downloadLink = useMemo(() => firstReferenceUrl(references, [
-        "http://schema.org/downloadUrl",
-        "https://schema.org/downloadUrl",
-        "http://schema.org/url",
-        "https://schema.org/url",
-    ]), [references]);
+    const downloadItems = useMemo(() => downloadableDistributions(resourceDistributions), [resourceDistributions]);
 
     const citationText = useMemo(() => {
         const parts = [];
@@ -124,20 +96,6 @@ export const ResourceSidebar: React.FC<ResourceSidebarProps> = ({ resource }) =>
 
     return (
         <div className="w-full lg:w-96 p-6 flex flex-col gap-6 bg-gray-50 dark:bg-slate-900/50">
-            {thumbnailUrl && (
-                <div className="bg-white dark:bg-slate-800 rounded-lg shadow-sm border border-gray-200 dark:border-slate-700 overflow-hidden">
-                    <div className="p-3 border-b border-gray-200 dark:border-slate-700 font-semibold text-sm">Thumbnail</div>
-                    <a href={thumbnailUrl} target="_blank" rel="noopener noreferrer" className="flex h-80 items-center justify-center bg-slate-100 dark:bg-slate-950">
-                        <ResourceThumbnail
-                            resource={resource}
-                            src={thumbnailUrl}
-                            alt={`Thumbnail for ${resource.dct_title_s}`}
-                            className="max-h-full w-full object-contain"
-                        />
-                    </a>
-                </div>
-            )}
-
             <div className="bg-white dark:bg-slate-800 rounded-lg shadow-sm border border-gray-200 dark:border-slate-700 overflow-hidden">
                 <div className="p-3 border-b border-gray-200 dark:border-slate-700 font-semibold text-sm">Location</div>
                 <div className="h-64 relative z-0">
@@ -150,17 +108,49 @@ export const ResourceSidebar: React.FC<ResourceSidebarProps> = ({ resource }) =>
             </div>
 
             <div className="bg-white dark:bg-slate-800 rounded-lg shadow-sm border border-gray-200 dark:border-slate-700">
-                <div className="p-3 border-b border-gray-200 dark:border-slate-700 font-semibold text-sm">Downloads</div>
+                <div className="flex items-center justify-between border-b border-gray-200 p-3 text-sm font-semibold dark:border-slate-700">
+                    <span>Downloads</span>
+                    {downloadItems.length > 0 && (
+                        <span className="text-xs font-medium text-slate-500 dark:text-slate-400">
+                            {downloadItems.length} file{downloadItems.length === 1 ? "" : "s"}
+                        </span>
+                    )}
+                </div>
                 <div className="p-4">
-                    {downloadLink ? (
-                        <a
-                            href={downloadLink}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="block w-full text-center bg-indigo-600 hover:bg-indigo-700 text-white rounded py-2 text-sm font-medium transition-colors"
-                        >
-                            Download Resource
-                        </a>
+                    {downloadItems.length > 0 ? (
+                        <ul className="divide-y divide-gray-100 dark:divide-slate-700">
+                            {downloadItems.map((distribution) => {
+                                const label = relationLabel(distribution);
+                                const actionLabel = label.toLowerCase() === "download" ? "Download resource" : `Download ${label}`;
+                                return (
+                                    <li key={`${distribution.relation_key}-${distribution.url}`} className="py-3 first:pt-0 last:pb-0">
+                                        <div className="flex items-start gap-3">
+                                            <div className="min-w-0 flex-1">
+                                                <div className="text-sm font-semibold text-slate-900 dark:text-slate-100">{label}</div>
+                                                <code className="mt-1 inline-block max-w-full truncate rounded bg-gray-100 px-1.5 py-0.5 text-xs text-slate-700 dark:bg-slate-900 dark:text-slate-300">
+                                                    {shortRelationKey(distribution.relation_key)}
+                                                </code>
+                                                <div
+                                                    className="mt-1 truncate text-xs text-slate-500 dark:text-slate-400"
+                                                    title={distribution.url}
+                                                >
+                                                    {displayUrl(distribution.url)}
+                                                </div>
+                                            </div>
+                                            <a
+                                                href={distribution.url}
+                                                target="_blank"
+                                                rel="noopener noreferrer"
+                                                aria-label={actionLabel}
+                                                className="shrink-0 rounded border border-gray-200 px-2.5 py-1.5 text-xs font-medium text-slate-700 transition-colors hover:bg-gray-50 dark:border-slate-600 dark:text-slate-200 dark:hover:bg-slate-700"
+                                            >
+                                                Download
+                                            </a>
+                                        </div>
+                                    </li>
+                                );
+                            })}
+                        </ul>
                     ) : (
                         <span className="text-sm text-slate-500">No direct download available.</span>
                     )}

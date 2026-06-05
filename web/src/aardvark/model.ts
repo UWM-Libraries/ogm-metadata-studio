@@ -46,6 +46,7 @@ export interface Resource {
   // Administrative
   dct_identifier_sm: string[];
   gbl_wxsIdentifier_s?: string | null;
+  gbl_mdModified_dt?: string | null;
   dct_rights_sm: string[];
   dct_rightsHolder_sm: string[];
   dct_license_sm: string[];
@@ -166,6 +167,128 @@ export const CSV_HEADER_MAPPING: Record<string, string> = {
   "Identifier": "dct_identifier_sm",
   "Suppressed": "gbl_suppressed_b"
 };
+
+function normalizedDateRangeValues(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return Array.from(new Set(value.map((item) => String(item || "").trim()).filter(Boolean)));
+  }
+  const text = String(value ?? "").trim();
+  return text ? [text] : [];
+}
+
+function validLatLng(lat: number, lng: number): boolean {
+  return Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180;
+}
+
+function compactCoordinate(value: number): string {
+  if (!Number.isFinite(value)) return "";
+  const rounded = Math.abs(value) < 1e-12 ? 0 : Number(value.toFixed(12));
+  return String(rounded);
+}
+
+function centroidFromPair(first: unknown, second: unknown): [number, number] | null {
+  const a = Number(first);
+  const b = Number(second);
+  if (validLatLng(a, b)) return [a, b];
+  if (validLatLng(b, a)) return [b, a];
+  return null;
+}
+
+export function parseAardvarkCentroid(value: unknown): [number, number] | null {
+  if (value == null) return null;
+
+  if (Array.isArray(value) && value.length >= 2) {
+    return centroidFromPair(value[0], value[1]);
+  }
+
+  if (typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    if (obj.type === "Point" && Array.isArray(obj.coordinates) && obj.coordinates.length >= 2) {
+      const lon = Number(obj.coordinates[0]);
+      const lat = Number(obj.coordinates[1]);
+      return validLatLng(lat, lon) ? [lat, lon] : null;
+    }
+    const lat = obj.lat ?? obj.latitude;
+    const lng = obj.lng ?? obj.lon ?? obj.longitude;
+    if (lat !== undefined && lng !== undefined) return centroidFromPair(lat, lng);
+  }
+
+  const text = String(value).trim();
+  if (!text) return null;
+
+  try {
+    const parsed = JSON.parse(text);
+    const centroid = parseAardvarkCentroid(parsed);
+    if (centroid) return centroid;
+  } catch {
+    // Not JSON; try the comma-separated Aardvark scalar below.
+  }
+
+  const commaPair = text.match(/^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$/);
+  if (!commaPair) return null;
+  return centroidFromPair(commaPair[1], commaPair[2]);
+}
+
+export function normalizeAardvarkCentroid(value: unknown): string | null {
+  const centroid = parseAardvarkCentroid(value);
+  if (!centroid) return null;
+  const [lat, lng] = centroid;
+  return `${compactCoordinate(lat)},${compactCoordinate(lng)}`;
+}
+
+function wktRingFromCoordinates(ring: unknown): string | null {
+  if (!Array.isArray(ring) || ring.length < 4) return null;
+  const points: string[] = [];
+  for (const point of ring) {
+    if (!Array.isArray(point) || point.length < 2) return null;
+    const lon = Number(point[0]);
+    const lat = Number(point[1]);
+    if (!Number.isFinite(lon) || !Number.isFinite(lat)) return null;
+    points.push(`${compactCoordinate(lon)} ${compactCoordinate(lat)}`);
+  }
+  return points.join(", ");
+}
+
+function geoJsonPolygonToWkt(coordinates: unknown): string | null {
+  if (!Array.isArray(coordinates) || coordinates.length === 0) return null;
+  const rings = coordinates
+    .map(wktRingFromCoordinates)
+    .filter((ring): ring is string => Boolean(ring));
+  if (rings.length === 0) return null;
+  return `POLYGON(${rings.map((ring) => `(${ring})`).join(", ")})`;
+}
+
+function geoJsonMultiPolygonToWkt(coordinates: unknown): string | null {
+  if (!Array.isArray(coordinates) || coordinates.length === 0) return null;
+  const polygons = coordinates
+    .map((polygon) => {
+      if (!Array.isArray(polygon)) return null;
+      const rings = polygon
+        .map(wktRingFromCoordinates)
+        .filter((ring): ring is string => Boolean(ring));
+      return rings.length ? `(${rings.map((ring) => `(${ring})`).join(", ")})` : null;
+    })
+    .filter((polygon): polygon is string => Boolean(polygon));
+  if (polygons.length === 0) return null;
+  return `MULTIPOLYGON(${polygons.join(", ")})`;
+}
+
+export function normalizeAardvarkGeometry(value: unknown): string | null {
+  if (value == null) return null;
+  const text = String(value).trim();
+  if (!text) return null;
+  if (/^(POLYGON|MULTIPOLYGON|ENVELOPE)\s*\(/i.test(text)) return text;
+
+  try {
+    const obj = JSON.parse(text);
+    if (obj?.type === "Polygon") return geoJsonPolygonToWkt(obj.coordinates) ?? text;
+    if (obj?.type === "MultiPolygon") return geoJsonMultiPolygonToWkt(obj.coordinates) ?? text;
+  } catch {
+    // Keep non-JSON geometry unchanged.
+  }
+
+  return text;
+}
 
 // OGM Reference URI Mappping for Export
 // Source: https://opengeometadata.org/reference-uris/
@@ -309,16 +432,18 @@ function extractTemporalFields(raw: AardvarkJson) {
     dct_temporal_sm: (raw["dct_temporal_sm"] as string[] | undefined) ?? [],
     dct_issued_s: (raw["dct_issued_s"] as string | undefined) ?? null,
     gbl_indexYear_im: (raw["gbl_indexYear_im"] as number | undefined) ?? null,
-    gbl_dateRange_drsim: (raw["gbl_dateRange_drsim"] as string[] | undefined) ?? [],
+    gbl_dateRange_drsim: normalizedDateRangeValues(raw["gbl_dateRange_drsim"]),
   };
 }
 
 function extractSpatialFields(raw: AardvarkJson) {
+  const normalizedCentroid = normalizeAardvarkCentroid(raw["dcat_centroid"]);
+  const normalizedGeometry = normalizeAardvarkGeometry(raw["locn_geometry"]);
   return {
     dct_spatial_sm: (raw["dct_spatial_sm"] as string[] | undefined) ?? [],
     dcat_bbox: (raw["dcat_bbox"] as string | undefined) ?? null,
-    locn_geometry: (raw["locn_geometry"] as string | undefined) ?? null,
-    dcat_centroid: (raw["dcat_centroid"] as string | undefined) ?? null,
+    locn_geometry: normalizedGeometry ?? ((raw["locn_geometry"] as string | undefined) ?? null),
+    dcat_centroid: normalizedCentroid ?? ((raw["dcat_centroid"] as string | undefined) ?? null),
     gbl_georeferenced_b: (raw["gbl_georeferenced_b"] as boolean | undefined) ?? null,
   };
 }
@@ -327,6 +452,7 @@ function extractAdminFields(raw: AardvarkJson) {
   return {
     dct_identifier_sm: (raw["dct_identifier_sm"] as string[] | undefined) ?? [],
     gbl_wxsIdentifier_s: (raw["gbl_wxsIdentifier_s"] as string | undefined) ?? null,
+    gbl_mdModified_dt: (raw["gbl_mdModified_dt"] as string | undefined) ?? null,
     dct_rights_sm: (raw["dct_rights_sm"] as string[] | undefined) ?? [],
     dct_rightsHolder_sm: (raw["dct_rightsHolder_sm"] as string[] | undefined) ?? [],
     dct_license_sm: (raw["dct_license_sm"] as string[] | undefined) ?? [],
@@ -380,7 +506,6 @@ export function resourceToJson(resource: Resource): AardvarkJson {
 
     // Temporal
     dct_temporal_sm: resource.dct_temporal_sm,
-    gbl_dateRange_drsim: resource.gbl_dateRange_drsim,
 
     // Spatial
     dct_spatial_sm: resource.dct_spatial_sm,
@@ -407,13 +532,15 @@ export function resourceToJson(resource: Resource): AardvarkJson {
   if (resource.dct_issued_s) base["dct_issued_s"] = resource.dct_issued_s;
   if (resource.gbl_indexYear_im !== null && resource.gbl_indexYear_im !== undefined) base["gbl_indexYear_im"] = resource.gbl_indexYear_im;
   if (resource.dcat_bbox) base["dcat_bbox"] = resource.dcat_bbox;
-  if (resource.locn_geometry) base["locn_geometry"] = resource.locn_geometry;
-  if (resource.dcat_centroid) base["dcat_centroid"] = resource.dcat_centroid;
+  if (resource.locn_geometry) base["locn_geometry"] = normalizeAardvarkGeometry(resource.locn_geometry) ?? resource.locn_geometry;
+  if (resource.dcat_centroid) base["dcat_centroid"] = normalizeAardvarkCentroid(resource.dcat_centroid) ?? resource.dcat_centroid;
   if (resource.gbl_georeferenced_b !== null && resource.gbl_georeferenced_b !== undefined) base["gbl_georeferenced_b"] = resource.gbl_georeferenced_b;
   if (resource.gbl_wxsIdentifier_s) base["gbl_wxsIdentifier_s"] = resource.gbl_wxsIdentifier_s;
+  if (resource.gbl_mdModified_dt) base["gbl_mdModified_dt"] = resource.gbl_mdModified_dt;
   if (resource.gbl_suppressed_b !== null && resource.gbl_suppressed_b !== undefined) base["gbl_suppressed_b"] = resource.gbl_suppressed_b;
   if (resource.gbl_fileSize_s) base["gbl_fileSize_s"] = resource.gbl_fileSize_s;
   if (resource.dct_references_s) base["dct_references_s"] = resource.dct_references_s;
+  if (resource.gbl_dateRange_drsim?.length) base["gbl_dateRange_drsim"] = resource.gbl_dateRange_drsim[0];
 
 
   for (const [k, v] of Object.entries(resource.extra)) {

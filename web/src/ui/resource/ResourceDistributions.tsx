@@ -1,97 +1,20 @@
 import React, { useMemo } from 'react';
 import { Distribution } from '../../aardvark/model';
+import {
+    displayUrl,
+    isDownloadableDistribution,
+    relationLabel,
+    shortRelationKey,
+    uniqueSortedDistributions,
+} from './distributionLinks';
 
 interface ResourceDistributionsProps {
     distributions: Distribution[];
 }
 
-const RELATION_LABELS: Record<string, string> = {
-    "http://schema.org/url": "Original image",
-    "https://schema.org/url": "Original image",
-    "http://schema.org/downloadUrl": "Download",
-    "https://schema.org/downloadUrl": "Download",
-    "http://schema.org/thumbnailUrl": "Thumbnail",
-    "https://schema.org/thumbnailUrl": "Thumbnail",
-    "http://iiif.io/api/image": "IIIF Image API",
-    "https://iiif.io/api/image": "IIIF Image API",
-    "http://iiif.io/api/presentation#manifest": "IIIF Manifest",
-    "https://iiif.io/api/presentation#manifest": "IIIF Manifest",
-    "https://opengeometadata.org/reference/enrichment-response": "Enrichment response",
-    "https://opengeometadata.org/reference/ai-enrichments": "AI Enrichments JSON",
-    "https://opengeometadata.org/reference/dataset-manifest": "Dataset manifest",
-    "https://opengeometadata.org/reference/archival-accession-supplement": "Archival accession supplement",
-    "https://opengeometadata.org/reference/archival-accession-supplement-json": "Archival accession supplement JSON",
-    "https://opengeometadata.org/reference/aardvark-json": "Aardvark JSON",
-    "https://www.cogeo.org/": "Cloud Optimized GeoTIFF",
-    "http://www.isotc211.org/schemas/2005/gmd/": "ISO metadata",
-    "http://www.opengis.net/cat/csw/csdgm": "FGDC metadata",
-    "geojson": "GeoJSON",
-    "pmtiles": "PMTiles",
-};
-
-function relationLabel(distribution: Distribution): string {
-    if (distribution.label?.trim()) return distribution.label.trim();
-    const key = distribution.relation_key;
-    if (RELATION_LABELS[key]) return RELATION_LABELS[key];
-    const lower = key.toLowerCase();
-    if (lower.includes("thumbnail")) return "Thumbnail";
-    if (lower.includes("iiif")) return "IIIF";
-    if (lower.includes("geojson")) return "GeoJSON";
-    if (lower.includes("pmtiles")) return "PMTiles";
-    if (lower.includes("cogeo")) return "Cloud Optimized GeoTIFF";
-    if (lower.includes("dataset-manifest")) return "Dataset manifest";
-    if (lower.includes("ai-enrichments")) return "AI Enrichments JSON";
-    if (lower.includes("archival-accession")) return "Archival accession supplement";
-    if (lower.includes("enrichment")) return "Enrichment response";
-    if (lower.includes("aardvark")) return "Aardvark JSON";
-    if (lower.includes("download")) return "Download";
-    return "Related link";
-}
-
-function shortRelationKey(key: string): string {
-    return key
-        .replace(/^https?:\/\/schema\.org\//, "schema.org/")
-        .replace(/^https?:\/\/iiif\.io\/api\//, "iiif.io/api/")
-        .replace(/^https?:\/\/opengeometadata\.org\/reference\//, "ogm/")
-        .replace(/^http:\/\/www\.isotc211\.org\/schemas\/2005\/gmd\/$/, "iso19139")
-        .replace(/^http:\/\/www\.opengis\.net\/cat\/csw\/csdgm$/, "fgdc");
-}
-
-function displayUrl(url: string): string {
-    try {
-        const parsed = new URL(url);
-        return `${parsed.hostname}${parsed.pathname}`;
-    } catch {
-        return url;
-    }
-}
-
-function distributionSortScore(distribution: Distribution): number {
-    const key = distribution.relation_key.toLowerCase();
-    const label = relationLabel(distribution).toLowerCase();
-    if (label.includes("original") || key.endsWith("/url")) return 10;
-    if (label.includes("thumbnail") || key.includes("thumbnail")) return 20;
-    if (label.includes("iiif") || key.includes("iiif")) return 30;
-    if (label.includes("cloud optimized geotiff") || key.includes("cogeo")) return 35;
-    if (label.includes("enrichment") || key.includes("enrichment")) return 40;
-    if (label.includes("archival accession") || key.includes("archival-accession")) return 45;
-    if (label.includes("aardvark") || key.includes("aardvark")) return 50;
-    if (label.includes("metadata") || key.includes("gmd") || key.includes("csdgm")) return 60;
-    return 100;
-}
-
 export const ResourceDistributions: React.FC<ResourceDistributionsProps> = ({ distributions }) => {
     const visibleDistributions = useMemo(() => {
-        const seen = new Set<string>();
-        return distributions
-            .filter((distribution) => distribution.url?.trim())
-            .filter((distribution) => {
-                const key = `${distribution.relation_key}\n${distribution.url}`;
-                if (seen.has(key)) return false;
-                seen.add(key);
-                return true;
-            })
-            .sort((a, b) => distributionSortScore(a) - distributionSortScore(b));
+        return uniqueSortedDistributions(distributions).filter((distribution) => !isDownloadableDistribution(distribution));
     }, [distributions]);
 
     if (visibleDistributions.length === 0) return null;

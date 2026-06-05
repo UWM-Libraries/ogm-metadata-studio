@@ -8,6 +8,7 @@ import { ResourceSidebar } from './resource/ResourceSidebar';
 import { ResourceMetadata } from './resource/ResourceMetadata';
 import { ResourceHeader } from './resource/ResourceHeader';
 import { ResourceDistributions } from './resource/ResourceDistributions';
+import { distributionsFromReferences } from './resource/distributionLinks';
 
 import { databaseService } from '../services/DatabaseService';
 import { useToast } from './shared/ToastContext';
@@ -19,43 +20,6 @@ interface ResourceShowProps {
     id: string;
     onBack: () => void;
 }
-
-function referenceUrlEntries(value: unknown): Array<{ url: string; label?: string }> {
-    const values = Array.isArray(value) ? value : [value];
-    return values.flatMap((item) => {
-        if (typeof item === "string" && item.trim()) return [{ url: item }];
-        if (!item || typeof item !== "object" || Array.isArray(item)) return [];
-        const candidate = item as { url?: unknown; label?: unknown };
-        if (typeof candidate.url !== "string" || !candidate.url.trim()) return [];
-        return [{
-            url: candidate.url,
-            ...(typeof candidate.label === "string" && candidate.label.trim() ? { label: candidate.label } : {}),
-        }];
-    });
-}
-
-function distributionsFromReferences(resource: Resource): Distribution[] {
-    if (!resource.dct_references_s) return [];
-    try {
-        const refs = JSON.parse(resource.dct_references_s);
-        if (!refs || typeof refs !== "object") return [];
-        const distributions: Distribution[] = [];
-        for (const [relation_key, value] of Object.entries(refs)) {
-            for (const entry of referenceUrlEntries(value)) {
-                distributions.push({
-                    resource_id: resource.id,
-                    relation_key,
-                    url: entry.url,
-                    label: entry.label,
-                });
-            }
-        }
-        return distributions;
-    } catch {
-        return [];
-    }
-}
-
 export const ResourceShow: React.FC<ResourceShowProps> = ({ id, onBack }) => {
     const [resource, setResource] = useState<Resource | null>(null);
     const [distributions, setDistributions] = useState<Distribution[]>([]);
@@ -223,7 +187,7 @@ export const ResourceShow: React.FC<ResourceShowProps> = ({ id, onBack }) => {
 
             <div className="flex flex-col lg:flex-row">
                 <ResourceMetadata resource={resource} />
-                <ResourceSidebar resource={resource} />
+                <ResourceSidebar resource={resource} distributions={distributions} />
             </div>
 
             {similarResources.length > 0 && (

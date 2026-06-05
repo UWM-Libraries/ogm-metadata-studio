@@ -133,6 +133,8 @@ const blankStorageProfile = (): ProxyStorageProfile => ({
     prefixes: [""],
     forcePathStyle: true,
     publicBaseUrl: "",
+    metadataIdPrefix: "unr",
+    metadataProvider: "",
     accessKeyIdEnv: "AWS_ACCESS_KEY_ID",
     secretAccessKeyEnv: "AWS_SECRET_ACCESS_KEY",
     sessionTokenEnv: "",
@@ -193,6 +195,7 @@ const defaultTextReconciliationProfileId = (profiles: ProxyModelProfile[]) => (
 
 const defaultBatchDefaults = {
     provider: "",
+    metadataIdPrefix: "unr",
     publisher: "",
     creator: "",
     accessRights: "Public",
@@ -208,9 +211,20 @@ const defaultBatchDefaults = {
     themes: [],
 };
 
-function defaultBatchDefaultsPayload() {
+function cleanMetadataIdPrefix(value: unknown): string {
+    const cleaned = String(value || "")
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9_-]+/g, "-")
+        .replace(/^-+|-+$/g, "");
+    return cleaned || "unr";
+}
+
+function defaultBatchDefaultsPayload(storageProfile?: ProxyStorageProfile) {
     return {
         ...defaultBatchDefaults,
+        provider: storageProfile?.metadataProvider || defaultBatchDefaults.provider,
+        metadataIdPrefix: cleanMetadataIdPrefix(storageProfile?.metadataIdPrefix || defaultBatchDefaults.metadataIdPrefix),
         resourceClass: [...defaultBatchDefaults.resourceClass],
         resourceType: [...defaultBatchDefaults.resourceType],
         subjects: [...defaultBatchDefaults.subjects],
@@ -1333,7 +1347,7 @@ export const EnrichmentWorkbench: React.FC = () => {
                 : null;
             const outputSchema = historicalMapPrompt ? JSON.parse(historicalMapPrompt.definition.output_schema_json) : {};
             const modelParams = normalizeModelParams(selectedModelProfile.defaultModel, selectedModelProfile.modelParams ?? {});
-            const batchDefaults = defaultBatchDefaultsPayload();
+            const batchDefaults = defaultBatchDefaultsPayload(selectedStorageProfile);
             const textProvider = selectedTextExtractionModelProfile?.provider || "openai";
             const textExtractorLabel = selectedTextExtractionModelProfile
                 ? ` + ${textProvider === "gemini" ? "Gemini" : textProvider === "kimi" ? "Kimi" : "OpenAI"} ${selectedTextExtractionModelProfile.defaultModel} label reconciliation`
@@ -1597,7 +1611,7 @@ export const EnrichmentWorkbench: React.FC = () => {
 
             startRegenerationProgress(resources.length);
             const modelParams = normalizeModelParams(selectedModelProfile.defaultModel, selectedModelProfile.modelParams ?? {});
-            const batchDefaults = defaultBatchDefaultsPayload();
+            const batchDefaults = defaultBatchDefaultsPayload(selectedStorageProfile);
             let published = 0;
             let failed = 0;
 
@@ -2513,6 +2527,10 @@ export const EnrichmentWorkbench: React.FC = () => {
                             <input className="rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950" value={storageDraft.bucket} onChange={(e) => setStorageDraft({ ...storageDraft, bucket: e.target.value })} placeholder="Bucket" />
                             <input className="rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950" value={(storageDraft.prefixes || []).join("\n")} onChange={(e) => setStorageDraft({ ...storageDraft, prefixes: e.target.value.split(/\n|,/).map((v) => v.trim()) })} placeholder="Prefixes, comma or newline separated" />
                             <input className="rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950" value={storageDraft.publicBaseUrl || ""} onChange={(e) => setStorageDraft({ ...storageDraft, publicBaseUrl: e.target.value })} placeholder="Optional public base URL" />
+                            <div className="grid grid-cols-1 gap-2 sm:grid-cols-[96px_minmax(0,1fr)]">
+                                <input className="rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950" value={storageDraft.metadataIdPrefix || "unr"} onChange={(e) => setStorageDraft({ ...storageDraft, metadataIdPrefix: cleanMetadataIdPrefix(e.target.value) })} placeholder="unr" aria-label="Metadata ID prefix" />
+                                <input className="rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950" value={storageDraft.metadataProvider || ""} onChange={(e) => setStorageDraft({ ...storageDraft, metadataProvider: e.target.value })} placeholder="Metadata provider, e.g. University of Nevada, Reno" aria-label="Metadata provider" />
+                            </div>
                             <p className="rounded-md bg-amber-50 px-2 py-1.5 text-[11px] text-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
                                 Enter environment variable names here, not secret values. Put actual credentials in web/.env or the shell that starts the proxy.
                             </p>

@@ -335,6 +335,14 @@ describe('viewerConfig', () => {
             expect(parsed.coordinates[0][0]).toEqual([-10, 20]);
         });
 
+        it('parses locn_geometry as WKT polygon', () => {
+            const resource = { ...base, locn_geometry: 'POLYGON((-10 -20, 10 -20, 10 20, -10 20, -10 -20))' };
+            const result = getViewerGeometry(resource);
+            const parsed = JSON.parse(result!);
+            expect(parsed.type).toBe('Polygon');
+            expect(parsed.coordinates[0][0]).toEqual([-10, 20]);
+        });
+
         it('falls back to dcat_bbox if locn_geometry is missing', () => {
             const resource = { ...base, dcat_bbox: 'ENVELOPE(-5, 5, 10, -10)' };
             const result = getViewerGeometry(resource);
@@ -363,8 +371,8 @@ describe('viewerConfig', () => {
     });
 
     describe('formatCentroid', () => {
-        it('returns GeoJSON Point string', () => {
-            expect(formatCentroid(-88.5, 41.5)).toBe('{"type":"Point","coordinates":[-88.5,41.5]}');
+        it('returns Aardvark latitude,longitude string', () => {
+            expect(formatCentroid(-88.5, 41.5)).toBe('41.5,-88.5');
         });
     });
 

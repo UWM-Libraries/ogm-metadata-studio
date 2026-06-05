@@ -91,13 +91,13 @@ export async function importCsv(file: File): Promise<{ success: boolean, message
                 console.warn("Failed to populate geom from dcat_bbox", e);
             }
 
-            // Populate dcat_centroid from bbox center where missing
+            // Populate dcat_centroid from bbox center where missing. Aardvark uses latitude,longitude.
             try {
                 await conn.query(`
                   UPDATE resources
-                  SET dcat_centroid = '{"type":"Point","coordinates":[' ||
-                    (CAST((string_split(regexp_replace(dcat_bbox, 'ENVELOPE\\(|\\)', '', 'g'), ','))[1] AS DOUBLE) + CAST((string_split(regexp_replace(dcat_bbox, 'ENVELOPE\\(|\\)', '', 'g'), ','))[2] AS DOUBLE)) / 2 || ',' ||
-                    (CAST((string_split(regexp_replace(dcat_bbox, 'ENVELOPE\\(|\\)', '', 'g'), ','))[3] AS DOUBLE) + CAST((string_split(regexp_replace(dcat_bbox, 'ENVELOPE\\(|\\)', '', 'g'), ','))[4] AS DOUBLE)) / 2 || ']}'
+                  SET dcat_centroid =
+                    (CAST((string_split(regexp_replace(dcat_bbox, 'ENVELOPE\\(|\\)', '', 'g'), ','))[3] AS DOUBLE) + CAST((string_split(regexp_replace(dcat_bbox, 'ENVELOPE\\(|\\)', '', 'g'), ','))[4] AS DOUBLE)) / 2 || ',' ||
+                    (CAST((string_split(regexp_replace(dcat_bbox, 'ENVELOPE\\(|\\)', '', 'g'), ','))[1] AS DOUBLE) + CAST((string_split(regexp_replace(dcat_bbox, 'ENVELOPE\\(|\\)', '', 'g'), ','))[2] AS DOUBLE)) / 2
                   WHERE dcat_bbox LIKE 'ENVELOPE(%'
                   AND (dcat_centroid IS NULL OR trim(dcat_centroid) = '')
                   AND id IN (SELECT "${idSource}" FROM ${tempTable})

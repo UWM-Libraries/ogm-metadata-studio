@@ -97,17 +97,23 @@ describe("enrichment schema and draft mapping", () => {
                 provider: "University Test Library",
                 accessRights: "Public",
                 license: "https://creativecommons.org/publicdomain/mark/1.0/",
+                metadataIdPrefix: "unr",
                 resourceClass: ["Maps"],
                 resourceType: ["Topographic maps"],
             },
         });
 
         expect(confidence).toBe(0.97);
+        expect(resource.id).toMatch(/^unr-/);
         expect(resource.dct_title_s).toContain("RENO SHEET");
         expect(resource.schema_provider_s).toBe("University Test Library");
+        expect(resource.dct_format_s).toBe("TIFF");
         expect(resource.dct_spatial_sm).toEqual(expect.arrayContaining(["NEVADA", "RENO", "PYRAMID LAKE"]));
         expect(resource.dcat_bbox).toBe("ENVELOPE(-120,-119.5,40,39.5)");
-        expect(resource.dcat_centroid).toContain("-119.75");
+        expect(resource.locn_geometry).toBe("POLYGON((-120 39.5, -119.5 39.5, -119.5 40, -120 40, -120 39.5))");
+        expect(resource.dcat_centroid).toBe("39.75,-119.75");
+        expect(resource.dcat_theme_sm).toEqual(["Location"]);
+        expect(resource.extra).toEqual({});
         expect(distributions[0]).toMatchObject({
             relation_key: "download",
             url: "https://example.test/usgs/reno.tif",

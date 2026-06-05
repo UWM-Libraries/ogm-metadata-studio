@@ -1,5 +1,5 @@
 import { Distribution, Resource } from '../../aardvark/model';
-import { envelopeToBounds, geoJsonToBounds } from '../viewers/maplibreBounds';
+import { envelopeToBounds, geoJsonToBounds, wktToBounds } from '../viewers/maplibreBounds';
 import { vectorGeoJsonArtifactUrl } from '../viewers/artifactProxy';
 
 export interface ViewerConfig {
@@ -189,23 +189,21 @@ function extractionEndpointFields(args: {
 
 // Helper: Extract Geometry (BBox to Polygon or Centroid? GBL usually expects BBox as Polygon)
 export function getViewerGeometry(resource: Resource): string | undefined {
+    const boundsToGeoJson = ([[w, s], [e, n]]: [[number, number], [number, number]]): string => JSON.stringify({
+        type: "Polygon",
+        coordinates: [[
+            [w, n],
+            [e, n],
+            [e, s],
+            [w, s],
+            [w, n]
+        ]]
+    });
+
     const parseEnvelope = (str: string): string | null => {
         const bounds = envelopeToBounds(str);
         if (bounds) {
-            const [[w, s], [e, n]] = bounds;
-
-            // GeoJSON Polygon [ [ [w, n], [e, n], [e, s], [w, s], [w, n] ] ]
-            const geojson = {
-                type: "Polygon",
-                coordinates: [[
-                    [w, n],
-                    [e, n],
-                    [e, s],
-                    [w, s],
-                    [w, n]
-                ]]
-            };
-            return JSON.stringify(geojson);
+            return boundsToGeoJson(bounds);
         }
         return null;
     };
@@ -220,6 +218,8 @@ export function getViewerGeometry(resource: Resource): string | undefined {
             // Not native JSON. Is it ENVELOPE?
             const parsed = parseEnvelope(resource.locn_geometry);
             if (parsed) return parsed;
+            const wktBounds = wktToBounds(resource.locn_geometry);
+            if (wktBounds) return boundsToGeoJson(wktBounds);
         }
     }
 
@@ -232,9 +232,9 @@ export function getViewerGeometry(resource: Resource): string | undefined {
     return undefined;
 }
 
-/** dcat_centroid format: GeoJSON Point {"type":"Point","coordinates":[lon,lat]}. */
+/** dcat_centroid format: Aardvark latitude,longitude string. */
 export function formatCentroid(lon: number, lat: number): string {
-    return JSON.stringify({ type: 'Point', coordinates: [lon, lat] });
+    return `${lat},${lon}`;
 }
 
 /** Centroid [lon, lat] from resource geometry (locn_geometry or dcat_bbox), or null if none. */

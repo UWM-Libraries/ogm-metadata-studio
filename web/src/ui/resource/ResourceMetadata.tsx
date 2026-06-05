@@ -15,6 +15,13 @@ const FACETABLE_FIELDS = [
     'dct_format_s'
 ];
 
+const HIDDEN_DETAIL_FIELDS = new Set([
+    'dct_references_s',
+    'extra',
+    'id',
+    'thumbnail',
+]);
+
 interface ResourceMetadataProps {
     resource: Resource;
 }
@@ -26,7 +33,7 @@ export const ResourceMetadata: React.FC<ResourceMetadataProps> = ({ resource }) 
 
             <dl className="grid grid-cols-[160px_1fr] gap-y-4 text-sm">
                 {Object.entries(resource).map(([key, value]) => {
-                    if (!value || (Array.isArray(value) && value.length === 0) || key === 'id' || key === 'dct_references_s' || key.startsWith('_')) return null;
+                    if (!value || (Array.isArray(value) && value.length === 0) || HIDDEN_DETAIL_FIELDS.has(key) || key.startsWith('_')) return null;
                     // Basic label formatting
                     const label = key.replace(/^[a-z]+_/, '').replace(/_[a-z]+$/, '').replace(/([A-Z])/g, ' $1').replace(/^./, str => str.toUpperCase());
 

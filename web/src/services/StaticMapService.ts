@@ -186,6 +186,9 @@ export class StaticMapService {
             return this.normalizeBBox(w, s, e, n);
         }
 
+        const wkt = this.bboxFromWkt(geom);
+        if (wkt) return wkt;
+
         const parts = geom.split(',').map(p => Number(p.trim()));
         if (parts.length === 4 && parts.every(Number.isFinite)) {
             return this.normalizeBBox(parts[0], parts[1], parts[2], parts[3]);
@@ -196,6 +199,19 @@ export class StaticMapService {
         } catch {
             return null;
         }
+    }
+
+    private bboxFromWkt(value: string): BBox | null {
+        if (!/^(?:MULTI)?POLYGON\s*\(/i.test(value.trim())) return null;
+        const numbers = value.match(/[-+]?\d*\.?\d+(?:e[-+]?\d+)?/gi)?.map(Number) ?? [];
+        if (numbers.length < 4 || numbers.length % 2 !== 0) return null;
+        const xs: number[] = [];
+        const ys: number[] = [];
+        for (let index = 0; index + 1 < numbers.length; index += 2) {
+            xs.push(numbers[index]);
+            ys.push(numbers[index + 1]);
+        }
+        return this.normalizeBBox(Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys));
     }
 
     private async parseBBoxFromReferences(): Promise<BBox | null> {
