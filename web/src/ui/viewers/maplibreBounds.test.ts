@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { envelopeToBounds, geoJsonToBounds, getBoundsFromGeometry, intersectLngLatBbox, textToLngLatBounds } from './maplibreBounds';
+import { envelopeToBounds, geoJsonToBounds, getBoundsFromGeometry, intersectLngLatBbox, textToLngLatBounds, wktToBounds } from './maplibreBounds';
 
 describe('maplibreBounds', () => {
     it('parses valid Aardvark envelopes', () => {
@@ -48,6 +48,12 @@ describe('maplibreBounds', () => {
 
     it('parses comma-separated WGS84 bounds', () => {
         expect(textToLngLatBounds('-10,-20,10,20')).toEqual([[-10, -20], [10, 20]]);
+    });
+
+    it('parses WKT polygon bounds', () => {
+        const wkt = 'POLYGON((-120 39.5, -119.5 39.5, -119.5 40, -120 40, -120 39.5))';
+        expect(wktToBounds(wkt)).toEqual([[-120, 39.5], [-119.5, 40]]);
+        expect(getBoundsFromGeometry(wkt)).toEqual([[-120, 39.5], [-119.5, 40]]);
     });
 
     it('clips a viewport bbox to a raster bbox', () => {

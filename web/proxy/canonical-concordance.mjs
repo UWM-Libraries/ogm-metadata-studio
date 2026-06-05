@@ -287,13 +287,31 @@ function bboxFromGeoJsonText(value) {
   }
 }
 
+function bboxFromWktText(value) {
+  const text = String(value || "").trim();
+  if (!/^(?:MULTI)?POLYGON\s*\(/i.test(text)) return undefined;
+  const numbers = text.match(/[-+]?\d*\.?\d+(?:e[-+]?\d+)?/gi)?.map(Number) || [];
+  if (numbers.length < 4 || numbers.length % 2 !== 0) return undefined;
+  const coordinates = [];
+  for (let index = 0; index + 1 < numbers.length; index += 2) {
+    coordinates.push([numbers[index], numbers[index + 1]]);
+  }
+  return normalizedBox([
+    Math.min(...coordinates.map((item) => item[0])),
+    Math.min(...coordinates.map((item) => item[1])),
+    Math.max(...coordinates.map((item) => item[0])),
+    Math.max(...coordinates.map((item) => item[1])),
+  ]);
+}
+
 function projectionBbox({ mapExtent = {}, resource = {}, boundary = null } = {}) {
   const minConfidence = envNumber("ENRICHMENT_PROXY_CANONICAL_PROJECTION_MIN_CONFIDENCE", DEFAULT_MIN_MAP_EXTENT_CONFIDENCE);
   const mapBox = normalizedBox(mapExtent?.bbox) || normalizedBox([mapExtent?.west, mapExtent?.south, mapExtent?.east, mapExtent?.north]);
   if (mapBox && Number(mapExtent?.confidence || 0) >= minConfidence) return { bbox: mapBox, source: "map_extent", confidence: mapExtent.confidence };
   const resourceBox = bboxFromEnvelopeText(resource?.dcat_bbox)
     || bboxFromGeoJsonText(resource?.locn_geometry)
-    || bboxFromEnvelopeText(resource?.locn_geometry);
+    || bboxFromEnvelopeText(resource?.locn_geometry)
+    || bboxFromWktText(resource?.locn_geometry);
   if (resourceBox) return { bbox: resourceBox, source: "resource_bbox", confidence: 0.85 };
   const boundaryBox = normalizedBox(boundary?.bbox);
   if (boundaryBox) return { bbox: boundaryBox, source: "gazetteer_boundary", confidence: boundary?.confidence || 0.75 };

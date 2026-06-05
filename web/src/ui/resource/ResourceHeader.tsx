@@ -26,10 +26,10 @@ export const ResourceHeader: React.FC<ResourceHeaderProps> = ({ resource, pagina
     ].filter(item => item.label);
 
     return (
-        <div className="border-b border-gray-200 dark:border-slate-800 p-6">
-            <div className="flex items-center text-sm text-slate-500 dark:text-slate-400 mb-2">
+        <div className="ogm-resource-header ogm-page-card p-6">
+            <div className="mb-4 flex flex-wrap items-center gap-3 text-sm">
                 {/* Left: Breadcrumbs */}
-                <div className="flex items-center gap-2 overflow-hidden flex-1">
+                <div className="ogm-resource-breadcrumb flex min-w-0 flex-1 items-center gap-2 overflow-hidden">
                     {breadcrumbItems.map((item, idx) => {
                         // Build cumulative filters up to this index
                         const params = new URLSearchParams();
@@ -44,7 +44,7 @@ export const ResourceHeader: React.FC<ResourceHeaderProps> = ({ resource, pagina
                                 {idx > 0 && <span>&rsaquo;</span>}
                                 <Link
                                     href={href}
-                                    className="hover:text-indigo-600 dark:hover:text-indigo-400 truncate whitespace-nowrap"
+                                    className="truncate whitespace-nowrap"
                                 >
                                     {item.label}
                                 </Link>
@@ -54,11 +54,11 @@ export const ResourceHeader: React.FC<ResourceHeaderProps> = ({ resource, pagina
                 </div>
 
                 {/* Right: Navigation Controls */}
-                <div className="flex items-center gap-4 shrink-0 ml-4">
+                <div className="flex shrink-0 flex-wrap items-center gap-2">
                     {/* Back to Results */}
                     <Link
                         href={`/?${window.location.search.substring(1)}`}
-                        className="flex items-center gap-1 hover:text-indigo-600 dark:hover:text-indigo-400 transition-colors"
+                        className="ogm-secondary-button inline-flex items-center gap-1"
                     >
                         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4">
                             <path fillRule="evenodd" d="M11.78 5.22a.75.75 0 010 1.06L8.06 10l3.72 3.72a.75.75 0 11-1.06 1.06l-4.25-4.25a.75.75 0 010-1.06l4.25-4.25a.75.75 0 011.06 0z" clipRule="evenodd" />
@@ -69,38 +69,36 @@ export const ResourceHeader: React.FC<ResourceHeaderProps> = ({ resource, pagina
                     {/* Pagination */}
                     {pagination.total > 0 && (
                         <>
-                            <div className="h-4 w-px bg-gray-300 dark:bg-slate-700 mx-2"></div>
                             <button
                                 onClick={() => pagination.prevId && onNavigate(pagination.prevId)}
                                 disabled={!pagination.prevId}
-                                className="flex items-center gap-1 disabled:opacity-30 hover:text-indigo-600 disabled:cursor-not-allowed transition-colors"
+                                className="ogm-page-button inline-flex items-center gap-1 px-3 py-1.5 text-xs"
                             >
                                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4">
                                     <path fillRule="evenodd" d="M11.78 5.22a.75.75 0 010 1.06L8.06 10l3.72 3.72a.75.75 0 11-1.06 1.06l-4.25-4.25a.75.75 0 010-1.06l4.25-4.25a.75.75 0 011.06 0z" clipRule="evenodd" />
                                 </svg>
                                 Prev
                             </button>
-                            <span className="text-slate-900 dark:text-slate-200 font-medium">
+                            <span className="ogm-count-badge">
                                 {pagination.position} of {pagination.total}
                             </span>
                             <button
                                 onClick={() => pagination.nextId && onNavigate(pagination.nextId)}
                                 disabled={!pagination.nextId}
-                                className="flex items-center gap-1 disabled:opacity-30 hover:text-indigo-600 disabled:cursor-not-allowed transition-colors"
+                                className="ogm-page-button inline-flex items-center gap-1 px-3 py-1.5 text-xs"
                             >
                                 Next
                                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4">
                                     <path fillRule="evenodd" d="M8.22 5.22a.75.75 0 011.06 0l4.25 4.25a.75.75 0 010 1.06l-4.25 4.25a.75.75 0 01-1.06-1.06L11.94 10 8.22 6.28a.75.75 0 010-1.06z" clipRule="evenodd" />
                                 </svg>
                             </button>
-                            <div className="h-4 w-px bg-gray-300 dark:bg-slate-700 mx-2"></div>
                         </>
                     )}
 
                     {/* Clear Search */}
                     <Link
                         href="/"
-                        className="flex items-center gap-1 hover:text-red-600 dark:hover:text-red-400 transition-colors"
+                        className="ogm-secondary-button inline-flex items-center gap-1"
                     >
                         Clear
                         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4">
@@ -109,13 +107,13 @@ export const ResourceHeader: React.FC<ResourceHeaderProps> = ({ resource, pagina
                     </Link>
                 </div>
             </div>
-            <h1 className="text-3xl font-bold text-slate-900 dark:text-white mb-2">{resource.dct_title_s}</h1>
-            <div className="flex flex-wrap gap-4 text-sm text-slate-600 dark:text-slate-400 items-center">
+            <h1 className="ogm-resource-title mb-3">{resource.dct_title_s}</h1>
+            <div className="flex flex-wrap items-center gap-3 text-sm">
                 {resource.dct_publisher_sm?.[0] && (
-                    <span>{resource.dct_publisher_sm[0]}</span>
+                    <span className="ogm-resource-subtle">{resource.dct_publisher_sm[0]}</span>
                 )}
                 {resource.gbl_indexYear_im && (
-                    <span>&middot; {resource.gbl_indexYear_im}</span>
+                    <span className="ogm-count-badge">{resource.gbl_indexYear_im}</span>
                 )}
 
                 <div className="flex-1"></div>
@@ -124,7 +122,7 @@ export const ResourceHeader: React.FC<ResourceHeaderProps> = ({ resource, pagina
                     <>
                         <Link
                             href={`/resources/${resource.id}/edit`}
-                            className="inline-flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-slate-700 dark:text-slate-200 bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded-lg hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors"
+                            className="ogm-secondary-button inline-flex items-center gap-2"
                         >
                             <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4">
                                 <path d="M5.433 13.917l1.262-3.155A4 4 0 017.58 9.42l6.92-6.918a2.121 2.121 0 013 3l-6.92 6.918c-.383.383-.84.685-1.343.886l-3.154 1.262a.5.5 0 01-.65-.65z" />
@@ -134,7 +132,7 @@ export const ResourceHeader: React.FC<ResourceHeaderProps> = ({ resource, pagina
                         </Link>
                         <Link
                             href={`/resources/${resource.id}/admin`}
-                            className="inline-flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-slate-700 dark:text-slate-200 bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded-lg hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors"
+                            className="ogm-secondary-button inline-flex items-center gap-2"
                         >
                             <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4">
                                 <path fillRule="evenodd" d="M10 1a4.5 4.5 0 00-4.5 4.5V9H5a2 2 0 00-2 2v6a2 2 0 002 2h10a2 2 0 002-2v-6a2 2 0 00-2-2h-.5V5.5A4.5 4.5 0 0010 1zm3 8V5.5a3 3 0 10-6 0V9h6z" clipRule="evenodd" />
@@ -144,7 +142,7 @@ export const ResourceHeader: React.FC<ResourceHeaderProps> = ({ resource, pagina
                         {onDelete && (
                             <button
                                 onClick={() => onDelete(resource.id)}
-                                className="inline-flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-red-700 dark:text-red-200 bg-white dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg hover:bg-red-50 dark:hover:bg-red-900/40 transition-colors"
+                                className="ogm-danger-button inline-flex items-center gap-2"
                             >
                                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4">
                                     <path fillRule="evenodd" d="M8.75 1A2.75 2.75 0 006 3.75v.443c-.795.077-1.584.176-2.365.298a.75.75 0 10.23 1.482l.149-.022.841 10.518A2.75 2.75 0 007.596 19h4.807a2.75 2.75 0 002.742-2.53l.841-10.52.149.023a.75.75 0 00.23-1.482A41.03 41.03 0 0014 4.193V3.75A2.75 2.75 0 0011.25 1h-2.5zM10 4c.84 0 1.673.025 2.5.075V3.75c0-.69-.56-1.25-1.25-1.25h-2.5c-.69 0-1.25.56-1.25 1.25v.325C8.327 4.025 9.16 4 10 4zM8.58 7.72a.75.75 0 00-1.5.06l.3 7.5a.75.75 0 101.5-.06l-.3-7.5zm4.34.06a.75.75 0 10-1.5-.06l-.3 7.5a.75.75 0 101.5.06l.3-7.5z" clipRule="evenodd" />

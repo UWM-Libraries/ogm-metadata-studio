@@ -8,6 +8,7 @@ import { ResourceSidebar } from './resource/ResourceSidebar';
 import { ResourceMetadata } from './resource/ResourceMetadata';
 import { ResourceHeader } from './resource/ResourceHeader';
 import { ResourceDistributions } from './resource/ResourceDistributions';
+import { distributionsFromReferences } from './resource/distributionLinks';
 
 import { databaseService } from '../services/DatabaseService';
 import { useToast } from './shared/ToastContext';
@@ -19,43 +20,6 @@ interface ResourceShowProps {
     id: string;
     onBack: () => void;
 }
-
-function referenceUrlEntries(value: unknown): Array<{ url: string; label?: string }> {
-    const values = Array.isArray(value) ? value : [value];
-    return values.flatMap((item) => {
-        if (typeof item === "string" && item.trim()) return [{ url: item }];
-        if (!item || typeof item !== "object" || Array.isArray(item)) return [];
-        const candidate = item as { url?: unknown; label?: unknown };
-        if (typeof candidate.url !== "string" || !candidate.url.trim()) return [];
-        return [{
-            url: candidate.url,
-            ...(typeof candidate.label === "string" && candidate.label.trim() ? { label: candidate.label } : {}),
-        }];
-    });
-}
-
-function distributionsFromReferences(resource: Resource): Distribution[] {
-    if (!resource.dct_references_s) return [];
-    try {
-        const refs = JSON.parse(resource.dct_references_s);
-        if (!refs || typeof refs !== "object") return [];
-        const distributions: Distribution[] = [];
-        for (const [relation_key, value] of Object.entries(refs)) {
-            for (const entry of referenceUrlEntries(value)) {
-                distributions.push({
-                    resource_id: resource.id,
-                    relation_key,
-                    url: entry.url,
-                    label: entry.label,
-                });
-            }
-        }
-        return distributions;
-    } catch {
-        return [];
-    }
-}
-
 export const ResourceShow: React.FC<ResourceShowProps> = ({ id, onBack }) => {
     const [resource, setResource] = useState<Resource | null>(null);
     const [distributions, setDistributions] = useState<Distribution[]>([]);
@@ -198,37 +162,36 @@ export const ResourceShow: React.FC<ResourceShowProps> = ({ id, onBack }) => {
     };
 
     if (loading) {
-        return <div className="p-8 text-center text-slate-500">{recoveryMessage || "Loading resource..."}</div>;
+        return <div className="ogm-page-card m-6 p-8 text-center text-[#5a5547] dark:text-[#ffffff]/80">{recoveryMessage || "Loading resource..."}</div>;
     }
 
     if (!resource) {
-        return <div className="p-8 text-center text-red-500">Resource not found: {id}</div>;
+        return <div className="ogm-page-card m-6 p-8 text-center text-[#cf3f32]">Resource not found: {id}</div>;
     }
 
     return (
-        <div className="max-w-7xl mx-auto w-full bg-white dark:bg-slate-900 min-h-full">
-            <ResourceHeader
-                resource={resource}
-                pagination={pagination}
-                onNavigate={navigateToId}
-                onDelete={handleDelete}
-            />
+        <div className="ogm-resource-page h-full min-h-0 overflow-auto">
+            <div className="mx-auto flex w-full max-w-7xl flex-col gap-6 p-6">
+                <ResourceHeader
+                    resource={resource}
+                    pagination={pagination}
+                    onNavigate={navigateToId}
+                    onDelete={handleDelete}
+                />
 
-            {/* Resource Viewer */}
-            <div className="px-6 pt-6">
                 <ResourceViewer resource={resource} distributions={distributions} />
+
+                <ResourceDistributions distributions={distributions} />
+
+                <div className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1fr)_24rem]">
+                    <ResourceMetadata resource={resource} />
+                    <ResourceSidebar resource={resource} distributions={distributions} />
+                </div>
+
+                {similarResources.length > 0 && (
+                    <SimilarResourcesCarousel items={similarResources} />
+                )}
             </div>
-
-            <ResourceDistributions distributions={distributions} />
-
-            <div className="flex flex-col lg:flex-row">
-                <ResourceMetadata resource={resource} />
-                <ResourceSidebar resource={resource} />
-            </div>
-
-            {similarResources.length > 0 && (
-                <SimilarResourcesCarousel items={similarResources} />
-            )}
         </div>
     );
 };

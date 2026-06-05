@@ -133,6 +133,8 @@ const blankStorageProfile = (): ProxyStorageProfile => ({
     prefixes: [""],
     forcePathStyle: true,
     publicBaseUrl: "",
+    metadataIdPrefix: "unr",
+    metadataProvider: "",
     accessKeyIdEnv: "AWS_ACCESS_KEY_ID",
     secretAccessKeyEnv: "AWS_SECRET_ACCESS_KEY",
     sessionTokenEnv: "",
@@ -193,6 +195,7 @@ const defaultTextReconciliationProfileId = (profiles: ProxyModelProfile[]) => (
 
 const defaultBatchDefaults = {
     provider: "",
+    metadataIdPrefix: "unr",
     publisher: "",
     creator: "",
     accessRights: "Public",
@@ -208,9 +211,20 @@ const defaultBatchDefaults = {
     themes: [],
 };
 
-function defaultBatchDefaultsPayload() {
+function cleanMetadataIdPrefix(value: unknown): string {
+    const cleaned = String(value || "")
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9_-]+/g, "-")
+        .replace(/^-+|-+$/g, "");
+    return cleaned || "unr";
+}
+
+function defaultBatchDefaultsPayload(storageProfile?: ProxyStorageProfile) {
     return {
         ...defaultBatchDefaults,
+        provider: storageProfile?.metadataProvider || defaultBatchDefaults.provider,
+        metadataIdPrefix: cleanMetadataIdPrefix(storageProfile?.metadataIdPrefix || defaultBatchDefaults.metadataIdPrefix),
         resourceClass: [...defaultBatchDefaults.resourceClass],
         resourceType: [...defaultBatchDefaults.resourceType],
         subjects: [...defaultBatchDefaults.subjects],
@@ -1333,7 +1347,7 @@ export const EnrichmentWorkbench: React.FC = () => {
                 : null;
             const outputSchema = historicalMapPrompt ? JSON.parse(historicalMapPrompt.definition.output_schema_json) : {};
             const modelParams = normalizeModelParams(selectedModelProfile.defaultModel, selectedModelProfile.modelParams ?? {});
-            const batchDefaults = defaultBatchDefaultsPayload();
+            const batchDefaults = defaultBatchDefaultsPayload(selectedStorageProfile);
             const textProvider = selectedTextExtractionModelProfile?.provider || "openai";
             const textExtractorLabel = selectedTextExtractionModelProfile
                 ? ` + ${textProvider === "gemini" ? "Gemini" : textProvider === "kimi" ? "Kimi" : "OpenAI"} ${selectedTextExtractionModelProfile.defaultModel} label reconciliation`
@@ -1597,7 +1611,7 @@ export const EnrichmentWorkbench: React.FC = () => {
 
             startRegenerationProgress(resources.length);
             const modelParams = normalizeModelParams(selectedModelProfile.defaultModel, selectedModelProfile.modelParams ?? {});
-            const batchDefaults = defaultBatchDefaultsPayload();
+            const batchDefaults = defaultBatchDefaultsPayload(selectedStorageProfile);
             let published = 0;
             let failed = 0;
 
@@ -2181,8 +2195,8 @@ export const EnrichmentWorkbench: React.FC = () => {
     );
 
     return (
-        <div className="flex h-full min-h-0 flex-col gap-4">
-            <div className="flex flex-wrap items-center gap-2 border-b border-gray-200 pb-3 dark:border-slate-800">
+        <div className="ogm-enrichment-page flex h-full min-h-0 flex-col gap-4">
+            <div className="ogm-tab-strip items-center">
                 {([
                     { id: "upload", label: "Upload Pipeline" },
                     { id: "config", label: "Config" },
@@ -2192,26 +2206,23 @@ export const EnrichmentWorkbench: React.FC = () => {
                         key={panel.id}
                         type="button"
                         onClick={() => setActivePanel(panel.id)}
-                        className={`rounded-md border px-3 py-1.5 text-xs font-medium ${activePanel === panel.id
-                            ? "border-indigo-300 bg-indigo-50 text-indigo-700 dark:border-indigo-500/60 dark:bg-indigo-950/40 dark:text-indigo-200"
-                            : "border-gray-200 text-slate-600 hover:bg-gray-50 dark:border-slate-800 dark:text-slate-300 dark:hover:bg-slate-800"
-                            }`}
+                        className={`ogm-tab-button ${activePanel === panel.id ? "ogm-tab-button-active" : ""}`}
                     >
                         {panel.label}
                     </button>
                 ))}
-                <div className="ml-auto text-xs text-slate-500 dark:text-slate-400">{status}</div>
+                <div className="ogm-section-label ml-auto">{status}</div>
             </div>
 
             {activePanel === "upload" && (
                 <div className="flex min-h-0 flex-col gap-3">
                     {isRestoring && (
-                        <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100">
+                        <div className="ogm-status-card px-3 py-2 text-xs">
                             {restoreLabel}. Upload processing is paused until restore finishes.
                         </div>
                     )}
                     {runProgress && (runProgress.kind === "regeneration" || runProgress.kind === "refresh" || runProgress.kind === "wof") && (
-                        <div className="rounded-md border border-indigo-100 bg-indigo-50/70 p-3 text-xs dark:border-indigo-900/70 dark:bg-indigo-950/20" role="status" aria-live="polite">
+                        <div className="ogm-status-card p-3 text-xs" role="status" aria-live="polite">
                             <div className="mb-2 flex flex-wrap items-center gap-2">
                                 <div className="font-semibold text-slate-900 dark:text-slate-100">{runProgress.kind === "wof" ? "Gazetteer Persistence Progress" : runProgress.kind === "refresh" ? "S3 Refresh Progress" : "Aardvark Regeneration Progress"}</div>
                                 <div className="text-slate-500 dark:text-slate-400">{runProgressPercent}%</div>
@@ -2227,7 +2238,7 @@ export const EnrichmentWorkbench: React.FC = () => {
                             </div>
                         </div>
                     )}
-                    <div className="sticky top-0 z-10 rounded-lg border border-gray-200 bg-white/95 p-3 text-xs shadow-sm backdrop-blur dark:border-slate-800 dark:bg-slate-900/95">
+                    <div className="ogm-page-card sticky top-0 z-10 p-3 text-xs">
                         <div className="flex flex-wrap items-center gap-3">
                             <div className="min-w-0 flex-1">
                                 <div className="font-semibold text-slate-900 dark:text-slate-100">Batch Actions</div>
@@ -2240,7 +2251,7 @@ export const EnrichmentWorkbench: React.FC = () => {
                         </div>
                     </div>
                     <div className="grid grid-cols-1 gap-3 lg:grid-cols-[minmax(320px,420px)_1fr]">
-                        <section className="rounded-lg border border-gray-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
+                        <section className="ogm-page-card p-4">
                             <div className="grid grid-cols-1 gap-3 text-xs">
                                 <select value={selectedStorageId} onChange={(e) => setSelectedStorageId(e.target.value)} className="rounded border border-gray-300 bg-white px-2 py-1.5 text-sm dark:border-slate-700 dark:bg-slate-950">
                                     <option value="">Storage profile...</option>
@@ -2388,7 +2399,7 @@ export const EnrichmentWorkbench: React.FC = () => {
                             </div>
                         </section>
 
-                        <section className="min-h-0 rounded-lg border border-gray-200 bg-white dark:border-slate-800 dark:bg-slate-900">
+                        <section className="ogm-page-card min-h-0">
                             <div className="flex flex-wrap items-center gap-2 border-b border-gray-100 px-4 py-3 text-xs dark:border-slate-800">
                                 <h2 className="text-sm font-semibold">Upload Pipeline</h2>
                                 <span className="text-slate-500 dark:text-slate-400">{uploadItems.length} queued · {completedUploadCount} published</span>
@@ -2497,7 +2508,7 @@ export const EnrichmentWorkbench: React.FC = () => {
 
             {activePanel === "config" && (
                 <div className="grid min-h-0 grid-cols-1 gap-4 overflow-auto xl:grid-cols-3">
-                    <section className="rounded-lg border border-gray-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
+                    <section className="ogm-page-card p-4">
                         <div className="mb-3 flex items-center justify-between">
                             <h2 className="text-sm font-semibold">S3-Compatible Storage Profiles</h2>
                             <button type="button" className="rounded bg-slate-100 px-2 py-1 text-xs dark:bg-slate-800" onClick={() => setStorageDraft(blankStorageProfile())}>New</button>
@@ -2513,6 +2524,10 @@ export const EnrichmentWorkbench: React.FC = () => {
                             <input className="rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950" value={storageDraft.bucket} onChange={(e) => setStorageDraft({ ...storageDraft, bucket: e.target.value })} placeholder="Bucket" />
                             <input className="rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950" value={(storageDraft.prefixes || []).join("\n")} onChange={(e) => setStorageDraft({ ...storageDraft, prefixes: e.target.value.split(/\n|,/).map((v) => v.trim()) })} placeholder="Prefixes, comma or newline separated" />
                             <input className="rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950" value={storageDraft.publicBaseUrl || ""} onChange={(e) => setStorageDraft({ ...storageDraft, publicBaseUrl: e.target.value })} placeholder="Optional public base URL" />
+                            <div className="grid grid-cols-1 gap-2 sm:grid-cols-[96px_minmax(0,1fr)]">
+                                <input className="rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950" value={storageDraft.metadataIdPrefix || "unr"} onChange={(e) => setStorageDraft({ ...storageDraft, metadataIdPrefix: cleanMetadataIdPrefix(e.target.value) })} placeholder="unr" aria-label="Metadata ID prefix" />
+                                <input className="rounded border px-2 py-1 dark:border-slate-700 dark:bg-slate-950" value={storageDraft.metadataProvider || ""} onChange={(e) => setStorageDraft({ ...storageDraft, metadataProvider: e.target.value })} placeholder="Metadata provider, e.g. University of Nevada, Reno" aria-label="Metadata provider" />
+                            </div>
                             <p className="rounded-md bg-amber-50 px-2 py-1.5 text-[11px] text-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
                                 Enter environment variable names here, not secret values. Put actual credentials in web/.env or the shell that starts the proxy.
                             </p>
@@ -2533,7 +2548,7 @@ export const EnrichmentWorkbench: React.FC = () => {
                         </div>
                     </section>
 
-                    <section className="rounded-lg border border-gray-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
+                    <section className="ogm-page-card p-4">
                         <div className="mb-3 flex items-center justify-between">
                             <h2 className="text-sm font-semibold">AI Model Profiles</h2>
                             <div className="flex gap-1">
@@ -2585,7 +2600,7 @@ export const EnrichmentWorkbench: React.FC = () => {
                         </div>
                     </section>
 
-                    <section className="rounded-lg border border-gray-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
+                    <section className="ogm-page-card p-4">
                         <div className="mb-3 flex items-center justify-between">
                             <h2 className="text-sm font-semibold">Google Vision OCR Profiles</h2>
                             <button type="button" className="rounded bg-slate-100 px-2 py-1 text-xs dark:bg-slate-800" onClick={() => setVisionDraft(blankVisionProfile())}>New</button>
@@ -2621,7 +2636,7 @@ export const EnrichmentWorkbench: React.FC = () => {
 
             {activePanel === "inventory" && (
                 <div className="flex min-h-0 flex-col gap-3">
-                    <div className="flex flex-wrap items-center gap-3 rounded-lg border border-gray-200 bg-white p-3 dark:border-slate-800 dark:bg-slate-900">
+                    <div className="ogm-page-card flex flex-wrap items-center gap-3 p-3">
                         <select value={selectedStorageId} onChange={(e) => setSelectedStorageId(e.target.value)} className="rounded border border-gray-300 bg-white px-2 py-1 text-sm dark:border-slate-700 dark:bg-slate-950">
                             <option value="">Storage profile...</option>
                             {config.storageProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}
@@ -2637,22 +2652,22 @@ export const EnrichmentWorkbench: React.FC = () => {
                         <span className="ml-auto text-xs text-slate-500 dark:text-slate-400">{inventoryStatus || (inventoryLoadedAt ? `Loaded ${formatDateTime(inventoryLoadedAt)}` : "Bucket not loaded")}</span>
                     </div>
                     <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
-                        <div className="rounded-lg border border-gray-200 bg-white p-3 dark:border-slate-800 dark:bg-slate-900">
+                        <div className="ogm-panel-card p-3">
                             <div className="text-[11px] font-semibold uppercase text-slate-500 dark:text-slate-400">UUIDs</div>
                             <div className="mt-1 text-2xl font-semibold text-slate-900 dark:text-slate-100">{inventoryResources.length.toLocaleString()}</div>
                         </div>
-                        <div className="rounded-lg border border-gray-200 bg-white p-3 dark:border-slate-800 dark:bg-slate-900">
+                        <div className="ogm-panel-card p-3">
                             <div className="text-[11px] font-semibold uppercase text-slate-500 dark:text-slate-400">Complete</div>
                             <div className="mt-1 text-2xl font-semibold text-emerald-700 dark:text-emerald-300">{inventoryCompleteCount.toLocaleString()}</div>
                         </div>
-                        <div className="rounded-lg border border-gray-200 bg-white p-3 dark:border-slate-800 dark:bg-slate-900">
+                        <div className="ogm-panel-card p-3">
                             <div className="text-[11px] font-semibold uppercase text-slate-500 dark:text-slate-400">Needs Attention</div>
                             <div className="mt-1 text-2xl font-semibold text-amber-700 dark:text-amber-300">{inventoryMissingCount.toLocaleString()}</div>
                         </div>
                     </div>
-                    <div className="min-h-0 overflow-auto rounded-lg border border-gray-200 dark:border-slate-800">
-                        <table className="w-full text-left text-xs">
-                            <thead className="sticky top-0 bg-gray-50 dark:bg-slate-900">
+                    <div className="ogm-table-card min-h-0 overflow-auto">
+                        <table className="ogm-table w-full text-left text-xs">
+                            <thead className="sticky top-0">
                                 <tr>
                                     <th className="p-2">UUID</th>
                                     <th className="p-2">Files</th>

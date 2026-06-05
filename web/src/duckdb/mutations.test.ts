@@ -113,6 +113,23 @@ describe('DuckDB Mutations', () => {
 
             expect(mockConn.query).toHaveBeenCalledWith(expect.stringContaining('ST_MakeEnvelope'));
         });
+
+        it('normalizes legacy GeoJSON centroid values before saving overlays', async () => {
+            const resource = {
+                id: 'legacy-centroid',
+                dct_title_s: 'Legacy Centroid',
+                dcat_centroid: '{"type":"Point","coordinates":[-93.361,46.4415]}',
+                extra: {},
+            };
+
+            await upsertResource(resource as any);
+
+            expect(mockConn.query).toHaveBeenCalledWith(expect.stringContaining("'46.4415,-93.361'"));
+            expect(dbInit.saveResourceOverlayToIndexedDB).toHaveBeenCalledWith(expect.objectContaining({
+                id: 'legacy-centroid',
+                dcat_centroid: '46.4415,-93.361',
+            }));
+        });
     });
 
     describe('deleteResource', () => {

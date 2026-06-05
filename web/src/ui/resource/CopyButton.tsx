@@ -12,7 +12,7 @@ export const CopyButton: React.FC<{ text: string }> = ({ text }) => {
     return (
         <button
             onClick={handleCopy}
-            className="flex-shrink-0 p-2 text-slate-500 hover:text-indigo-600 dark:text-slate-400 dark:hover:text-indigo-400 bg-gray-50 dark:bg-slate-800 hover:bg-indigo-50 dark:hover:bg-indigo-900/20 border border-gray-200 dark:border-slate-700 rounded transition-colors"
+            className="ogm-secondary-button flex-shrink-0 p-2"
             title="Copy to clipboard"
         >
             {copied ? (

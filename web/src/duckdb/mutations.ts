@@ -1,5 +1,13 @@
 import { getDuckDbContext, saveResourceDeleteOverlayToIndexedDB, saveResourceOverlayToIndexedDB, saveThumbnailToIndexedDB } from "./dbInit";
-import { Resource, Distribution, SCALAR_FIELDS, REPEATABLE_STRING_FIELDS, resourceToJson } from "../aardvark/model";
+import {
+    Resource,
+    Distribution,
+    SCALAR_FIELDS,
+    REPEATABLE_STRING_FIELDS,
+    normalizeAardvarkCentroid,
+    normalizeAardvarkGeometry,
+    resourceToJson
+} from "../aardvark/model";
 import { buildDctReferencesS } from "../aardvark/mapping";
 import { fetchResourcesByIds } from "./queries";
 import embeddingWorkerUrl from "../workers/embedding.worker?worker&url";
@@ -7,7 +15,7 @@ import { getCentroidFromGeometry, formatCentroid } from "../ui/resource/viewerCo
 import { latLngToCell } from "h3-js";
 import { H3_RES_COLUMNS } from "./schema";
 
-/** Parse dcat_centroid (GeoJSON Point or "[lon,lat]") to [lat, lng] for h3-js, or null. */
+/** Parse dcat_centroid (preferred "lat,lng", legacy GeoJSON Point, or coordinate arrays) to [lat, lng] for h3-js. */
 export function parseCentroidForH3(dcatCentroid: string | null | undefined): [number, number] | null {
     if (!dcatCentroid || String(dcatCentroid).trim() === "") return null;
     const s = String(dcatCentroid).trim();
@@ -127,6 +135,16 @@ export async function upsertResource(resource: Resource, distributions: Distribu
     await conn.query(`DELETE FROM resources_mv WHERE id = '${safeId}'`);
     await conn.query(`DELETE FROM distributions WHERE resource_id = '${safeId}'`);
 
+    const normalizedGeometry = normalizeAardvarkGeometry(resource.locn_geometry);
+    if (normalizedGeometry && normalizedGeometry !== resource.locn_geometry) {
+        resource = { ...resource, locn_geometry: normalizedGeometry };
+    }
+
+    const normalizedCentroid = normalizeAardvarkCentroid(resource.dcat_centroid);
+    if (normalizedCentroid && normalizedCentroid !== resource.dcat_centroid) {
+        resource = { ...resource, dcat_centroid: normalizedCentroid };
+    }
+
     // Populate centroid from geometry when missing
     if (!resource.dcat_centroid || String(resource.dcat_centroid).trim() === "") {
         const centroid = getCentroidFromGeometry(resource);
@@ -172,7 +190,11 @@ export async function upsertResource(resource: Resource, distributions: Distribu
         } else if (resource.locn_geometry) {
             try {
                 const safeGeom = String(resource.locn_geometry).replace(/'/g, "''");
-                await conn.query(`UPDATE resources SET geom = ST_GeomFromGeoJSON('${safeGeom}') WHERE id = '${safeId}'`);
+                const isGeoJson = String(resource.locn_geometry).trim().startsWith("{");
+                const geomExpression = isGeoJson
+                    ? `ST_GeomFromGeoJSON('${safeGeom}')`
+                    : `ST_GeomFromText('${safeGeom}')`;
+                await conn.query(`UPDATE resources SET geom = ${geomExpression} WHERE id = '${safeId}'`);
             } catch (e) {
                 console.warn("Failed to update geom from locn_geometry in upsert", e);
             }

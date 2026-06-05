@@ -76,10 +76,28 @@ function bboxFromGeoJsonText(value) {
   }
 }
 
+function bboxFromWktText(value) {
+  const text = String(value || "").trim();
+  if (!/^(?:MULTI)?POLYGON\s*\(/i.test(text)) return undefined;
+  const numbers = text.match(/[-+]?\d*\.?\d+(?:e[-+]?\d+)?/gi)?.map(Number) || [];
+  if (numbers.length < 4 || numbers.length % 2 !== 0) return undefined;
+  const coordinates = [];
+  for (let index = 0; index + 1 < numbers.length; index += 2) {
+    coordinates.push([numbers[index], numbers[index + 1]]);
+  }
+  return normalizeBbox([
+    Math.min(...coordinates.map((item) => item[0])),
+    Math.min(...coordinates.map((item) => item[1])),
+    Math.max(...coordinates.map((item) => item[0])),
+    Math.max(...coordinates.map((item) => item[1])),
+  ]);
+}
+
 function bboxFromResource(resource) {
   return bboxFromEnvelopeText(resource?.dcat_bbox)
     || bboxFromGeoJsonText(resource?.locn_geometry)
-    || bboxFromEnvelopeText(resource?.locn_geometry);
+    || bboxFromEnvelopeText(resource?.locn_geometry)
+    || bboxFromWktText(resource?.locn_geometry);
 }
 
 function clamp(value, min, max) {

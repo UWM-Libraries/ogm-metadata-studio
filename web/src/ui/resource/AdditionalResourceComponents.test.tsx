@@ -14,6 +14,8 @@ describe('Resource Components Coverage', () => {
             dct_language_sm: ['eng'],
             gbl_resourceClass_sm: ['Map'], // Facetable
             dct_issued_s: '2020',
+            thumbnail: 'blob:http://localhost/thumbnail',
+            extra: { hidden: true },
             _hidden: 'should not show'
         } as any;
 
@@ -41,6 +43,8 @@ describe('Resource Components Coverage', () => {
 
             // Hidden fields ignored
             expect(screen.queryByText('should not show')).toBeNull();
+            expect(screen.queryByText('blob:http://localhost/thumbnail')).toBeNull();
+            expect(screen.queryByText('[object Object]')).toBeNull();
         });
     });
 

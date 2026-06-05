@@ -3,10 +3,11 @@ import maplibregl from 'maplibre-gl';
 import { PMTiles, Protocol } from 'pmtiles';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import { bboxToBounds, geoJsonToBounds, getBoundsFromGeometry, intersectLngLatBbox, type LngLatBbox } from './maplibreBounds';
+import { OPENFREEMAP_BRIGHT_STYLE } from '../../config/mapStyles';
 import { cogInfoArtifactUrl, cogPreviewArtifactUrl, proxiedArtifactUrl } from './artifactProxy';
 import type { GeoJsonGeometry, SelectableGeoJsonFeature } from './geospatialFeature';
 
-const MAP_STYLE = "https://tiles.openfreemap.org/styles/bright";
+const MAP_STYLE = OPENFREEMAP_BRIGHT_STYLE;
 const PMTILES_SOURCE_ID = 'pmtiles-overlay';
 const PMTILES_LAYER_PREFIX = 'pmtiles-overlay-';
 const SELECTION_SOURCE_ID = 'selected-feature-overlay';

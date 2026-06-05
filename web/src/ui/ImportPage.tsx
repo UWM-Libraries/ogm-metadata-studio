@@ -17,7 +17,7 @@ export const ImportPage: React.FC<ImportPageProps> = ({ resourceCount = 0, onImp
     const [repoRootHandle, setRepoRootHandle] = useState<any | null>(null);
     const [repoRootName, setRepoRootName] = useState<string>("");
     const usingStarterArtifact = usingDefaultResourceStarter();
-    const logoUrl = withBasePath("/opengeometadata-bauhaus-logo.svg");
+    const logoUrl = withBasePath("/opengeometadata-map-legend-logo-composite.svg");
 
     const handleExportJsonZip = async () => {
         try {
@@ -159,18 +159,18 @@ export const ImportPage: React.FC<ImportPageProps> = ({ resourceCount = 0, onImp
     };
 
     return (
-        <div className="p-8 max-w-4xl mx-auto space-y-8">
+        <div className="ogm-admin-content max-w-5xl mx-auto space-y-8">
             {resourceCount === 0 && (
-                <div className="rounded-md border-2 border-[#1e1e1e] bg-[#fffdf3] p-8 text-[#141414] shadow-[6px_6px_0_#111111] dark:bg-slate-950 dark:text-[#fffdf3] dark:shadow-[6px_6px_0_#f6d94d]">
+                <div className="ogm-page-card p-8 text-[#141414] dark:text-[#ffffff]">
                     <div className="flex items-start gap-5">
                         <img
                             src={logoUrl}
                             alt="OpenGeoMetadata geometric logo"
-                            className="h-16 w-16 shrink-0 border-2 border-[#111111] bg-[#fffdf3]"
+                            className="h-16 w-16 shrink-0 border-2 border-[#111111] bg-[#ffffff]"
                         />
                         <div>
-                            <h1 className="text-3xl font-extrabold tracking-normal mb-3">Welcome to OpenGeoMetadata Studio!</h1>
-                            <p className="text-lg text-[#5a5547] dark:text-[#fffdf3]/80 max-w-2xl">
+                            <h1 className="mb-3 text-3xl font-black tracking-normal text-[#111111] dark:text-[#f6d94d]">Welcome to OpenGeoMetadata Studio!</h1>
+                            <p className="ogm-page-copy max-w-2xl text-lg">
                                 It looks like your database is empty. To get started, please import some data below.
                                 You can upload CSV/JSON files or connect a GitHub repository.
                             </p>
@@ -179,28 +179,28 @@ export const ImportPage: React.FC<ImportPageProps> = ({ resourceCount = 0, onImp
                 </div>
             )}
 
-            <h1 className="text-2xl font-bold text-slate-900 dark:text-slate-100">Import Data</h1>
+            <h1 className="ogm-page-title text-2xl">Import Data</h1>
 
             {/* Tabs */}
-            <div className="flex border-b border-gray-200 dark:border-slate-800 space-x-6">
+            <div className="ogm-tab-strip">
                 <button
                     onClick={() => setMode("local")}
-                    className={`pb-2 text-sm font-medium border-b-2 transition-colors ${mode === "local" ? "border-[#0057b8] text-[#0057b8] dark:text-[#f6d94d] dark:border-[#f6d94d]" : "border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-300"}`}
+                    className={`ogm-tab-button ${mode === "local" ? "ogm-tab-button-active" : ""}`}
                 >
                     Local File Upload
                 </button>
                 <button
                     onClick={() => setMode("github")}
-                    className={`pb-2 text-sm font-medium border-b-2 transition-colors ${mode === "github" ? "border-[#0057b8] text-[#0057b8] dark:text-[#f6d94d] dark:border-[#f6d94d]" : "border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-300"}`}
+                    className={`ogm-tab-button ${mode === "github" ? "ogm-tab-button-active" : ""}`}
                 >
                     GitHub Import
                 </button>
             </div>
 
             {mode === "local" && (
-                <div className="bg-white dark:bg-slate-900 rounded-lg border border-gray-200 dark:border-slate-800 p-6 shadow-sm">
-                    <h2 className="text-lg font-semibold mb-4 text-slate-900 dark:text-slate-200">1. CSV / JSON / DuckDB Import</h2>
-                    <p className="text-slate-500 dark:text-slate-400 mb-4 text-sm">
+                <div className="ogm-page-card p-6">
+                    <h2 className="ogm-page-card-title mb-4 text-lg">1. CSV / JSON / DuckDB Import</h2>
+                    <p className="ogm-page-copy mb-4">
                         Upload Aardvark-compliant CSV files, OGM Aardvark JSON files, or a <b>.duckdb</b> backup file.
                         Existing records with matching IDs will be updated (CSV/JSON) or replaced (DB Backup).
                     </p>
@@ -214,12 +214,12 @@ export const ImportPage: React.FC<ImportPageProps> = ({ resourceCount = 0, onImp
                             file:mr-4 file:py-2 file:px-4
                             file:rounded-md file:border-2 file:border-[#111111]
                             file:text-sm file:font-semibold
-                            file:bg-[#111111] file:text-[#fffdf3]
+                            file:bg-[#111111] file:text-[#ffffff]
                             hover:file:bg-[#0057b8]
                         "
                     />
                     {status && (
-                        <div className={`mt-6 p-4 rounded-md ${status.startsWith("Error") ? "bg-red-50 dark:bg-red-900/50 text-red-700 dark:text-red-200 border-red-200 dark:border-red-800" : "bg-gray-50 dark:bg-slate-800 text-slate-700 dark:text-slate-200 border-gray-200 dark:border-slate-700"} border`}>
+                        <div className={`ogm-status-card mt-6 p-4 ${status.startsWith("Error") ? "border-[#cf3f32] text-[#cf3f32]" : ""}`}>
                             {status}
                         </div>
                     )}
@@ -227,45 +227,45 @@ export const ImportPage: React.FC<ImportPageProps> = ({ resourceCount = 0, onImp
             )}
 
             {mode === "github" && (
-                <div className="bg-white dark:bg-slate-900 rounded-lg border border-gray-200 dark:border-slate-800 p-6 shadow-sm">
-                    <h2 className="text-lg font-semibold mb-4 text-slate-900 dark:text-slate-200">GitHub Repository Import</h2>
-                    <p className="text-slate-500 dark:text-slate-400 mb-6 text-sm">
+                <div className="ogm-page-card p-6">
+                    <h2 className="ogm-page-card-title mb-4 text-lg">GitHub Repository Import</h2>
+                    <p className="ogm-page-copy mb-6">
                         Scan a GitHub repository for `metadata-aardvark` folders and bulk import JSON records.
                     </p>
                     <GithubImport onImported={onImported} />
                 </div>
             )}
 
-            <div className="bg-white dark:bg-slate-900 rounded-lg border border-gray-200 dark:border-slate-800 p-6 shadow-sm">
-                <h2 className="text-lg font-semibold mb-4 text-slate-900 dark:text-slate-200">2. Export Data</h2>
-                <p className="text-slate-500 dark:text-slate-400 mb-6 text-sm">
+            <div className="ogm-page-card p-6">
+                <h2 className="ogm-page-card-title mb-4 text-lg">2. Export Data</h2>
+                <p className="ogm-page-copy mb-6">
                     Export your data for backup or to commit back to GitHub.
                 </p>
 
-                <div className="flex gap-4">
-                    <div className="flex-1 p-4 bg-gray-50 dark:bg-slate-800 rounded border border-gray-200 dark:border-slate-700">
-                        <h3 className="text-sm font-medium text-slate-900 dark:text-slate-200 mb-2">Download Database (Backup)</h3>
-                        <p className="text-xs text-slate-500 dark:text-slate-400 mb-4">
+                <div className="grid gap-4 md:grid-cols-2">
+                    <div className="ogm-panel-card flex-1 p-4">
+                        <h3 className="ogm-page-card-title mb-2 text-sm">Download Database (Backup)</h3>
+                        <p className="ogm-page-copy mb-4 text-xs">
                             Download the full `records.duckdb` file. Commit this to `web/public/` to save changes permanently.
                         </p>
                         <button
                             onClick={handleSaveDb}
                             disabled={loading}
-                            className="w-full bg-slate-600 text-white px-4 py-2 rounded-md hover:bg-slate-500 disabled:opacity-50 text-sm font-medium transition-colors"
+                            className="ogm-secondary-button w-full"
                         >
                             Download records.duckdb
                         </button>
                     </div>
 
-                    <div className="flex-1 p-4 bg-gray-50 dark:bg-slate-800 rounded border border-gray-200 dark:border-slate-700">
-                        <h3 className="text-sm font-medium text-slate-900 dark:text-slate-200 mb-2">Export OGM JSONs (Publish)</h3>
-                        <p className="text-xs text-slate-500 dark:text-slate-400 mb-4">
+                    <div className="ogm-panel-card flex-1 p-4">
+                        <h3 className="ogm-page-card-title mb-2 text-sm">Export OGM JSONs (Publish)</h3>
+                        <p className="ogm-page-copy mb-4 text-xs">
                             Download a ZIP of individual Aardvark JSON files, ready for the GBL workflow.
                         </p>
                         <button
                             onClick={handleExportJsonZip}
                             disabled={loading}
-                            className="w-full bg-emerald-600 text-white px-4 py-2 rounded-md hover:bg-emerald-500 disabled:opacity-50 text-sm font-medium transition-colors"
+                            className="ogm-primary-button w-full"
                         >
                             {loading ? "Zipping..." : "Download JSON Zip"}
                         </button>
@@ -273,47 +273,47 @@ export const ImportPage: React.FC<ImportPageProps> = ({ resourceCount = 0, onImp
                 </div>
             </div>
 
-            <div className="bg-white dark:bg-slate-900 rounded-lg border border-gray-200 dark:border-slate-800 p-6 shadow-sm">
-                <h2 className="text-lg font-semibold mb-4 text-slate-900 dark:text-slate-200">3. Publish Workflow</h2>
-                <p className="text-slate-500 dark:text-slate-400 mb-6 text-sm">
+            <div className="ogm-page-card p-6">
+                <h2 className="ogm-page-card-title mb-4 text-lg">3. Publish Workflow</h2>
+                <p className="ogm-page-copy mb-6">
                     Choose your local repository root and write the current dataset into <code>web/public/{PARQUET_ARTIFACTS.resources}</code>,
                     <code>web/public/{PARQUET_ARTIFACTS.distributions}</code>, and a DuckDB snapshot at <code>web/public/records.duckdb</code>.
                     After that, all you need to do is commit and push those files. GitHub Pages will rebuild
                     the site with those published artifacts.
                 </p>
                 {usingStarterArtifact && (
-                    <div className="mb-4 rounded-md border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-200">
+                    <div className="ogm-status-card mb-4 p-3 text-xs">
                         <code>{DEFAULT_RESOURCES_PARQUET}</code> is reserved as the empty starter artifact. Set <code>VITE_RESOURCES_PARQUET</code> to a named file before publishing fork data.
                     </div>
                 )}
 
                 <div className="space-y-4">
-                    <div className="rounded border border-gray-200 dark:border-slate-700 bg-gray-50 dark:bg-slate-800 p-4">
+                    <div className="ogm-panel-card p-4">
                         <div className="flex items-center justify-between gap-4">
                             <div>
-                                <h3 className="text-sm font-medium text-slate-900 dark:text-slate-200">Target Repository Folder</h3>
-                                <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+                                <h3 className="ogm-page-card-title text-sm">Target Repository Folder</h3>
+                                <p className="ogm-page-copy mt-1 text-xs">
                                     Pick the local repo root that contains the <code>web/public/</code> folder you want to publish.
                                 </p>
                             </div>
                             <button
                                 onClick={handleChooseRepoRoot}
                                 disabled={loading}
-                                className="rounded-md border-2 border-[#111111] bg-[#f6d94d] px-4 py-2 text-sm font-semibold text-[#111111] hover:bg-[#fffdf3] disabled:opacity-50 dark:border-[#f6d94d] dark:bg-[#f6d94d] dark:hover:bg-[#fffdf3]"
+                                className="ogm-secondary-button"
                             >
                                 {repoRootHandle ? "Choose Different Folder" : "Choose Repo Folder"}
                             </button>
                         </div>
-                        <p className="mt-3 text-xs text-slate-600 dark:text-slate-300">
+                        <p className="ogm-page-copy mt-3 text-xs">
                             {repoRootHandle
                                 ? `Selected: ${repoRootName || "repository root"}`
                                 : "No repository folder selected yet."}
                         </p>
                     </div>
 
-                    <div className="rounded border border-emerald-200 dark:border-emerald-900/50 bg-emerald-50 dark:bg-emerald-950/20 p-4">
-                        <h3 className="text-sm font-medium text-slate-900 dark:text-slate-200">Write Publishable Metadata</h3>
-                        <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 mb-4">
+                    <div className="ogm-panel-card p-4">
+                        <h3 className="ogm-page-card-title text-sm">Write Publishable Metadata</h3>
+                        <p className="ogm-page-copy mt-1 mb-4 text-xs">
                             This writes the current in-browser dataset to <code>web/public/{PARQUET_ARTIFACTS.resources}</code> plus
                             <code>web/public/{PARQUET_ARTIFACTS.distributions}</code>.
                             Once complete, commit and push both files so everyone sees the same dataset on GitHub Pages.
@@ -321,7 +321,7 @@ export const ImportPage: React.FC<ImportPageProps> = ({ resourceCount = 0, onImp
                         <button
                             onClick={handlePublishToMetadata}
                             disabled={loading || !repoRootHandle || resourceCount === 0 || usingStarterArtifact}
-                            className="w-full bg-emerald-600 text-white px-4 py-2 rounded-md hover:bg-emerald-500 disabled:opacity-50 text-sm font-medium transition-colors"
+                            className="ogm-primary-button w-full"
                         >
                             {loading ? "Publishing..." : "Prepare Parquet files for commit"}
                         </button>

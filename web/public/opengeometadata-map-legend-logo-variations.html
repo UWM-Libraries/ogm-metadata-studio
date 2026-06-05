@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>OpenGeoMetadata map legend logo variations</title>
+    <style>
+      :root {
+        color: #171717;
+        background: #fffdf3;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+      }
+
+      main {
+        box-sizing: border-box;
+        width: min(1160px, 100%);
+        margin: 0 auto;
+        padding: 40px 24px;
+      }
+
+      h1 {
+        margin: 0 0 8px;
+        font-size: clamp(30px, 4vw, 52px);
+        line-height: 1;
+        font-weight: 800;
+        letter-spacing: 0;
+      }
+
+      p {
+        max-width: 760px;
+        margin: 0 0 30px;
+        font-size: 17px;
+        line-height: 1.5;
+      }
+
+      .selected {
+        display: grid;
+        grid-template-columns: minmax(220px, 360px) minmax(0, 1fr);
+        gap: 24px;
+        align-items: end;
+        margin-bottom: 34px;
+      }
+
+      .selected img {
+        max-width: 360px;
+      }
+
+      .selected figcaption {
+        margin-top: 0;
+        max-width: 520px;
+        font-size: 18px;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 24px;
+      }
+
+      .option-grid {
+        margin-bottom: 34px;
+      }
+
+      figure {
+        margin: 0;
+      }
+
+      img {
+        display: block;
+        width: 100%;
+        aspect-ratio: 1;
+        background: #fffdf3;
+        border: 1px solid #ded8bf;
+      }
+
+      figcaption {
+        margin-top: 12px;
+        font-size: 15px;
+        line-height: 1.35;
+      }
+
+      strong {
+        display: block;
+        margin-bottom: 3px;
+      }
+
+      h2 {
+        margin: 0 0 18px;
+        font-size: 18px;
+        line-height: 1.2;
+        font-weight: 800;
+        letter-spacing: 0;
+      }
+
+      @media (max-width: 700px) {
+        .selected {
+          grid-template-columns: 1fr;
+        }
+
+        .selected img {
+          max-width: none;
+        }
+
+        .selected figcaption {
+          margin-top: 12px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Map legend logo variations</h1>
+      <p>A selected composite that keeps the Bauhaus grid and uses four recognizable historic map symbols.</p>
+      <figure class="selected">
+        <img src="./opengeometadata-map-legend-logo-composite.svg" alt="Selected composite map legend logo">
+        <figcaption><strong>Selected Composite</strong>Railroad square, spot elevation without numbers, blue bench mark triangle with only the white plus, and a uniform inverted township index.</figcaption>
+      </figure>
+      <h2>Township Grid Alternatives</h2>
+      <div class="grid option-grid">
+        <figure>
+          <img src="./opengeometadata-map-legend-logo-township-plat.svg" alt="Township plat logo alternative">
+          <figcaption><strong>A. Irregular Plat</strong>Parcel-like cadastral blocks with corner monuments instead of repeated rail ties.</figcaption>
+        </figure>
+        <figure>
+          <img src="./opengeometadata-map-legend-logo-township-section-dots.svg" alt="Township section corner logo alternative">
+          <figcaption><strong>B. Section Corners</strong>Thin section lines with a strong outer township boundary and corner dots.</figcaption>
+        </figure>
+        <figure>
+          <img src="./opengeometadata-map-legend-logo-township-frame.svg" alt="Township range frame logo alternative">
+          <figcaption><strong>C. Township/Range</strong>PLSS-style frame with thinner subdivisions and compact T/R marks.</figcaption>
+        </figure>
+        <figure>
+          <img src="./opengeometadata-map-legend-logo-township-index.svg" alt="Township index logo alternative">
+          <figcaption><strong>D. Inverted Index</strong>Uniform cream township index panel inside the black square for stronger contrast from rail.</figcaption>
+        </figure>
+      </div>
+      <h2>Earlier Studies</h2>
+      <div class="grid">
+        <figure>
+          <img src="./opengeometadata-map-legend-logo-survey.svg" alt="Survey control logo variation">
+          <figcaption><strong>1. Survey Control</strong>Triangulation station, control disk, USGS-style bench mark, and township grid.</figcaption>
+        </figure>
+        <figure>
+          <img src="./opengeometadata-map-legend-logo-topographic.svg" alt="Topographic relief logo variation">
+          <figcaption><strong>2. Topographic Relief</strong>Contour lines, spot elevation, bench mark, and hachured relief.</figcaption>
+        </figure>
+        <figure>
+          <img src="./opengeometadata-map-legend-logo-transport-hydro.svg" alt="Transportation and hydrography logo variation">
+          <figcaption><strong>3. Transport + Hydro</strong>Railroad, road junction, bench mark, stream, and bridge.</figcaption>
+        </figure>
+        <figure>
+          <img src="./opengeometadata-map-legend-logo-settlement-boundary.svg" alt="Settlement and boundaries logo variation">
+          <figcaption><strong>4. Settlement + Boundary</strong>School flag, church and cemetery crosses, bench mark, and dashed boundary lines.</figcaption>
+        </figure>
+      </div>
+    </main>
+  </body>
+</html>

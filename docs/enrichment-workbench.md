@@ -2,6 +2,8 @@
 
 The enrichment workbench is an administrator workflow for turning source imagery into reviewed Aardvark drafts.
 
+For the Aardvark field policy used by generated records, including ID prefixes, required fields, controlled values, spatial syntax, and artifact references, see [Metadata Generation](./metadata-generation.md).
+
 ## Local Proxy
 
 Run the proxy from the `web/` directory:

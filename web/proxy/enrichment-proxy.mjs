@@ -130,6 +130,34 @@ function safeJsonStringify(value, space) {
   }, space);
 }
 
+function cleanMetadataIdPrefix(value) {
+  const cleaned = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return cleaned || "unr";
+}
+
+function effectiveBatchDefaults(batchDefaults = {}, storageProfile = {}) {
+  const metadataIdPrefix = cleanMetadataIdPrefix(
+    batchDefaults.metadataIdPrefix ||
+    storageProfile.metadataIdPrefix ||
+    process.env.OGM_METADATA_ID_PREFIX ||
+    "unr"
+  );
+  return {
+    ...batchDefaults,
+    metadataIdPrefix,
+    provider: String(batchDefaults.provider || storageProfile.metadataProvider || storageProfile.name || "").trim(),
+  };
+}
+
+function generatedAardvarkResourceId(storageProfile = {}, batchDefaults = {}) {
+  const prefix = effectiveBatchDefaults(batchDefaults, storageProfile).metadataIdPrefix;
+  return `${prefix}-${crypto.randomUUID()}`;
+}
+
 function sha256Text(value) {
   return crypto.createHash("sha256").update(String(value || "")).digest("hex");
 }
@@ -301,13 +329,21 @@ async function loadConfig() {
     const parsed = JSON.parse(text);
     const modelProfiles = Array.isArray(parsed.modelProfiles) ? parsed.modelProfiles : DEFAULT_CONFIG.modelProfiles;
     return {
-      storageProfiles: Array.isArray(parsed.storageProfiles) ? parsed.storageProfiles : [],
+      storageProfiles: normalizeStorageProfiles(parsed.storageProfiles),
       visionProfiles: Array.isArray(parsed.visionProfiles) ? parsed.visionProfiles : [],
       modelProfiles: mergeDefaultModelProfiles(modelProfiles),
     };
   } catch {
     return DEFAULT_CONFIG;
   }
+}
+
+function normalizeStorageProfiles(profiles) {
+  return (Array.isArray(profiles) ? profiles : []).map((profile) => ({
+    ...profile,
+    metadataIdPrefix: cleanMetadataIdPrefix(profile?.metadataIdPrefix || process.env.OGM_METADATA_ID_PREFIX || "unr"),
+    metadataProvider: String(profile?.metadataProvider || "").trim(),
+  }));
 }
 
 function mergeDefaultModelProfiles(profiles) {
@@ -321,7 +357,7 @@ function mergeDefaultModelProfiles(profiles) {
 
 async function saveConfig(config) {
   const normalized = {
-    storageProfiles: Array.isArray(config.storageProfiles) ? config.storageProfiles : [],
+    storageProfiles: normalizeStorageProfiles(config.storageProfiles),
     visionProfiles: Array.isArray(config.visionProfiles) ? config.visionProfiles : [],
     modelProfiles: Array.isArray(config.modelProfiles) ? config.modelProfiles : DEFAULT_CONFIG.modelProfiles,
   };
@@ -3846,24 +3882,130 @@ async function createIiifLevel0Package(profile, keys, buffer, log = () => undefi
   };
 }
 
+function formatDecimalCoordinate(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "";
+  return String(Math.round(number * 1_000_000_000) / 1_000_000_000);
+}
+
+function normalizedBboxObject(value) {
+  if (!value) return null;
+  const west = Number(value.west);
+  const east = Number(value.east);
+  const north = Number(value.north);
+  const south = Number(value.south);
+  if (![west, east, north, south].every(Number.isFinite)) return null;
+  if (west < -180 || east > 180 || south < -90 || north > 90 || west > east || south > north) return null;
+  return { west, east, north, south };
+}
+
+function bboxToAardvarkEnvelope(bbox) {
+  const normalized = normalizedBboxObject(bbox);
+  if (!normalized) return "";
+  return `ENVELOPE(${formatDecimalCoordinate(normalized.west)},${formatDecimalCoordinate(normalized.east)},${formatDecimalCoordinate(normalized.north)},${formatDecimalCoordinate(normalized.south)})`;
+}
+
+function bboxToAardvarkPolygonWkt(bbox) {
+  const normalized = normalizedBboxObject(bbox);
+  if (!normalized) return "";
+  const west = formatDecimalCoordinate(normalized.west);
+  const east = formatDecimalCoordinate(normalized.east);
+  const north = formatDecimalCoordinate(normalized.north);
+  const south = formatDecimalCoordinate(normalized.south);
+  return `POLYGON((${west} ${south}, ${east} ${south}, ${east} ${north}, ${west} ${north}, ${west} ${south}))`;
+}
+
+function bboxToAardvarkCentroid(bbox) {
+  const normalized = normalizedBboxObject(bbox);
+  if (!normalized) return "";
+  const lon = (normalized.west + normalized.east) / 2;
+  const lat = (normalized.north + normalized.south) / 2;
+  return `${formatDecimalCoordinate(lat)},${formatDecimalCoordinate(lon)}`;
+}
+
+function bboxFromEnvelopeText(value) {
+  const text = String(value || "").trim();
+  const match = text.match(/^ENVELOPE\s*\(([^)]+)\)$/i);
+  if (!match) return null;
+  const parts = match[1].split(",").map((item) => Number(item.trim()));
+  if (parts.length < 4) return null;
+  const [west, east, north, south] = parts;
+  return normalizedBboxObject({ west, east, north, south });
+}
+
+function collectCoordinatePairs(value, output = []) {
+  if (!Array.isArray(value)) return output;
+  if (value.length >= 2 && typeof value[0] === "number" && typeof value[1] === "number") {
+    output.push([value[0], value[1]]);
+    return output;
+  }
+  for (const child of value) collectCoordinatePairs(child, output);
+  return output;
+}
+
+function bboxFromCoordinatePairs(coordinates) {
+  const valid = coordinates
+    .map(([lon, lat]) => [Number(lon), Number(lat)])
+    .filter(([lon, lat]) => Number.isFinite(lon) && Number.isFinite(lat));
+  if (valid.length === 0) return null;
+  return normalizedBboxObject({
+    west: Math.min(...valid.map(([lon]) => lon)),
+    east: Math.max(...valid.map(([lon]) => lon)),
+    south: Math.min(...valid.map(([, lat]) => lat)),
+    north: Math.max(...valid.map(([, lat]) => lat)),
+  });
+}
+
+function bboxFromGeoJsonText(value) {
+  if (!value || typeof value !== "string") return null;
+  try {
+    const parsed = JSON.parse(value);
+    const direct = Array.isArray(parsed?.bbox) && parsed.bbox.length >= 4
+      ? normalizedBboxObject({ west: parsed.bbox[0], south: parsed.bbox[1], east: parsed.bbox[2], north: parsed.bbox[3] })
+      : null;
+    if (direct) return direct;
+    return bboxFromCoordinatePairs(collectCoordinatePairs(parsed?.coordinates));
+  } catch {
+    return null;
+  }
+}
+
+function bboxFromWktText(value) {
+  const text = String(value || "").trim();
+  if (!/^(?:MULTI)?POLYGON\s*\(/i.test(text)) return null;
+  const numberMatches = text.match(/[-+]?\d*\.?\d+(?:e[-+]?\d+)?/gi) || [];
+  const coordinates = [];
+  for (let index = 0; index + 1 < numberMatches.length; index += 2) {
+    coordinates.push([Number(numberMatches[index]), Number(numberMatches[index + 1])]);
+  }
+  return bboxFromCoordinatePairs(coordinates);
+}
+
+function bboxFromAardvarkGeometryText(value) {
+  return bboxFromEnvelopeText(value) || bboxFromGeoJsonText(value) || bboxFromWktText(value);
+}
+
+function normalizeAardvarkSpatialFields(resource) {
+  const bbox = bboxFromEnvelopeText(resource?.dcat_bbox) || bboxFromAardvarkGeometryText(resource?.locn_geometry);
+  if (!bbox) return resource;
+  return {
+    ...resource,
+    dcat_bbox: bboxToAardvarkEnvelope(bbox),
+    locn_geometry: bboxToAardvarkPolygonWkt(bbox),
+    dcat_centroid: bboxToAardvarkCentroid(bbox),
+    gbl_georeferenced_b: true,
+  };
+}
+
 function bboxFields(extraction) {
   const bbox = extraction?.map_bbox_estimate;
-  if (!bbox || Number(bbox.confidence || 0) <= 0 || ![bbox.west, bbox.east, bbox.north, bbox.south].every((v) => typeof v === "number")) {
+  if (!bbox || Number(bbox.confidence || 0) <= 0 || !normalizedBboxObject(bbox)) {
     return { bboxString: "", locnGeometry: "", centroid: "" };
   }
   return {
-    bboxString: `ENVELOPE(${bbox.west},${bbox.east},${bbox.north},${bbox.south})`,
-    locnGeometry: safeJsonStringify({
-      type: "Polygon",
-      coordinates: [[
-        [bbox.west, bbox.north],
-        [bbox.east, bbox.north],
-        [bbox.east, bbox.south],
-        [bbox.west, bbox.south],
-        [bbox.west, bbox.north],
-      ]],
-    }),
-    centroid: safeJsonStringify({ type: "Point", coordinates: [(bbox.west + bbox.east) / 2, (bbox.north + bbox.south) / 2] }),
+    bboxString: bboxToAardvarkEnvelope(bbox),
+    locnGeometry: bboxToAardvarkPolygonWkt(bbox),
+    centroid: bboxToAardvarkCentroid(bbox),
   };
 }
 
@@ -3886,7 +4028,7 @@ const aardvarkResourceSchemaProperties = {
   dct_temporal_sm: stringArraySchema,
   dct_issued_s: { type: "string" },
   gbl_indexYear_im: { type: ["integer", "null"] },
-  gbl_dateRange_drsim: stringArraySchema,
+  gbl_dateRange_drsim: { type: "string" },
   dct_spatial_sm: stringArraySchema,
   locn_geometry: { type: "string" },
   dcat_bbox: { type: "string" },
@@ -3955,7 +4097,6 @@ const AARDVARK_ARRAY_FIELDS = [
   "dcat_theme_sm",
   "dcat_keyword_sm",
   "dct_temporal_sm",
-  "gbl_dateRange_drsim",
   "dct_spatial_sm",
   "dct_identifier_sm",
   "dct_rights_sm",
@@ -3974,6 +4115,7 @@ const AARDVARK_STRING_FIELDS = [
   "dct_title_s",
   "schema_provider_s",
   "dct_issued_s",
+  "gbl_dateRange_drsim",
   "locn_geometry",
   "dcat_bbox",
   "dcat_centroid",
@@ -4005,6 +4147,153 @@ function asNumberArray(value) {
   return Array.from(new Set(values
     .map((item) => Number(item))
     .filter((item) => Number.isInteger(item) && item >= 0)));
+}
+
+const AARDVARK_RESOURCE_CLASS_VALUES = ["Collections", "Datasets", "Imagery", "Maps", "Web services", "Websites", "Other"];
+const AARDVARK_THEME_VALUES = [
+  "Agriculture",
+  "Biology",
+  "Boundaries",
+  "Climate",
+  "Economy",
+  "Elevation",
+  "Environment",
+  "Events",
+  "Geology",
+  "Health",
+  "Imagery",
+  "Inland Waters",
+  "Land Cover",
+  "Location",
+  "Military",
+  "Oceans",
+  "Property",
+  "Society",
+  "Structure",
+  "Transportation",
+  "Utilities",
+];
+const AARDVARK_FORMAT_VALUES = [
+  "ArcGRID",
+  "CD-ROM",
+  "DEM",
+  "DVD-ROM",
+  "Feature Class",
+  "Geodatabase",
+  "GeoJPEG",
+  "GeoJSON",
+  "GeoPackage",
+  "GeoPDF",
+  "GeoTIFF",
+  "JPEG",
+  "JPEG2000",
+  "KML",
+  "KMZ",
+  "LAS",
+  "LAZ",
+  "Mixed",
+  "MrSID",
+  "PDF",
+  "PNG",
+  "Pulsewaves",
+  "Raster Dataset",
+  "Shapefile",
+  "SQLite Database",
+  "Tabular Data",
+  "TIFF",
+];
+
+function normalizeControlledValues(values, allowedValues, fallback = []) {
+  const allowedByLower = new Map(allowedValues.map((value) => [value.toLowerCase(), value]));
+  const normalized = asStringArray(values)
+    .map((value) => allowedByLower.get(value.toLowerCase()))
+    .filter(Boolean);
+  return normalized.length > 0 ? uniqueStrings(normalized) : fallback;
+}
+
+function normalizeAccessRights(value, fallback = "Public") {
+  const text = String(value || "").trim();
+  return text === "Public" || text === "Restricted" ? text : fallback;
+}
+
+function normalizeLanguageValues(values) {
+  return asStringArray(values)
+    .map((value) => {
+      const text = String(value || "").trim();
+      const lower = text.toLowerCase();
+      const aliases = {
+        english: "eng",
+        french: "fre",
+        spanish: "spa",
+        german: "ger",
+        italian: "ita",
+        latin: "lat",
+        multiple: "mul",
+      };
+      return aliases[lower] || lower;
+    })
+    .filter((value) => /^[a-z]{3}$/.test(value));
+}
+
+function normalizeFormatFromText(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const lower = raw.toLowerCase();
+  const exact = AARDVARK_FORMAT_VALUES.find((item) => item.toLowerCase() === lower);
+  if (exact) return exact;
+  if (/image\/jpe?g|\.jpe?g$/i.test(raw)) return "JPEG";
+  if (/image\/png|\.png$/i.test(raw)) return "PNG";
+  if (/image\/tiff?|\.tiff?$/i.test(raw)) return "TIFF";
+  if (/image\/(?:jp2|j2k|jpeg2000)|\.j(?:p2|2k)$/i.test(raw)) return "JPEG2000";
+  if (/application\/pdf|\.pdf$/i.test(raw)) return "PDF";
+  if (/geo\s*tiff|cog|cloud optimized geotiff|\.cog\.tiff?$/i.test(raw)) return "GeoTIFF";
+  if (/geo\s*json|application\/(?:geo\+)?json|\.geojson$/i.test(raw)) return "GeoJSON";
+  if (/geo\s*package|geopackage|\.gpkg$/i.test(raw)) return "GeoPackage";
+  if (/shape\s*file|esri shapefile|\.shp(?:\.zip)?$/i.test(raw)) return "Shapefile";
+  if (/mr\s*sid|\.sid$/i.test(raw)) return "MrSID";
+  if (/sqlite|spatialite|\.sqlite$/i.test(raw)) return "SQLite Database";
+  if (/csv|tsv|tabular|spreadsheet|\.csv$/i.test(raw)) return "Tabular Data";
+  if (/raster|erdas|\.img$/i.test(raw)) return "Raster Dataset";
+  if (/mixed|zip|package|archive/i.test(raw)) return "Mixed";
+  return raw;
+}
+
+function formatLabelFromFileName(fileName, georeferenced = false) {
+  const lower = String(fileName || "").toLowerCase();
+  if (/\.cog\.tiff?$/.test(lower)) return "GeoTIFF";
+  if (/\.tiff?$/.test(lower)) return georeferenced ? "GeoTIFF" : "TIFF";
+  if (/\.jpe?g$/.test(lower)) return "JPEG";
+  if (/\.png$/.test(lower)) return "PNG";
+  if (/\.(jp2|j2k)$/.test(lower)) return "JPEG2000";
+  if (/\.pdf$/.test(lower)) return "PDF";
+  if (/\.geojson$/.test(lower)) return "GeoJSON";
+  if (/\.gpkg$/.test(lower)) return "GeoPackage";
+  if (/\.sid$/.test(lower)) return "MrSID";
+  if (/\.csv$/.test(lower)) return "Tabular Data";
+  if (/\.shp$/.test(lower) || /\.zip$/.test(lower)) return "Shapefile";
+  return "";
+}
+
+function normalizeAardvarkFormat(value, { fileName = "", contentType = "", georeferenced = false } = {}) {
+  const fromValue = normalizeFormatFromText(value);
+  if (fromValue && fromValue !== "Mixed") return fromValue === "TIFF" && georeferenced ? "GeoTIFF" : fromValue;
+  const fromContentType = normalizeFormatFromText(contentType);
+  if (fromContentType) {
+    if (fromContentType === "TIFF" && georeferenced) return "GeoTIFF";
+    return fromContentType;
+  }
+  const fromFileName = formatLabelFromFileName(fileName, georeferenced);
+  return fromFileName || fromValue || "Mixed";
+}
+
+function datasetResourceType(manifest) {
+  const geometryType = String(manifest?.dataset?.geometryType || "").trim().toLowerCase();
+  if (String(manifest?.dataset?.kind || "").toLowerCase() === "raster") return "Raster data";
+  if (geometryType.includes("point")) return "Point data";
+  if (geometryType.includes("line") || geometryType.includes("polyline")) return "Line data";
+  if (geometryType.includes("polygon")) return "Polygon data";
+  if (geometryType.includes("table")) return "Table data";
+  return "Table data";
 }
 
 function extractionEvidenceText(extraction) {
@@ -4102,21 +4391,32 @@ function normalizeAardvarkResource(candidate, fallback, context) {
   if (!next.dct_issued_s && inferred.issued) next.dct_issued_s = inferred.issued;
   if ((next.dct_publisher_sm || []).length === 0 && inferred.publisher) next.dct_publisher_sm = [inferred.publisher];
   if ((next.dct_creator_sm || []).length === 0 && inferred.creator) next.dct_creator_sm = [inferred.creator];
+  if (!String(next.schema_provider_s || "").trim()) {
+    next.schema_provider_s = String(fallback.schema_provider_s || context.batchDefaults?.provider || "OpenGeoMetadata Studio").trim();
+  }
+  if ((next.dct_description_sm || []).length === 0) {
+    next.dct_description_sm = [next.dct_title_s].filter(Boolean);
+  }
 
   const issuedYear = normalizeIndexYear(next.gbl_indexYear_im) || normalizeIndexYear(next.dct_issued_s);
   next.gbl_indexYear_im = issuedYear;
   if (issuedYear && (next.dct_temporal_sm || []).length === 0) next.dct_temporal_sm = [String(issuedYear)];
-  if (issuedYear && (next.gbl_dateRange_drsim || []).length === 0) next.gbl_dateRange_drsim = [`[${issuedYear} TO ${issuedYear}]`];
+  if (issuedYear && !String(next.gbl_dateRange_drsim || "").trim()) next.gbl_dateRange_drsim = `[${issuedYear} TO ${issuedYear}]`;
 
-  const allowedClass = new Set(["Datasets", "Maps", "Imagery", "Collections", "Websites", "Web services", "Other"]);
-  next.gbl_resourceClass_sm = (next.gbl_resourceClass_sm || []).filter((value) => allowedClass.has(value));
-  if (next.gbl_resourceClass_sm.length === 0) next.gbl_resourceClass_sm = fallback.gbl_resourceClass_sm || ["Maps"];
+  next.gbl_resourceClass_sm = normalizeControlledValues(next.gbl_resourceClass_sm, AARDVARK_RESOURCE_CLASS_VALUES, fallback.gbl_resourceClass_sm || ["Maps"]);
   if ((next.gbl_resourceType_sm || []).length === 0) next.gbl_resourceType_sm = fallback.gbl_resourceType_sm || ["Topographic maps"];
+  next.dcat_theme_sm = normalizeControlledValues(next.dcat_theme_sm, AARDVARK_THEME_VALUES, fallback.dcat_theme_sm || ["Location"]);
+  next.dct_language_sm = normalizeLanguageValues(next.dct_language_sm);
+  next.dct_accessRights_s = normalizeAccessRights(next.dct_accessRights_s, normalizeAccessRights(fallback.dct_accessRights_s, "Public"));
+  next.dct_format_s = normalizeAardvarkFormat(next.dct_format_s || fallback.dct_format_s, {
+    fileName: context.fileName,
+    contentType: context.contentType,
+    georeferenced: Boolean(next.gbl_georeferenced_b),
+  });
 
   next.id = context.resourceId;
   next.gbl_mdVersion_s = "Aardvark";
   next.gbl_mdModified_dt = new Date().toISOString();
-  next.dct_accessRights_s = ["Public", "Restricted"].includes(next.dct_accessRights_s) ? next.dct_accessRights_s : fallback.dct_accessRights_s;
   next.dct_references_s = fallback.dct_references_s;
   next.dct_identifier_sm = uniqueStrings([context.resourceId, context.checksum, ...(next.dct_identifier_sm || [])]);
   next.dct_source_sm = uniqueStrings([context.artifacts.originalUrl, ...(context.metadataSourceUrls || []), ...(next.dct_source_sm || [])]);
@@ -4126,7 +4426,7 @@ function normalizeAardvarkResource(candidate, fallback, context) {
   next.gbl_georeferenced_b = Boolean(next.dcat_bbox || next.locn_geometry);
   next.gbl_suppressed_b = Boolean(next.gbl_suppressed_b);
   delete next.extra;
-  return next;
+  return normalizeAardvarkSpatialFields(next);
 }
 
 function normalizeMetadataDocuments(documents) {
@@ -4234,13 +4534,13 @@ function resourceHasGeometry(resource) {
 function applyManifestGeometry(resource, manifest) {
   const bbox = manifest?.dataset?.bbox;
   if (!bbox) return resource;
-  return {
+  return normalizeAardvarkSpatialFields({
     ...resource,
     dcat_bbox: resource.dcat_bbox || bboxToAardvarkEnvelope(bbox),
-    locn_geometry: resource.locn_geometry || bboxToPolygonJson(bbox),
-    dcat_centroid: resource.dcat_centroid || bboxToCentroidJson(bbox),
+    locn_geometry: resource.locn_geometry || bboxToAardvarkPolygonWkt(bbox),
+    dcat_centroid: resource.dcat_centroid || bboxToAardvarkCentroid(bbox),
     gbl_georeferenced_b: true,
-  };
+  });
 }
 
 function applyExtractionGeometry(resource, extraction) {
@@ -5851,33 +6151,6 @@ function geojsonFromShapefile(shpBuffer, dbf, manifest) {
   };
 }
 
-function bboxToAardvarkEnvelope(bbox) {
-  if (!bbox) return "";
-  return `ENVELOPE(${bbox.west},${bbox.east},${bbox.north},${bbox.south})`;
-}
-
-function bboxToPolygonJson(bbox) {
-  if (!bbox) return "";
-  return safeJsonStringify({
-    type: "Polygon",
-    coordinates: [[
-      [bbox.west, bbox.north],
-      [bbox.east, bbox.north],
-      [bbox.east, bbox.south],
-      [bbox.west, bbox.south],
-      [bbox.west, bbox.north],
-    ]],
-  });
-}
-
-function bboxToCentroidJson(bbox) {
-  if (!bbox) return "";
-  return safeJsonStringify({
-    type: "Point",
-    coordinates: [(bbox.west + bbox.east) / 2, (bbox.north + bbox.south) / 2],
-  });
-}
-
 function metadataXmlSummary(xml) {
   if (!xml) return null;
   const metaId = (xml.match(/<MetaID>([\s\S]*?)<\/MetaID>/i)?.[1] || "").trim();
@@ -6417,23 +6690,31 @@ function buildAardvarkForGeospatialPackage({ resourceId, checksum, fileName, fil
   return {
     id: resourceId,
     dct_title_s: title,
-    dct_accessRights_s: String(batchDefaults.accessRights || "Public"),
-    dct_format_s: isRaster ? manifest.dataset.sourceFormat : "Shapefile",
+    dct_accessRights_s: normalizeAccessRights(batchDefaults.accessRights, "Public"),
+    dct_format_s: normalizeAardvarkFormat(isRaster ? manifest.dataset.sourceFormat : "Shapefile", { fileName, georeferenced: Boolean(bbox) }),
     gbl_mdVersion_s: "Aardvark",
-    schema_provider_s: String(batchDefaults.provider || ""),
+    schema_provider_s: String(batchDefaults.provider || "OpenGeoMetadata Studio"),
     dct_issued_s: manifest.sidecarMetadata?.createDate ? manifest.sidecarMetadata.createDate.slice(0, 4) : "",
     dct_alternative_sm: [],
     dct_description_sm: [description].filter(Boolean),
-    dct_language_sm: batchDefaults.language ? [String(batchDefaults.language)] : [],
+    dct_language_sm: normalizeLanguageValues(batchDefaults.language ? [String(batchDefaults.language)] : []),
     gbl_displayNote_sm: manifest.derivatives?.some((item) => item.status === "missing_dependency")
       ? ["Some cloud-optimized derivatives were not generated because local geospatial command-line tools are missing."]
       : [],
     dct_creator_sm: batchDefaults.creator ? [String(batchDefaults.creator)] : [],
     dct_publisher_sm: batchDefaults.publisher ? [String(batchDefaults.publisher)] : [],
     gbl_resourceClass_sm: ["Datasets"],
-    gbl_resourceType_sm: [isRaster ? "Raster data" : `${manifest.dataset.geometryType} data`.replace("Polygon data", "Polygon data")],
+    gbl_resourceType_sm: [datasetResourceType(manifest)],
     dct_subject_sm: Array.isArray(batchDefaults.subjects) ? batchDefaults.subjects.map(String) : [],
-    dcat_theme_sm: Array.from(new Set([...(Array.isArray(batchDefaults.themes) ? batchDefaults.themes.map(String) : []), "Imagery", "Location"])),
+    dcat_theme_sm: normalizeControlledValues(
+      [
+        ...(Array.isArray(batchDefaults.themes) ? batchDefaults.themes.map(String) : []),
+        ...(isRaster ? ["Imagery"] : []),
+        "Location",
+      ],
+      AARDVARK_THEME_VALUES,
+      ["Location"]
+    ),
     dcat_keyword_sm: [
       "automated metadata",
       isRaster ? "geospatial raster" : "geospatial package",
@@ -6442,12 +6723,12 @@ function buildAardvarkForGeospatialPackage({ resourceId, checksum, fileName, fil
       ...Object.keys(manifest.attributes?.stats || {}).slice(0, 8),
     ],
     dct_temporal_sm: temporalYears,
-    gbl_dateRange_drsim: firstYear ? [`[${Math.min(...temporalYears.map(Number))} TO ${Math.max(...temporalYears.map(Number))}]`] : [],
+    gbl_dateRange_drsim: firstYear ? `[${Math.min(...temporalYears.map(Number))} TO ${Math.max(...temporalYears.map(Number))}]` : "",
     gbl_indexYear_im: firstYear,
     dct_spatial_sm: spatialNames,
-    locn_geometry: bboxToPolygonJson(bbox),
+    locn_geometry: bboxToAardvarkPolygonWkt(bbox),
     dcat_bbox: bboxToAardvarkEnvelope(bbox),
-    dcat_centroid: bboxToCentroidJson(bbox),
+    dcat_centroid: bboxToAardvarkCentroid(bbox),
     gbl_georeferenced_b: Boolean(bbox),
     dct_identifier_sm: [resourceId, checksum, fileName],
     gbl_wxsIdentifier_s: "",
@@ -7101,6 +7382,8 @@ const OGM_AARDVARK_CONTROLLED_VALUE_GUIDANCE = [
   "- gbl_resourceClass_sm: choose only from Collections, Datasets, Imagery, Maps, Web services, Websites, Other. For a scanned or digitized map image, normally use [\"Maps\"]. Use Imagery only for aerial, satellite, or photographic imagery. Use Datasets only for GIS/vector/raster data products.",
   "- gbl_resourceType_sm: for scanned maps, prefer Library of Congress cartographic genre terms. Use Cartographic materials when no more specific term is supported. Common scanned-map terms include World maps, Thematic maps, Nautical charts, Topographic maps, Road maps, Fire insurance maps, Cadastral maps, Geological maps, Pictorial maps, Wall maps, Atlases, Aerial photographs, and Aerial views. Use OpenGeoMetadata data-type terms such as Raster data, Point data, Line data, Polygon data, and Table data only for geospatial datasets, not scanned map images.",
   "- dcat_theme_sm: choose only from Agriculture, Biology, Boundaries, Climate, Economy, Elevation, Environment, Events, Geology, Health, Imagery, Inland Waters, Land Cover, Location, Military, Oceans, Property, Society, Structure, Transportation, Utilities. Pick one to three values supported by the map evidence. For general maps use Location; add Transportation for routes, railroads, roads, shipping, or charts; Oceans for ocean/nautical content; Elevation for relief/topographic content; Boundaries for administrative boundaries; Economy for commerce/trade; Imagery only for imagery; Land Cover only for classified land cover.",
+  "- gbl_dateRange_drsim: return a single Solr date range string like \"[1952 TO 1952]\", not an array containing that string.",
+  "- locn_geometry: use WKT or ENVELOPE syntax. dcat_centroid: use \"latitude,longitude\". Do not return GeoJSON strings for either field.",
   "- If batch defaults or the base record conflict with the controlled value guidance, replace them with the best OGM-preferred value supported by evidence.",
 ].join("\n");
 
@@ -7246,7 +7529,8 @@ async function callGeospatialAardvarkMetadataWriter(modelProfile, request, conte
 }
 
 async function completeGeospatialProcessing({ storageProfile, modelProfile, body, fileName, checksum, fileSize, analysis, uploadOriginal, log, milestones }) {
-  const resourceId = `geodata-${checksum.slice(0, 16)}`;
+  const batchDefaults = effectiveBatchDefaults(body.batchDefaults || {}, storageProfile);
+  const resourceId = body.resourceId || generatedAardvarkResourceId(storageProfile, batchDefaults);
   const keys = geospatialUploadKeys(storageProfile, resourceId, fileName);
   const artifacts = {
     originalUrl: accessUrlFor(storageProfile, keys.original),
@@ -7348,7 +7632,7 @@ async function completeGeospatialProcessing({ storageProfile, modelProfile, body
     fileName,
     fileSize,
     manifest: analysis.manifest,
-    batchDefaults: body.batchDefaults || {},
+    batchDefaults,
     artifacts: finalArtifacts,
   });
 
@@ -7359,7 +7643,7 @@ async function completeGeospatialProcessing({ storageProfile, modelProfile, body
     writer = await callGeospatialAardvarkMetadataWriter(modelProfile, body, {
       manifest: analysis.manifest,
       baseResource,
-      batchDefaults: body.batchDefaults || {},
+      batchDefaults,
       artifacts: finalArtifacts,
       fileName,
       checksum,
@@ -7371,6 +7655,7 @@ async function completeGeospatialProcessing({ storageProfile, modelProfile, body
       artifacts: finalArtifacts,
       fileName,
       fallbackTitle: baseResource.dct_title_s,
+      batchDefaults,
     });
     log("Geospatial Aardvark metadata writer complete", { title: resource.dct_title_s });
   } catch (error) {
@@ -7381,6 +7666,7 @@ async function completeGeospatialProcessing({ storageProfile, modelProfile, body
       artifacts: finalArtifacts,
       fileName,
       fallbackTitle: baseResource.dct_title_s,
+      batchDefaults,
     });
   }
 
@@ -7412,6 +7698,7 @@ async function processGeospatialPackage(config, body) {
   const { log, milestones } = createUploadLogger(jobId, fileName);
   const storageProfile = findProfile(config, "storage", body.storageProfileId);
   const modelProfile = findProfile(config, "model", body.modelProfileId);
+  const batchDefaults = effectiveBatchDefaults(body.batchDefaults || {}, storageProfile);
   const checksum = String(body.checksum || body.file?.checksum || "");
   if (!checksum) throw new Error("Geospatial package request is missing a checksum.");
   const buffer = Buffer.from(String(body.file?.base64 || ""), "base64");
@@ -7614,24 +7901,24 @@ function buildAardvarkForUpload({ resourceId, checksum, fileName, fileSize, cont
   const resource = {
     id: resourceId,
     dct_title_s: String(batchDefaults.titlePrefix ? `${batchDefaults.titlePrefix}: ${titleText || fallbackTitle}` : titleText || fallbackTitle),
-    dct_accessRights_s: String(batchDefaults.accessRights || "Public"),
-    dct_format_s: contentType,
+    dct_accessRights_s: normalizeAccessRights(batchDefaults.accessRights, "Public"),
+    dct_format_s: normalizeAardvarkFormat("", { fileName, contentType, georeferenced: Boolean(artifacts.cogUrl) }),
     gbl_mdVersion_s: "Aardvark",
-    schema_provider_s: String(batchDefaults.provider || ""),
+    schema_provider_s: String(batchDefaults.provider || "OpenGeoMetadata Studio"),
     dct_issued_s: String(batchDefaults.issued || ""),
     dct_alternative_sm: [],
     dct_description_sm: [extraction?.description || ""].filter(Boolean),
-    dct_language_sm: batchDefaults.language ? [batchDefaults.language] : [],
+    dct_language_sm: normalizeLanguageValues(batchDefaults.language ? [batchDefaults.language] : []),
     gbl_displayNote_sm: [],
     dct_creator_sm: batchDefaults.creator ? [batchDefaults.creator] : [],
     dct_publisher_sm: batchDefaults.publisher ? [batchDefaults.publisher] : [],
-    gbl_resourceClass_sm: Array.isArray(batchDefaults.resourceClass) ? batchDefaults.resourceClass.map(String) : ["Maps"],
+    gbl_resourceClass_sm: normalizeControlledValues(batchDefaults.resourceClass, AARDVARK_RESOURCE_CLASS_VALUES, ["Maps"]),
     gbl_resourceType_sm: Array.isArray(batchDefaults.resourceType) ? batchDefaults.resourceType.map(String) : ["Cartographic materials"],
     dct_subject_sm: Array.isArray(batchDefaults.subjects) ? batchDefaults.subjects.map(String) : [],
-    dcat_theme_sm: Array.isArray(batchDefaults.themes) ? batchDefaults.themes.map(String) : [],
+    dcat_theme_sm: normalizeControlledValues(batchDefaults.themes, AARDVARK_THEME_VALUES, ["Location"]),
     dcat_keyword_sm: ["AI extracted", "uploaded image", ...uniquePlaces.slice(0, 12)],
     dct_temporal_sm: [],
-    gbl_dateRange_drsim: [],
+    gbl_dateRange_drsim: "",
     gbl_indexYear_im: null,
     dct_spatial_sm: uniquePlaces,
     locn_geometry: locnGeometry,
@@ -7703,6 +7990,7 @@ async function processUploadedImage(config, body) {
   const modelProfile = findProfile(config, "model", body.modelProfileId);
   const visionProfile = body.visionProfileId ? findProfile(config, "vision", body.visionProfileId) : null;
   const textExtractionModelProfile = body.textExtractionModelProfileId ? findProfile(config, "model", body.textExtractionModelProfileId) : null;
+  const batchDefaults = effectiveBatchDefaults(body.batchDefaults || {}, storageProfile);
   const contentType = file.type || contentTypeForKey(fileName);
   const base64 = String(file.base64 || "").replace(/^data:[^;]+;base64,/, "");
   if (!base64) throw new Error("Upload request is missing file data.");
@@ -7785,7 +8073,7 @@ async function processUploadedImage(config, body) {
     }
   }
 
-  const resourceId = indexedUpload?.resourceId || body.resourceId || crypto.randomUUID();
+  const resourceId = indexedUpload?.resourceId || body.resourceId || generatedAardvarkResourceId(storageProfile, batchDefaults);
   const keys = hydrateUploadKeys(storageProfile, indexedUpload?.keys, resourceId, fileName);
   log("Resource directory assigned", { resourceId, root: keys.root, forceReprocess });
   const artifacts = {
@@ -7895,7 +8183,7 @@ async function processUploadedImage(config, body) {
     fileSize: buffer.length,
     contentType,
     extraction: extractionResult.parsedResponse,
-    batchDefaults: body.batchDefaults || {},
+    batchDefaults,
     artifacts: finalArtifacts,
   });
   let aardvarkWriter = null;
@@ -7908,7 +8196,7 @@ async function processUploadedImage(config, body) {
       fileName,
       extraction: extractionResult.parsedResponse,
       baseResource: baseAardvark.resource,
-      batchDefaults: body.batchDefaults || {},
+      batchDefaults,
       artifacts: finalArtifacts,
       metadataDocuments,
       metadataSourceUrls,
@@ -7920,6 +8208,8 @@ async function processUploadedImage(config, body) {
       extraction: extractionResult.parsedResponse,
       artifacts: finalArtifacts,
       metadataSourceUrls,
+      batchDefaults,
+      contentType,
     });
     log("Aardvark metadata writer complete", { title: resource.dct_title_s });
   } catch (error) {
@@ -7931,6 +8221,8 @@ async function processUploadedImage(config, body) {
       extraction: extractionResult.parsedResponse,
       artifacts: finalArtifacts,
       metadataSourceUrls,
+      batchDefaults,
+      contentType,
     });
   }
   const distributions = distributionsFromResource(resource);
@@ -8034,7 +8326,7 @@ async function regenerateAardvarkForS3Resource(config, body) {
       fileName,
       extraction,
       baseResource,
-      batchDefaults: body.batchDefaults || {},
+      batchDefaults,
       artifacts,
       metadataDocuments,
       metadataSourceUrls,
@@ -8046,6 +8338,8 @@ async function regenerateAardvarkForS3Resource(config, body) {
       extraction,
       artifacts,
       metadataSourceUrls,
+      batchDefaults,
+      contentType: contentTypeForKey(fileName),
     });
     log("Aardvark metadata writer complete", { title: resource.dct_title_s });
   } catch (error) {
@@ -8057,6 +8351,8 @@ async function regenerateAardvarkForS3Resource(config, body) {
       extraction,
       artifacts,
       metadataSourceUrls,
+      batchDefaults,
+      contentType: contentTypeForKey(fileName),
     });
   }
 
@@ -8115,6 +8411,7 @@ async function refreshOcrForS3ImageResource(config, body) {
   const modelProfile = body.modelProfileId ? findProfile(config, "model", body.modelProfileId) : null;
   const visionProfile = findProfile(config, "vision", body.visionProfileId);
   const textExtractionModelProfile = body.textExtractionModelProfileId ? findProfile(config, "model", body.textExtractionModelProfileId) : null;
+  const batchDefaults = effectiveBatchDefaults(body.batchDefaults || {}, storageProfile);
   const root = String(requested.root || (requested.resourceId ? `${uploadBasePrefix(storageProfile)}/${requested.resourceId}` : "")).replace(/\/+$/g, "");
   if (!root) throw new Error("OCR refresh request is missing the S3 resource root.");
   if (!modelProfile && body.skipMetadataWriter !== true) throw new Error("OCR refresh requires a model profile unless skipMetadataWriter is true.");
@@ -8221,7 +8518,7 @@ async function refreshOcrForS3ImageResource(config, body) {
         fileName,
         extraction: extractionResult.parsedResponse,
         baseResource,
-        batchDefaults: body.batchDefaults || {},
+        batchDefaults,
         artifacts,
         metadataDocuments,
         metadataSourceUrls,
@@ -8233,6 +8530,8 @@ async function refreshOcrForS3ImageResource(config, body) {
         extraction: extractionResult.parsedResponse,
         artifacts,
         metadataSourceUrls,
+        batchDefaults,
+        contentType,
       });
       log("Aardvark metadata writer complete", { title: resource.dct_title_s });
     } catch (error) {
@@ -8246,6 +8545,8 @@ async function refreshOcrForS3ImageResource(config, body) {
           extraction: extractionResult.parsedResponse,
           artifacts,
           metadataSourceUrls,
+          batchDefaults,
+          contentType,
         });
       }
     }
@@ -9187,9 +9488,19 @@ if (fileURLToPath(import.meta.url) === path.resolve(process.argv[1] || "")) {
 }
 
 export {
+  bboxFields,
+  bboxToAardvarkCentroid,
+  bboxToAardvarkEnvelope,
+  bboxToAardvarkPolygonWkt,
+  buildAardvarkForGeospatialPackage,
+  buildAardvarkForUpload,
   consolidateOcrTextEntries,
   cogPreviewRenderOptions,
   deriveMapLabelPlacenames,
+  effectiveBatchDefaults,
+  generatedAardvarkResourceId,
+  normalizeAardvarkFormat,
+  normalizeAardvarkResource,
   rasterThumbnailOutsizeArgs,
   selectTextReconciliationTiles,
 };

@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useCallback } from "react";
 import { Resource, Distribution } from "../aardvark/model";
 // GithubClient imports removed
-import { queryResourceById, upsertResource, queryDistributionsForResource, countResources } from "../duckdb/duckdbClient";
+import { queryResourceById, upsertResource, queryDistributionsForResource, countResources, deleteResource } from "../duckdb/duckdbClient";
 import { ResourceList } from "./ResourceList";
 import { ImportPage } from "./ImportPage";
 import { ResourceEdit } from "./ResourceEdit";
@@ -19,6 +19,8 @@ import { GoogleAuthButton } from "./GoogleAuthButton";
 import { useAuth } from "../auth/useAuth";
 import { withBasePath } from "../utils/basePath";
 import { DUCKDB_RESTORED_EVENT, DUCKDB_RESTORE_PROGRESS_EVENT, getDuckDbRestoreStatus, waitForDuckDbRestore } from "../duckdb/dbInit";
+import { canonicalResourceId, CANONICAL_RESOURCE_IDS, LEGACY_RESOURCE_IDS, replaceResourceIdAliasesInValue } from "../config/resourceIdAliases";
+import { recoverProcessedS3ResourcesToLocalCatalog } from "../services/processedResourceRecovery";
 
 
 // URL State
@@ -28,14 +30,50 @@ interface AppState {
   id?: string;
 }
 
+function canonicalizeLocalResource(resource: Resource, legacyId: string, nextId: string): Resource {
+  const migrated = replaceResourceIdAliasesInValue(resource) as Resource;
+  migrated.id = nextId;
+  const identifiers = Array.isArray(migrated.dct_identifier_sm)
+    ? migrated.dct_identifier_sm.map(String).filter((value) => value && value !== legacyId && value !== nextId)
+    : [];
+  migrated.dct_identifier_sm = [nextId, ...identifiers];
+  return migrated;
+}
+
+function canonicalizeLocalDistributions(distributions: Distribution[], nextId: string): Distribution[] {
+  return distributions.map((distribution) => ({
+    ...replaceResourceIdAliasesInValue(distribution) as Distribution,
+    resource_id: nextId,
+  }));
+}
+
 export const appUrlOptions = {
   toUrl: (s: AppState) => {
     const p = new URLSearchParams();
-    if (s.view !== "dashboard" && s.view !== "resource") p.set("view", s.view);
-    if (s.id && s.view !== "resource") p.set("id", s.id);
+    if (s.id && s.view !== "resource" && s.view !== "edit" && s.view !== "resource_admin") p.set("id", s.id);
     return p;
   },
   fromUrl: (p: URLSearchParams, pathname: string): AppState => {
+    if (pathname === "/admin" || pathname === "/admin/resources") {
+      return { view: "admin" };
+    }
+
+    if (pathname === "/admin/distributions") {
+      return { view: "distributions" };
+    }
+
+    if (pathname === "/admin/import") {
+      return { view: "import" };
+    }
+
+    if (pathname === "/admin/enrichments") {
+      return { view: "enrichments" };
+    }
+
+    if (pathname === "/admin/resources/new") {
+      return { view: "create" };
+    }
+
     // Check for /resources/:id/edit
     const editMatch = pathname.match(/^\/resources\/([^/]+)\/edit$/);
     if (editMatch) {
@@ -63,6 +101,21 @@ export const appUrlOptions = {
     p.delete("id");
   },
   path: (s: AppState) => {
+    if (s.view === "admin") {
+      return "/admin/resources";
+    }
+    if (s.view === "distributions") {
+      return "/admin/distributions";
+    }
+    if (s.view === "import") {
+      return "/admin/import";
+    }
+    if (s.view === "enrichments") {
+      return "/admin/enrichments";
+    }
+    if (s.view === "create") {
+      return "/admin/resources/new";
+    }
     if (s.view === "edit" && s.id) {
       return `/resources/${encodeURIComponent(s.id)}/edit`;
     }
@@ -85,6 +138,7 @@ export const App: React.FC = () => {
   const [resourceCount, setResourceCount] = useState<number>(0);
   const [resourceCountLoading, setResourceCountLoading] = useState(true);
   const [restoreProgress, setRestoreProgress] = useState(getDuckDbRestoreStatus);
+  const [canonicalResourceIdsReady, setCanonicalResourceIdsReady] = useState(false);
 
   // URL State
   const [urlState, setUrlState] = useUrlState<AppState>(
@@ -93,13 +147,14 @@ export const App: React.FC = () => {
   );
 
   const { view, id: selectedId } = urlState;
+  const canonicalSelectedId = selectedId ? canonicalResourceId(selectedId) : selectedId;
 
   // When not signed in on a CRUD view, show the safe view (stable tree = no hook order warning)
-  const isCrudView = view === "edit" || view === "create" || view === "resource_admin" || view === "enrichments";
+  const isCrudView = view === "edit" || view === "create" || view === "resource_admin";
   const displayView = isCrudView && !isSignedIn
     ? ((view === "edit" || view === "resource_admin") && selectedId ? "resource" as const : "dashboard" as const)
     : view;
-  const displayId = selectedId;
+  const displayId = canonicalSelectedId;
 
   const [editing, setEditing] = useState<Resource | null>(null);
   const [editingDistributions, setEditingDistributions] = useState<Distribution[]>([]);
@@ -142,6 +197,68 @@ export const App: React.FC = () => {
     return () => {
       window.removeEventListener(DUCKDB_RESTORE_PROGRESS_EVENT, handleRestoreProgress);
       window.removeEventListener(DUCKDB_RESTORED_EVENT, handleRestored);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!selectedId || selectedId === canonicalSelectedId) return;
+    setUrlState((state) => ({ ...state, id: canonicalSelectedId }));
+  }, [selectedId, canonicalSelectedId, setUrlState]);
+
+  useEffect(() => {
+    let canceled = false;
+    const enforceCanonicalResourceIds = async () => {
+      try {
+        await countResources();
+        await waitForDuckDbRestore();
+
+        let removed = 0;
+        for (const legacyId of LEGACY_RESOURCE_IDS) {
+          const existing = await queryResourceById(legacyId);
+          if (!existing) continue;
+          const nextId = canonicalResourceId(legacyId);
+          const existingCanonical = await queryResourceById(nextId);
+          if (!existingCanonical) {
+            const legacyDistributions = await queryDistributionsForResource(legacyId);
+            await upsertResource(
+              canonicalizeLocalResource(existing, legacyId, nextId),
+              canonicalizeLocalDistributions(legacyDistributions, nextId),
+            );
+          }
+          await deleteResource(legacyId);
+          removed += 1;
+        }
+
+        const missingCanonicalIds = [];
+        for (const resourceId of CANONICAL_RESOURCE_IDS) {
+          const existing = await queryResourceById(resourceId);
+          if (!existing) missingCanonicalIds.push(resourceId);
+        }
+
+        let recovered = 0;
+        if (missingCanonicalIds.length > 0) {
+          const result = await recoverProcessedS3ResourcesToLocalCatalog(missingCanonicalIds);
+          recovered = result.recovered.length;
+          if (result.missing.length > 0) {
+            console.warn(`Missing migrated S3 resources: ${result.missing.join(", ")}`);
+          }
+        }
+
+        if (removed > 0 || recovered > 0) {
+          await refreshResourceCount();
+          window.dispatchEvent(new CustomEvent(DUCKDB_RESTORED_EVENT, { detail: getDuckDbRestoreStatus() }));
+        }
+      } catch (error) {
+        console.error("Failed to enforce canonical resource ids", error);
+      } finally {
+        if (!canceled) setCanonicalResourceIdsReady(true);
+      }
+    };
+
+    void enforceCanonicalResourceIds();
+
+    return () => {
+      canceled = true;
     };
   }, []);
 
@@ -211,14 +328,14 @@ export const App: React.FC = () => {
   // Load resource if view is edit and we have ID but no data
   useEffect(() => {
     const load = async () => {
-      if (view === "edit" && selectedId && (!editing || editing.id !== selectedId)) {
-        let r = await queryResourceById(selectedId);
+      if (view === "edit" && canonicalSelectedId && (!editing || editing.id !== canonicalSelectedId)) {
+        let r = await queryResourceById(canonicalSelectedId);
         if (!r) {
           await waitForDuckDbRestore();
-          r = await queryResourceById(selectedId);
+          r = await queryResourceById(canonicalSelectedId);
         }
         if (r) {
-          const d = await queryDistributionsForResource(selectedId);
+          const d = await queryDistributionsForResource(canonicalSelectedId);
           setEditing(r);
           setEditingDistributions(d);
         } else {
@@ -231,7 +348,7 @@ export const App: React.FC = () => {
       }
     };
     load();
-  }, [view, selectedId, editing, setUrlState, handleCreate]);
+  }, [view, canonicalSelectedId, editing, setUrlState, handleCreate]);
 
 
 
@@ -300,44 +417,50 @@ export const App: React.FC = () => {
     // Ensure we are on the dashboard
     if (view !== "dashboard") {
       params.delete("view");
+      params.delete("id");
     }
     // Reset page to 1 on new search
     params.set("page", "1");
 
     // Update URL
-    const newUrl = `${window.location.pathname}?${params.toString()}`;
+    const targetPath = view === "dashboard" ? window.location.pathname : withBasePath("/");
+    const query = params.toString();
+    const newUrl = query ? `${targetPath}?${query}` : targetPath;
     window.history.pushState({}, "", newUrl);
     window.dispatchEvent(new PopStateEvent("popstate"));
   };
 
-  const logoUrl = withBasePath("/opengeometadata-bauhaus-logo.svg");
+  const logoUrl = withBasePath("/opengeometadata-map-legend-logo-composite.svg");
   const navButtonClass = (active: boolean) =>
     `rounded-md border-2 px-3 py-2 text-[11px] font-semibold tracking-normal transition-colors ${active
-      ? "border-[#111111] bg-[#111111] text-[#fffdf3] dark:border-[#f6d94d] dark:bg-[#f6d94d] dark:text-[#111111]"
-      : "border-transparent text-[#5a5547] hover:border-[#111111] hover:text-[#111111] dark:text-[#fffdf3]/80 dark:hover:border-[#f6d94d] dark:hover:text-[#fffdf3]"
+      ? "border-[#111111] bg-[#111111] text-[#ffffff] dark:border-[#f6d94d] dark:bg-[#f6d94d] dark:text-[#111111]"
+      : "border-transparent text-[#5a5547] hover:border-[#111111] hover:text-[#111111] dark:text-[#ffffff]/80 dark:hover:border-[#f6d94d] dark:hover:text-[#ffffff]"
     }`;
 
   return (
     <ErrorBoundary>
-    <div className="ogm-grid-bg min-h-screen text-[#141414] dark:text-[#fffdf3] flex flex-col transition-colors duration-200">
-      <header className="border-t-[8px] border-t-[#111111] border-b-2 border-b-[#1e1e1e] bg-[#fffdf3]/95 px-4 py-3 flex flex-wrap items-center justify-between gap-3 backdrop-blur-sm sticky top-0 z-50 dark:border-b-[#f6d94d] dark:bg-[#111111]/95">
+    <div className="ogm-grid-bg min-h-screen text-[#141414] dark:text-[#ffffff] flex flex-col transition-colors duration-200">
+      <div className="ogm-background-art" aria-hidden="true">
+        <span className="ogm-bg-accent ogm-bg-accent-left-blue" />
+        <span className="ogm-bg-accent ogm-bg-accent-left-red" />
+        <span className="ogm-bg-accent ogm-bg-accent-left-yellow" />
+        <img className="ogm-bg-official-logo" src={logoUrl} alt="" />
+      </div>
+      <header className="border-t-[8px] border-t-[#111111] border-b-2 border-b-[#1e1e1e] bg-[#ffffff]/95 px-4 py-3 flex flex-wrap items-center justify-between gap-3 backdrop-blur-sm sticky top-0 z-50 dark:border-b-[#f6d94d] dark:bg-[#111111]/95">
         <div className="flex items-center gap-4 flex-1 min-w-[18rem]">
           <button
             onClick={handleReset}
-            className="flex items-center gap-3 hover:opacity-90 transition-opacity focus:outline-none focus-visible:ring-2 focus-visible:ring-[#0057b8] focus-visible:ring-offset-2 focus-visible:ring-offset-[#fffdf3] flex-shrink-0 w-auto sm:w-80 lg:w-[28rem] pr-2"
+            className="flex items-center gap-3 hover:opacity-90 transition-opacity focus:outline-none focus-visible:ring-2 focus-visible:ring-[#0057b8] focus-visible:ring-offset-2 focus-visible:ring-offset-[#ffffff] flex-shrink-0 w-auto sm:w-80 lg:w-[28rem] pr-2"
             title="Reset to Dashboard"
           >
-            <span className="relative h-11 w-11 flex-shrink-0">
-              <span className="absolute left-1 top-1 h-10 w-10 border-2 border-[#111111] bg-[#f6d94d]" aria-hidden="true" />
-              <span className="absolute left-2 top-2 h-10 w-10 bg-[#111111]" aria-hidden="true" />
+            <span className="ogm-header-logo-stack">
               <img
                 src={logoUrl}
-                alt="OpenGeoMetadata geometric logo"
-                className="relative h-10 w-10 border-2 border-[#111111] bg-[#fffdf3]"
+                alt="OpenGeoMetadata map legend logo"
               />
             </span>
             <div className="text-left hidden sm:block min-w-0">
-              <h1 className="truncate text-xl font-extrabold tracking-normal text-[#111111] dark:text-[#fffdf3] leading-tight">OpenGeoMetadata Studio</h1>
+              <h1 className="truncate text-xl font-extrabold tracking-normal text-[#111111] dark:text-[#ffffff] leading-tight">OpenGeoMetadata Studio</h1>
               <p className="truncate text-xs font-semibold tracking-normal text-[#5a5547] dark:text-[#f6d94d]">
                 Geospatial metadata workspace
               </p>
@@ -402,8 +525,14 @@ export const App: React.FC = () => {
                   Restoring local records into DuckDB: {restoreProgress.processed} / {restoreProgress.total}
                 </div>
               )}
-
-              <section className={`rounded-md border-2 border-[#1e1e1e] bg-[#fffdf3]/90 dark:bg-slate-950/90 p-6 flex-1 flex flex-col min-h-0 shadow-[4px_4px_0_#111111] dark:shadow-[4px_4px_0_#f6d94d] backdrop-blur-sm ${displayView === 'map' ? '' : 'overflow-hidden'}`}>
+              {!canonicalResourceIdsReady ? (
+                <section className="ogm-workspace-frame flex-1 p-6">
+                  <div className="flex h-full items-center justify-center text-sm font-semibold text-[#5a5547] dark:text-[#ffffff]/80">
+                    Loading resources...
+                  </div>
+                </section>
+              ) : (
+              <section className={`ogm-workspace-frame p-6 flex-1 flex flex-col min-h-0 ${displayView === 'map' ? '' : 'overflow-hidden'}`}>
                 {(displayView === "dashboard" || displayView === "list" || displayView === "gallery" || displayView === "map") && (
                   <div className="flex flex-col h-full -m-6">
                     <Dashboard
@@ -446,11 +575,28 @@ export const App: React.FC = () => {
                   </div>
                 )}
 
+                {displayView === "enrichments" && !isSignedIn && (
+                  <div className="flex h-full items-center justify-center p-8">
+                    <div className="ogm-page-card flex max-w-md flex-col items-center gap-6 p-8 text-center">
+                      <p className="ogm-page-copy text-base">
+                        Sign in with Google to run enrichment workflows.
+                      </p>
+                      <GoogleAuthButton />
+                      <button
+                        onClick={() => setUrlState({ view: "dashboard" })}
+                        className="ogm-secondary-button"
+                      >
+                        ← Back to Dashboard
+                      </button>
+                    </div>
+                  </div>
+                )}
+
                 {displayView === "enrichments" && isSignedIn && (
                   <div className="flex flex-col h-full">
                     <button
                       onClick={() => setUrlState({ view: "dashboard" })}
-                      className="mb-4 self-start flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-white transition-colors"
+                      className="ogm-secondary-button mb-4 self-start"
                     >
                       ← Back to Dashboard
                     </button>
@@ -474,17 +620,19 @@ export const App: React.FC = () => {
                 )}
 
                 {displayView === "import" && !isSignedIn && (
-                  <div className="flex flex-col h-full items-center justify-center gap-6 p-8">
-                    <p className="text-slate-600 dark:text-slate-300 text-center max-w-md">
-                      Sign in with Google to import or export data.
-                    </p>
-                    <GoogleAuthButton />
-                    <button
-                      onClick={() => setUrlState({ view: "dashboard" })}
-                      className="text-xs text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-white transition-colors"
-                    >
-                      ← Back to Dashboard
-                    </button>
+                  <div className="flex h-full items-center justify-center p-8">
+                    <div className="ogm-page-card flex max-w-md flex-col items-center gap-6 p-8 text-center">
+                      <p className="ogm-page-copy text-base">
+                        Sign in with Google to import or export data.
+                      </p>
+                      <GoogleAuthButton />
+                      <button
+                        onClick={() => setUrlState({ view: "dashboard" })}
+                        className="ogm-secondary-button"
+                      >
+                        ← Back to Dashboard
+                      </button>
+                    </div>
                   </div>
                 )}
                 {displayView === "import" && isSignedIn && (
@@ -493,7 +641,7 @@ export const App: React.FC = () => {
                       onClick={() => {
                         setUrlState({ view: "dashboard" });
                       }}
-                      className="mb-4 self-start flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-white transition-colors"
+                      className="ogm-secondary-button mb-4 self-start"
                     >
                       ← Back to Dashboard
                     </button>
@@ -507,8 +655,53 @@ export const App: React.FC = () => {
                 )}
 
               </section>
+              )}
             </div>
           </main>
+          <footer className="ogm-footer" aria-labelledby="ogm-footer-title">
+            <div className="ogm-footer-blue-panel" aria-hidden="true" />
+            <div className="ogm-footer-inner">
+              <div className="ogm-footer-brand">
+                <h2 id="ogm-footer-title" className="ogm-footer-title">OpenGeoMetadata Studio</h2>
+                <div className="ogm-footer-rule" aria-hidden="true" />
+              </div>
+
+              <div className="ogm-footer-content">
+                <div className="ogm-footer-left">
+                  <section className="ogm-footer-section" aria-labelledby="ogm-footer-project">
+                    <h3 id="ogm-footer-project">Project</h3>
+                    <a href="https://opengeometadata.org/" target="_blank" rel="noreferrer">OpenGeoMetadata</a>
+                    <a href="https://opengeometadata.org/schema/geoblacklight-schema-aardvark.json" target="_blank" rel="noreferrer">Aardvark Schema</a>
+                    <a href="https://github.com/OpenGeoMetadata" target="_blank" rel="noreferrer">OpenGeoMetadata GitHub Organization</a>
+                  </section>
+
+                  <section className="ogm-footer-section" aria-labelledby="ogm-footer-studio">
+                    <h3 id="ogm-footer-studio">Studio</h3>
+                    <a href={withBasePath("/admin/resources")}>Resource Workspace</a>
+                    <a href={withBasePath("/admin/distributions")}>Distribution Manager</a>
+                    <a href={withBasePath("/admin/import")}>Import / Export</a>
+                    <a href={withBasePath("/admin/enrichments")}>Enrichments</a>
+                  </section>
+
+                  <section className="ogm-footer-section ogm-footer-notes" aria-labelledby="ogm-footer-notes">
+                    <h3 id="ogm-footer-notes">Notes</h3>
+                    <p>
+                      Browser-native workspace for editing, importing, exporting, and enriching
+                      Aardvark records while keeping the catalog ready for OpenGeoMetadata discovery.
+                    </p>
+                  </section>
+                </div>
+
+                <section className="ogm-footer-section ogm-footer-routes" aria-labelledby="ogm-footer-routes">
+                  <h3 id="ogm-footer-routes">Key Routes</h3>
+                  <a className="ogm-footer-code" href={withBasePath("/admin/resources")}>/admin/resources</a>
+                  <a className="ogm-footer-code" href={withBasePath("/admin/distributions")}>/admin/distributions</a>
+                  <a className="ogm-footer-code" href={withBasePath("/admin/import")}>/admin/import</a>
+                  <a className="ogm-footer-code" href={withBasePath("/admin/enrichments")}>/admin/enrichments</a>
+                </section>
+              </div>
+            </div>
+          </footer>
     </div>
     </ErrorBoundary>
   );

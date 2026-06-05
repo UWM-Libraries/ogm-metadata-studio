@@ -49,9 +49,9 @@ export async function backfillCentroidAndH3(): Promise<{ centroidFilled: number;
         // 3) dcat_centroid from bbox center where centroid null and dcat_bbox present
         await conn.query(`
             UPDATE ${RESOURCES_TABLE}
-            SET dcat_centroid = '{"type":"Point","coordinates":[' ||
-                (CAST((string_split(regexp_replace(dcat_bbox, 'ENVELOPE\\(|\\)', '', 'g'), ','))[1] AS DOUBLE) + CAST((string_split(regexp_replace(dcat_bbox, 'ENVELOPE\\(|\\)', '', 'g'), ','))[2] AS DOUBLE)) / 2 || ',' ||
-                (CAST((string_split(regexp_replace(dcat_bbox, 'ENVELOPE\\(|\\)', '', 'g'), ','))[3] AS DOUBLE) + CAST((string_split(regexp_replace(dcat_bbox, 'ENVELOPE\\(|\\)', '', 'g'), ','))[4] AS DOUBLE)) / 2 || ']}'
+            SET dcat_centroid =
+                (CAST((string_split(regexp_replace(dcat_bbox, 'ENVELOPE\\(|\\)', '', 'g'), ','))[3] AS DOUBLE) + CAST((string_split(regexp_replace(dcat_bbox, 'ENVELOPE\\(|\\)', '', 'g'), ','))[4] AS DOUBLE)) / 2 || ',' ||
+                (CAST((string_split(regexp_replace(dcat_bbox, 'ENVELOPE\\(|\\)', '', 'g'), ','))[1] AS DOUBLE) + CAST((string_split(regexp_replace(dcat_bbox, 'ENVELOPE\\(|\\)', '', 'g'), ','))[2] AS DOUBLE)) / 2
             WHERE dcat_bbox LIKE 'ENVELOPE(%'
             AND (dcat_centroid IS NULL OR trim(dcat_centroid) = '')
         `);
@@ -60,9 +60,9 @@ export async function backfillCentroidAndH3(): Promise<{ centroidFilled: number;
         try {
             await conn.query(`
                 UPDATE ${RESOURCES_TABLE}
-                SET dcat_centroid = '{"type":"Point","coordinates":[' ||
-                    (ST_XMin(geom) + ST_XMax(geom)) / 2 || ',' ||
-                    (ST_YMin(geom) + ST_YMax(geom)) / 2 || ']}'
+                SET dcat_centroid =
+                    (ST_YMin(geom) + ST_YMax(geom)) / 2 || ',' ||
+                    (ST_XMin(geom) + ST_XMax(geom)) / 2
                 WHERE geom IS NOT NULL AND (dcat_centroid IS NULL OR trim(dcat_centroid) = '')
             `);
         } catch {

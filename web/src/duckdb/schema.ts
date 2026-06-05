@@ -105,6 +105,8 @@ export async function ensureSchema(conn: duckdb.AsyncDuckDBConnection) {
             prefixes_json VARCHAR,
             force_path_style BOOLEAN,
             public_base_url VARCHAR,
+            metadata_id_prefix VARCHAR,
+            metadata_provider VARCHAR,
             access_key_id_env VARCHAR,
             secret_access_key_env VARCHAR,
             session_token_env VARCHAR,
@@ -112,6 +114,18 @@ export async function ensureSchema(conn: duckdb.AsyncDuckDBConnection) {
             updated_at VARCHAR
         )
     `);
+    try {
+        const storageInfo = await conn.query(`DESCRIBE ${STORAGE_PROFILES_TABLE}`);
+        const storageCols = storageInfo.toArray().map((r: any) => r.column_name);
+        if (!storageCols.includes("metadata_id_prefix")) {
+            await conn.query(`ALTER TABLE ${STORAGE_PROFILES_TABLE} ADD COLUMN metadata_id_prefix VARCHAR`);
+        }
+        if (!storageCols.includes("metadata_provider")) {
+            await conn.query(`ALTER TABLE ${STORAGE_PROFILES_TABLE} ADD COLUMN metadata_provider VARCHAR`);
+        }
+    } catch (e) {
+        console.warn("Storage profiles schema evolution failed", e);
+    }
     await conn.query(`
         CREATE TABLE IF NOT EXISTS ${MODEL_PROFILES_TABLE} (
             id VARCHAR,

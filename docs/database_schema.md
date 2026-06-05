@@ -33,6 +33,8 @@ Stores the scalar (single-value) metadata fields for each resource.
 - `gbl_fileSize_s`
 - `gbl_mdModified_dt`
 
+Generated Aardvark records store `dcat_bbox` as `ENVELOPE(west,east,north,south)`, `locn_geometry` as WKT, and `dcat_centroid` as `latitude,longitude`. Import and display code still tolerates legacy GeoJSON strings for older local records.
+
 ### `resources_mv`
 
 Stores multivalued fields in a normalized "long" format.

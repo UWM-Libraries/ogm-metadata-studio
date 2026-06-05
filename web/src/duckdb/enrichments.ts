@@ -32,6 +32,8 @@ export interface ProxyStorageProfile {
     prefixes?: string[];
     forcePathStyle?: boolean;
     publicBaseUrl?: string;
+    metadataIdPrefix?: string;
+    metadataProvider?: string;
     accessKeyIdEnv?: string;
     secretAccessKeyEnv?: string;
     sessionTokenEnv?: string;
@@ -254,6 +256,61 @@ function newId(prefix: string): string {
     return `${prefix}-${uuid}`;
 }
 
+function cleanMetadataIdPrefix(value: unknown): string {
+    const cleaned = String(value || "")
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9_-]+/g, "-")
+        .replace(/^-+|-+$/g, "");
+    return cleaned || "unr";
+}
+
+function newAardvarkResourceId(batchDefaults: Record<string, any>): string {
+    const uuid = typeof crypto !== "undefined" && "randomUUID" in crypto
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    return `${cleanMetadataIdPrefix(batchDefaults.metadataIdPrefix)}-${uuid}`;
+}
+
+function decimalCoordinate(value: number): string {
+    return String(Math.round(value * 1_000_000_000) / 1_000_000_000);
+}
+
+function aardvarkPolygonFromBbox(bbox: any): string {
+    const west = decimalCoordinate(Number(bbox.west));
+    const east = decimalCoordinate(Number(bbox.east));
+    const north = decimalCoordinate(Number(bbox.north));
+    const south = decimalCoordinate(Number(bbox.south));
+    return `POLYGON((${west} ${south}, ${east} ${south}, ${east} ${north}, ${west} ${north}, ${west} ${south}))`;
+}
+
+function aardvarkCentroidFromBbox(bbox: any): string {
+    const lon = (Number(bbox.west) + Number(bbox.east)) / 2;
+    const lat = (Number(bbox.north) + Number(bbox.south)) / 2;
+    return `${decimalCoordinate(lat)},${decimalCoordinate(lon)}`;
+}
+
+function formatLabelForFile(asset: StagedAsset): string {
+    const text = `${asset.content_type || ""} ${asset.object_key || ""}`.toLowerCase();
+    if (/image\/jpe?g|\.jpe?g\b/.test(text)) return "JPEG";
+    if (/image\/png|\.png\b/.test(text)) return "PNG";
+    if (/image\/tiff?|\.tiff?\b/.test(text)) return "TIFF";
+    if (/image\/(?:jp2|j2k|jpeg2000)|\.j(?:p2|2k)\b/.test(text)) return "JPEG2000";
+    if (/application\/pdf|\.pdf\b/.test(text)) return "PDF";
+    return "Mixed";
+}
+
+function controlledThemeValues(values: unknown): string[] {
+    const allowed = new Set([
+        "Agriculture", "Biology", "Boundaries", "Climate", "Economy", "Elevation", "Environment",
+        "Events", "Geology", "Health", "Imagery", "Inland Waters", "Land Cover", "Location",
+        "Military", "Oceans", "Property", "Society", "Structure", "Transportation", "Utilities",
+    ]);
+    const candidates = Array.isArray(values) ? values.map(String) : [];
+    const cleaned = candidates.filter((value) => allowed.has(value));
+    return cleaned.length > 0 ? Array.from(new Set(cleaned)) : ["Location"];
+}
+
 function sqlLiteral(value: unknown): string {
     if (value === undefined || value === null) return "NULL";
     if (typeof value === "boolean") return value ? "TRUE" : "FALSE";
@@ -391,6 +448,8 @@ export async function syncProxyProfilesToDuckDb(storageProfiles: ProxyStoragePro
             prefixes_json: safeJsonStringify(profile.prefixes ?? []),
             force_path_style: profile.forcePathStyle ?? true,
             public_base_url: profile.publicBaseUrl ?? null,
+            metadata_id_prefix: profile.metadataIdPrefix ?? null,
+            metadata_provider: profile.metadataProvider ?? null,
             access_key_id_env: profile.accessKeyIdEnv ?? null,
             secret_access_key_env: profile.secretAccessKeyEnv ?? null,
             session_token_env: profile.sessionTokenEnv ?? null,
@@ -593,7 +652,7 @@ export function buildAardvarkDraftFromExtraction(args: {
 }): { resource: Resource; distributions: Distribution[]; confidence: number } {
     const bbox = args.extraction?.map_bbox_estimate;
     const confidence = typeof bbox?.confidence === "number" ? bbox.confidence : 0;
-    const resourceId = newId("resource");
+    const resourceId = newAardvarkResourceId(args.batchDefaults);
     const titleText = Array.isArray(args.extraction?.text)
         ? args.extraction.text.find((entry: any) => entry?.role === "title" && entry?.content)?.content
         : null;
@@ -608,28 +667,20 @@ export function buildAardvarkDraftFromExtraction(args: {
         ? `ENVELOPE(${bbox.west},${bbox.east},${bbox.north},${bbox.south})`
         : "";
     const locnGeometry = bboxString
-        ? safeJsonStringify({
-            type: "Polygon",
-            coordinates: [[
-                [bbox.west, bbox.north],
-                [bbox.east, bbox.north],
-                [bbox.east, bbox.south],
-                [bbox.west, bbox.south],
-                [bbox.west, bbox.north],
-            ]],
-        })
+        ? aardvarkPolygonFromBbox(bbox)
         : "";
     const centroid = bboxString
-        ? safeJsonStringify({ type: "Point", coordinates: [(bbox.west + bbox.east) / 2, (bbox.north + bbox.south) / 2] })
+        ? aardvarkCentroidFromBbox(bbox)
         : "";
 
     const resource: Resource = {
         id: resourceId,
         dct_title_s: String(args.batchDefaults.titlePrefix ? `${args.batchDefaults.titlePrefix}: ${titleText || fallbackTitle}` : titleText || fallbackTitle),
         dct_accessRights_s: String(args.batchDefaults.accessRights || "Public"),
+        dct_format_s: formatLabelForFile(args.asset),
         gbl_resourceClass_sm: Array.isArray(args.batchDefaults.resourceClass) ? args.batchDefaults.resourceClass.map(String) : ["Maps"],
         gbl_mdVersion_s: "Aardvark",
-        schema_provider_s: String(args.batchDefaults.provider || ""),
+        schema_provider_s: String(args.batchDefaults.provider || "OpenGeoMetadata Studio"),
         dct_issued_s: String(args.batchDefaults.issued || ""),
         dct_alternative_sm: [],
         dct_description_sm: [args.extraction?.description || ""].filter(Boolean),
@@ -639,7 +690,7 @@ export function buildAardvarkDraftFromExtraction(args: {
         dct_publisher_sm: args.batchDefaults.publisher ? [args.batchDefaults.publisher] : [],
         gbl_resourceType_sm: Array.isArray(args.batchDefaults.resourceType) ? args.batchDefaults.resourceType.map(String) : ["Topographic maps"],
         dct_subject_sm: Array.isArray(args.batchDefaults.subjects) ? args.batchDefaults.subjects.map(String) : [],
-        dcat_theme_sm: Array.isArray(args.batchDefaults.themes) ? args.batchDefaults.themes.map(String) : [],
+        dcat_theme_sm: controlledThemeValues(args.batchDefaults.themes),
         dcat_keyword_sm: ["AI extracted", ...uniquePlaces.slice(0, 12)],
         dct_temporal_sm: [],
         gbl_dateRange_drsim: [],
@@ -661,9 +712,8 @@ export function buildAardvarkDraftFromExtraction(args: {
         dct_replaces_sm: [],
         dct_isReplacedBy_sm: [],
         dct_relation_sm: [],
-        extra: {
-            gbl_mdModified_dt: nowIso(),
-        },
+        gbl_mdModified_dt: nowIso(),
+        extra: {},
     };
 
     const distributions: Distribution[] = [{

@@ -15,16 +15,27 @@ interface DashboardResultsListProps {
 }
 
 export const DashboardResultsList: React.FC<DashboardResultsListProps> = ({ resources, thumbnails, mapUrls, onSelect, onAddFilter, page = 1, pageSize = 20 }) => {
+    if (resources.length === 0) {
+        return (
+            <div className="ogm-empty-state max-w-xl p-6 text-[#5a5547] dark:text-[#ffffff]/70">
+                <h3 className="text-xl font-black text-[#111111] dark:text-[#f6d94d]">No results found</h3>
+                <p className="mt-2 text-sm font-medium">
+                    The current filter set returns no records.
+                </p>
+            </div>
+        );
+    }
+
     return (
-        <div className="space-y-4">
+        <div className="space-y-5">
             {resources.map((r, index) => {
                 const thumbnailUrl = displayThumbnailUrl(r, thumbnails);
                 return (
-                <div key={r.id} className="group relative grid grid-cols-[auto_1fr] gap-4 rounded-lg border border-gray-200 dark:border-slate-800 bg-white dark:bg-slate-900/40 p-4 hover:border-gray-300 dark:hover:border-slate-700 hover:bg-gray-50 dark:hover:bg-slate-900/60 transition-colors shadow-sm hover:shadow-md">
+                <div key={r.id} className="ogm-result-card group grid grid-cols-[auto_1fr] gap-4 p-4">
 
                     {/* Index Number */}
                     <div className="flex flex-col items-center justify-start pt-1 w-8 flex-shrink-0">
-                        <span className="text-xl font-bold text-gray-200 dark:text-slate-800 group-hover:text-indigo-200 dark:group-hover:text-indigo-900 transition-colors">
+                        <span className="ogm-result-index text-sm">
                             {(page - 1) * pageSize + index + 1}
                         </span>
                     </div>
@@ -35,7 +46,7 @@ export const DashboardResultsList: React.FC<DashboardResultsListProps> = ({ reso
                         {/* Merged Images (Thumbnail + Map) */}
                         <div className="hidden sm:flex flex-row items-stretch select-none">
                             {/* Thumbnail */}
-                            <div className="w-40 h-40 bg-gray-100 dark:bg-slate-950 rounded-l-lg border border-gray-200 dark:border-slate-800 border-r-0 items-center justify-center overflow-hidden flex-shrink-0">
+                            <div className="ogm-media-frame w-40 h-40 border-r-0 items-center justify-center overflow-hidden flex-shrink-0">
                                 <ResourceThumbnail
                                     resource={r}
                                     src={thumbnailUrl}
@@ -45,7 +56,7 @@ export const DashboardResultsList: React.FC<DashboardResultsListProps> = ({ reso
                             </div>
 
                             {/* Static Map */}
-                            <div className="w-40 h-40 bg-gray-100 dark:bg-slate-950 rounded-r-lg border border-gray-200 dark:border-slate-800 overflow-hidden relative flex-shrink-0">
+                            <div className="ogm-media-frame w-40 h-40 overflow-hidden relative flex-shrink-0">
                                 {mapUrls[r.id] ? (
                                     <img
                                         src={mapUrls[r.id]!}
@@ -55,7 +66,7 @@ export const DashboardResultsList: React.FC<DashboardResultsListProps> = ({ reso
                                         title={`Location map: ${r.dct_title_s}`}
                                     />
                                 ) : (
-                                    <div className="w-full h-full flex items-center justify-center text-xs text-slate-400">
+                                    <div className="w-full h-full flex items-center justify-center text-xs font-bold text-[#5a5547] dark:text-[#ffffff]/60">
                                         No Map
                                     </div>
                                 )}
@@ -65,17 +76,17 @@ export const DashboardResultsList: React.FC<DashboardResultsListProps> = ({ reso
                         {/* Content */}
                         <div className="min-w-0 flex flex-col justify-between h-full">
                             <div>
-                                <h3 className="text-lg font-medium text-indigo-600 dark:text-indigo-400 group-hover:text-indigo-700 dark:group-hover:text-indigo-300">
+                                <h3 className="text-lg ogm-result-title">
                                     <button onClick={() => onSelect?.(r.id)} className="text-left focus:outline-none hover:underline line-clamp-3">
                                         {r.dct_title_s || "Untitled"}
                                     </button>
                                 </h3>
-                                <p className="mt-1 text-sm text-slate-500 dark:text-slate-400 line-clamp-2">
+                                <p className="mt-1 text-sm text-[#5a5547] dark:text-[#ffffff]/70 line-clamp-2">
                                     {r.dct_description_sm?.[0] || "No description."}
                                 </p>
                             </div>
 
-                            <div className="flex items-center justify-between mt-2 pt-2 border-t border-dashed border-gray-100 dark:border-slate-800">
+                            <div className="flex items-center justify-between mt-3 pt-3 border-t-2 border-dashed border-[#111111]/15 dark:border-[#f6d94d]/25">
                                 <div className="flex flex-col gap-2 w-full">
                                     <div className="flex flex-wrap gap-2 items-center">
                                         {/* Class */}
@@ -110,7 +121,7 @@ export const DashboardResultsList: React.FC<DashboardResultsListProps> = ({ reso
                                             />
                                         ))}
                                         {r.dct_subject_sm && r.dct_subject_sm.length > 5 && (
-                                            <span className="text-xs text-slate-400">+{r.dct_subject_sm.length - 5} subjects</span>
+                                            <span className="text-xs font-bold text-[#5a5547] dark:text-[#ffffff]/60">+{r.dct_subject_sm.length - 5} subjects</span>
                                         )}
 
                                         {/* Keywords */}
@@ -124,13 +135,13 @@ export const DashboardResultsList: React.FC<DashboardResultsListProps> = ({ reso
                                             />
                                         ))}
                                         {r.dcat_keyword_sm && r.dcat_keyword_sm.length > 5 && (
-                                            <span className="text-xs text-slate-400">+{r.dcat_keyword_sm.length - 5} keywords</span>
+                                            <span className="text-xs font-bold text-[#5a5547] dark:text-[#ffffff]/60">+{r.dcat_keyword_sm.length - 5} keywords</span>
                                         )}
                                     </div>
 
-                                    <div className="flex items-center gap-2 text-xs text-slate-400 dark:text-slate-500 font-mono mt-1">
+                                    <div className="flex items-center gap-2 text-xs text-[#9a927e] dark:text-[#ffffff]/55 font-mono mt-1">
                                         <span title={r.id} className="truncate max-w-[150px]">{r.id}</span>
-                                        <span className={`inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium border ${r.dct_accessRights_s === "Public" ? "bg-emerald-50 dark:bg-emerald-900/20 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800" : "bg-amber-50 dark:bg-amber-900/20 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-800"}`}>
+                                        <span className="ogm-access-badge inline-flex items-center px-1.5 py-0.5 text-[10px]">
                                             {r.dct_accessRights_s}
                                         </span>
                                     </div>
@@ -154,7 +165,7 @@ const FacetTag: React.FC<{
     return (
         <button
             onClick={(e) => { e.stopPropagation(); onAddFilter?.(field, value); }}
-            className="inline-flex items-center rounded-sm bg-gray-100 dark:bg-slate-800 px-2 py-0.5 text-xs font-medium text-slate-700 dark:text-slate-300 border border-gray-200 dark:border-slate-700 hover:bg-gray-200 dark:hover:bg-slate-700 transition-colors"
+            className="ogm-tag inline-flex items-center px-2 py-0.5 text-xs transition-colors"
             title={`Filter by ${label}: ${value}`}
         >
             {value}

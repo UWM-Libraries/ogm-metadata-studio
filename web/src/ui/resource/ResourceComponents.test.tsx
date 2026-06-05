@@ -4,7 +4,7 @@ import { vi, describe, it, expect } from 'vitest';
 import { AuthProvider } from '../../auth/AuthContext';
 import { ResourceHeader } from './ResourceHeader';
 import { ResourceSidebar } from './ResourceSidebar';
-import { Resource } from '../../aardvark/model';
+import { Distribution, Resource } from '../../aardvark/model';
 
 const renderWithAuth = (ui: React.ReactElement) => render(<AuthProvider>{ui}</AuthProvider>);
 
@@ -109,7 +109,27 @@ describe('ResourceSidebar', () => {
 
     it('renders download link', () => {
         render(<ResourceSidebar resource={FIXTURE_RES} />);
-        expect(screen.getByText('Download Resource')).toHaveAttribute('href', 'http://dl.com');
+        expect(screen.getByRole('link', { name: 'Download resource' })).toHaveAttribute('href', 'http://dl.com');
+    });
+
+    it('renders generated artifact downloads from distributions', () => {
+        const artifactDistributions: Distribution[] = [
+            {
+                resource_id: 'test-1',
+                relation_key: 'https://opengeometadata.org/reference/aardvark-json',
+                url: 'https://example.com/aardvark.json',
+            },
+            {
+                resource_id: 'test-1',
+                relation_key: 'http://schema.org/thumbnailUrl',
+                url: 'https://example.com/thumbnail.jpg',
+            },
+        ];
+        render(<ResourceSidebar resource={{ ...FIXTURE_RES, dct_references_s: undefined }} distributions={artifactDistributions} />);
+
+        expect(screen.getByText('Aardvark JSON')).toBeInTheDocument();
+        expect(screen.getByRole('link', { name: 'Download Aardvark JSON' })).toHaveAttribute('href', 'https://example.com/aardvark.json');
+        expect(screen.queryByText('Thumbnail')).not.toBeInTheDocument();
     });
 
     it('renders citation', () => {

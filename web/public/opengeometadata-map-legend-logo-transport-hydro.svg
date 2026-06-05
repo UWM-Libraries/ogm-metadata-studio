@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">OpenGeoMetadata map legend logo variation: transportation and hydrography</title>
+  <desc id="desc">A Bauhaus grid logo using historic map legend symbols: railroad, road junction, bench mark, stream, and bridge.</desc>
+  <defs>
+    <clipPath id="yellow-square"><rect x="32" y="32" width="80" height="80"/></clipPath>
+    <clipPath id="red-circle"><circle cx="184" cy="72" r="40"/></clipPath>
+    <clipPath id="blue-triangle"><path d="M72 144 32 224h80z"/></clipPath>
+    <clipPath id="black-square"><rect x="144" y="144" width="80" height="80"/></clipPath>
+  </defs>
+  <rect width="256" height="256" fill="#fffdf3"/>
+  <rect x="32" y="32" width="80" height="80" fill="#f6d94d"/>
+  <circle cx="184" cy="72" r="40" fill="#d52b1e"/>
+  <path d="M72 144 32 224h80z" fill="#0057b8"/>
+  <rect x="144" y="144" width="80" height="80" fill="#111111"/>
+
+  <g clip-path="url(#yellow-square)" fill="none" stroke="#111111" stroke-linecap="square">
+    <path d="M40 64h64M40 82h64" stroke-width="5"/>
+    <path d="M48 54v38M60 54v38M72 54v38M84 54v38M96 54v38" stroke-width="4"/>
+    <circle cx="72" cy="73" r="5" fill="#111111" stroke="none"/>
+  </g>
+
+  <g clip-path="url(#red-circle)" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M158 96c14-18 28-29 51-50" stroke="#fffdf3" stroke-width="13"/>
+    <path d="M160 48c17 17 30 30 48 48" stroke="#fffdf3" stroke-width="13"/>
+    <path d="M158 96c14-18 28-29 51-50" stroke="#111111" stroke-width="4"/>
+    <path d="M160 48c17 17 30 30 48 48" stroke="#111111" stroke-width="4"/>
+    <circle cx="184" cy="72" r="8" fill="#fffdf3" stroke="#111111" stroke-width="4"/>
+  </g>
+
+  <g clip-path="url(#blue-triangle)" fill="none" stroke="#fffdf3" stroke-linecap="square" stroke-linejoin="miter">
+    <path d="M72 158 48 210h48z" stroke-width="6"/>
+    <path d="M72 174v24M60 186h24" stroke-width="6"/>
+    <circle cx="72" cy="186" r="4" fill="#fffdf3" stroke="none"/>
+    <path d="M50 214c8-5 15-5 22 0s14 5 22 0" stroke-width="4" stroke-linecap="round"/>
+  </g>
+
+  <g clip-path="url(#black-square)" fill="none" stroke="#fffdf3" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M152 188c14-13 27-13 40 0s20 13 32 0" stroke-width="6"/>
+    <path d="M164 162v52M204 162v52M158 172h52M158 204h52" stroke-width="5" stroke-linecap="square"/>
+    <path d="M154 154h24M154 154v24" stroke-width="7" stroke-linecap="square"/>
+  </g>
+</svg>

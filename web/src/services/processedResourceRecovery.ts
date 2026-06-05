@@ -30,6 +30,14 @@ export interface ProcessedResourceRecoveryResult extends LocalCatalogPublishResu
     s3Resource: ProcessedS3Resource;
 }
 
+export interface ProcessedResourceBatchRecoveryResult {
+    requested: number;
+    recovered: ProcessedResourceRecoveryResult[];
+    missing: string[];
+    storageProfileId?: string;
+    storageProfileName?: string;
+}
+
 function distributionsFromResponse(resourceId: string, response: LocalCatalogPublishResponse): Distribution[] {
     return (response.distributions || []).flatMap((distribution) => {
         const relationKey = String(distribution.relation_key || "").trim();
@@ -115,4 +123,63 @@ export async function recoverProcessedS3ResourceToLocalCatalog(
 
     if (lastError && storageProfiles.length === 1) throw lastError;
     return null;
+}
+
+export async function recoverProcessedS3ResourcesToLocalCatalog(
+    resourceIds: string[],
+    options: { signal?: AbortSignal } = {},
+): Promise<ProcessedResourceBatchRecoveryResult> {
+    const requestedIds = Array.from(new Set(resourceIds.map(String).filter(Boolean)));
+    if (requestedIds.length === 0) {
+        return { requested: 0, recovered: [], missing: [] };
+    }
+
+    const config = await enrichmentProxyClient.getConfig();
+    const storageProfiles = config.storageProfiles || [];
+    let lastError: unknown = null;
+
+    for (const profile of storageProfiles) {
+        if (options.signal?.aborted) throw new Error("S3 resource recovery canceled.");
+        try {
+            const discovered = await enrichmentProxyClient.listProcessedS3Resources(profile.id, options.signal);
+            const resourcesById = new Map(discovered.resources.map((resource) => [resource.resourceId, resource]));
+            const available = requestedIds
+                .map((resourceId) => resourcesById.get(resourceId))
+                .filter((resource): resource is ProcessedS3Resource => Boolean(resource));
+
+            if (available.length === 0) continue;
+
+            const recovered: ProcessedResourceRecoveryResult[] = [];
+            for (const s3Resource of available) {
+                if (options.signal?.aborted) throw new Error("S3 resource recovery canceled.");
+                const response = await enrichmentProxyClient.fetchAardvarkFromS3({
+                    storageProfileId: profile.id,
+                    resource: s3Resource,
+                }, options.signal);
+                const published = await publishAardvarkResponseToLocalCatalog(response, {
+                    label: s3Resource.fileName || s3Resource.resourceId,
+                });
+                recovered.push({
+                    ...published,
+                    storageProfileId: profile.id,
+                    storageProfileName: profile.name,
+                    s3Resource,
+                });
+            }
+
+            return {
+                requested: requestedIds.length,
+                recovered,
+                missing: requestedIds.filter((resourceId) => !resourcesById.has(resourceId)),
+                storageProfileId: profile.id,
+                storageProfileName: profile.name,
+            };
+        } catch (error) {
+            lastError = error;
+            console.warn(`Failed to recover processed S3 resources from ${profile.name}`, error);
+        }
+    }
+
+    if (lastError && storageProfiles.length === 1) throw lastError;
+    return { requested: requestedIds.length, recovered: [], missing: requestedIds };
 }

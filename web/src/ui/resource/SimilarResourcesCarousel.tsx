@@ -32,22 +32,22 @@ export const SimilarResourcesCarousel: React.FC<{ items: Resource[] }> = ({ item
     if (items.length === 0) return null;
 
     return (
-        <div className="mt-12 mb-8 px-6 pb-6">
-            <h2 className="text-2xl font-bold mb-6 text-slate-900 dark:text-gray-100">Similar Items</h2>
+        <section className="ogm-resource-similar ogm-page-card p-6">
+            <h2 className="ogm-page-card-title mb-6 text-xl">Similar Items</h2>
             <div className="relative group">
                 {/* Grid for items */}
-                <div className="grid grid-cols-4 gap-6 mb-6">
+                <div className="mb-6 grid grid-cols-1 gap-6 sm:grid-cols-2 xl:grid-cols-4">
                     {currentItems.map((item) => {
                         const thumbnailUrl = displayThumbnailUrl(item, thumbnails);
                         return (
                         <Link
                             key={item.id}
                             href={`/resources/${item.id}`}
-                            className="group/card focus:outline-none focus:ring-2 focus:ring-indigo-500 rounded-lg"
+                            className="group/card focus:outline-none focus:ring-2 focus:ring-[#2f62b8]"
                         >
-                            <div className="bg-white dark:bg-slate-800 rounded-lg shadow-sm hover:shadow-md transition-shadow duration-200 border border-gray-200 dark:border-slate-700 h-full flex flex-col overflow-hidden">
+                            <div className="ogm-resource-similar-card h-full overflow-hidden">
                                 {/* Thumbnail */}
-                                <div className="flex h-40 items-center justify-center bg-gray-100 dark:bg-slate-700 overflow-hidden relative text-slate-400">
+                                <div className="ogm-media-frame relative flex h-40 items-center justify-center overflow-hidden text-slate-400">
                                     <ResourceThumbnail
                                         resource={item}
                                         src={thumbnailUrl}
@@ -57,11 +57,11 @@ export const SimilarResourcesCarousel: React.FC<{ items: Resource[] }> = ({ item
                                 </div>
 
                                 {/* Content */}
-                                <div className="p-4 flex-1 flex flex-col">
-                                    <h3 className="text-sm font-semibold text-slate-900 dark:text-gray-100 line-clamp-2 mb-2 group-hover/card:text-indigo-600 dark:group-hover/card:text-indigo-400">
+                                <div className="flex flex-1 flex-col p-4">
+                                    <h3 className="ogm-result-title mb-2 line-clamp-2 text-sm">
                                         {item.dct_title_s}
                                     </h3>
-                                    <div className="mt-auto text-xs text-slate-500 dark:text-slate-400">
+                                    <div className="ogm-page-copy mt-auto text-xs">
                                         {item.dct_publisher_sm?.[0] || 'Unknown Publisher'}
                                         <span className="mx-1">&middot;</span>
                                         {item.gbl_indexYear_im || 'n.d.'}
@@ -79,10 +79,10 @@ export const SimilarResourcesCarousel: React.FC<{ items: Resource[] }> = ({ item
                         <button
                             onClick={handlePrev}
                             disabled={currentPage === 0}
-                            className="p-2 rounded-full hover:bg-gray-100 dark:hover:bg-slate-700 disabled:opacity-30 disabled:hover:bg-transparent transition-colors"
+                            className="ogm-page-button p-2"
                             aria-label="Previous page"
                         >
-                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5 text-slate-600 dark:text-slate-400">
+                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="h-5 w-5">
                                 <path fillRule="evenodd" d="M12.79 5.23a.75.75 0 01-.02 1.06L8.832 10l3.938 3.71a.75.75 0 11-1.04 1.08l-4.5-4.25a.75.75 0 010-1.08l4.5-4.25a.75.75 0 011.06.02z" clipRule="evenodd" />
                             </svg>
                         </button>
@@ -92,9 +92,9 @@ export const SimilarResourcesCarousel: React.FC<{ items: Resource[] }> = ({ item
                                 <button
                                     key={i}
                                     onClick={() => setCurrentPage(i)}
-                                    className={`w-2 h-2 rounded-full transition-colors ${i === currentPage
-                                        ? 'bg-indigo-600 dark:bg-indigo-400'
-                                        : 'bg-gray-300 dark:bg-slate-700 hover:bg-gray-400 dark:hover:bg-slate-600'
+                                    className={`h-2 w-2 rounded-full border border-[#111111] transition-colors dark:border-[#f6d94d] ${i === currentPage
+                                        ? 'bg-[#111111] dark:bg-[#f6d94d]'
+                                        : 'bg-[#ffffff] dark:bg-[#111111]'
                                         }`}
                                     aria-label={`Go to page ${i + 1}`}
                                     aria-current={i === currentPage ? 'page' : undefined}
@@ -105,16 +105,16 @@ export const SimilarResourcesCarousel: React.FC<{ items: Resource[] }> = ({ item
                         <button
                             onClick={handleNext}
                             disabled={currentPage === totalPages - 1}
-                            className="p-2 rounded-full hover:bg-gray-100 dark:hover:bg-slate-700 disabled:opacity-30 disabled:hover:bg-transparent transition-colors"
+                            className="ogm-page-button p-2"
                             aria-label="Next page"
                         >
-                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5 text-slate-600 dark:text-slate-400">
+                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="h-5 w-5">
                                 <path fillRule="evenodd" d="M7.21 14.77a.75.75 0 01.02-1.06L11.168 10 7.23 6.29a.75.75 0 111.04-1.08l4.5 4.25a.75.75 0 010 1.08l-4.5 4.25a.75.75 0 01-1.06-.02z" clipRule="evenodd" />
                             </svg>
                         </button>
                     </div>
                 )}
             </div>
-        </div>
+        </section>
     );
 };

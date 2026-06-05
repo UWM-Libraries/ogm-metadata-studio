@@ -1,4 +1,5 @@
 import { Resource } from "../aardvark/model";
+import { OPENFREEMAP_BRIGHT_STYLE } from "../config/mapStyles";
 
 // Constants for Web Mercator
 const TILE_SIZE = 256;
@@ -61,6 +62,129 @@ export class StaticMapService {
         const bbox = await this.resolveBBox();
         if (!bbox) return null;
 
+        const mapLibreBlob = await this.generateWithMapLibreBright(bbox, width, height);
+        if (mapLibreBlob) return mapLibreBlob;
+
+        return this.generateWithRasterTiles(bbox, width, height);
+    }
+
+    private async generateWithMapLibreBright(bbox: BBox, width: number, height: number): Promise<Blob | null> {
+        if (!this.canRenderMapLibre()) return null;
+
+        let container: HTMLDivElement | null = null;
+        let map: any = null;
+
+        try {
+            const maplibregl = (await import("maplibre-gl")).default;
+            container = document.createElement("div");
+            Object.assign(container.style, {
+                position: "fixed",
+                left: "-10000px",
+                top: "0",
+                width: `${width}px`,
+                height: `${height}px`,
+                overflow: "hidden",
+                opacity: "0",
+                pointerEvents: "none",
+                zIndex: "-1",
+            });
+            document.body.appendChild(container);
+
+            return await new Promise<Blob | null>((resolve) => {
+                let settled = false;
+                let didFitBounds = false;
+                let timeout: number;
+
+                const cleanup = (blob: Blob | null) => {
+                    if (settled) return;
+                    settled = true;
+                    window.clearTimeout(timeout);
+                    try {
+                        map?.remove();
+                    } catch {
+                        // ignore cleanup failures
+                    }
+                    container?.remove();
+                    resolve(blob);
+                };
+
+                const capture = async () => {
+                    if (!didFitBounds) return;
+                    try {
+                        cleanup(await this.captureMapLibreCanvas(map, bbox, width, height));
+                    } catch {
+                        cleanup(null);
+                    }
+                };
+
+                timeout = window.setTimeout(() => {
+                    if (didFitBounds && map?.loaded?.()) {
+                        void capture();
+                    } else {
+                        cleanup(null);
+                    }
+                }, 12000);
+
+                map = new maplibregl.Map({
+                    container: container as HTMLDivElement,
+                    style: OPENFREEMAP_BRIGHT_STYLE,
+                    interactive: false,
+                    attributionControl: false,
+                    preserveDrawingBuffer: true,
+                    fadeDuration: 0,
+                });
+
+                map.once("load", () => {
+                    map.resize();
+                    map.fitBounds(
+                        [[bbox.minLng, bbox.minLat], [bbox.maxLng, bbox.maxLat]],
+                        { padding: 20, maxZoom: 14, duration: 0 }
+                    );
+                    didFitBounds = true;
+                });
+
+                map.on("idle", () => {
+                    void capture();
+                });
+            });
+        } catch {
+            try {
+                map?.remove();
+            } catch {
+                // ignore cleanup failures
+            }
+            container?.remove();
+            return null;
+        }
+    }
+
+    private canRenderMapLibre(): boolean {
+        return typeof window !== "undefined" &&
+            typeof document !== "undefined" &&
+            Boolean(document.body) &&
+            (typeof WebGLRenderingContext !== "undefined" || typeof WebGL2RenderingContext !== "undefined");
+    }
+
+    private async captureMapLibreCanvas(map: any, bbox: BBox, width: number, height: number): Promise<Blob | null> {
+        const sourceCanvas = map?.getCanvas?.();
+        if (!sourceCanvas) return null;
+
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return null;
+
+        ctx.drawImage(sourceCanvas, 0, 0, width, height);
+        this.drawBBoxOverlay(ctx, bbox, (lng, lat) => {
+            const point = map.project([lng, lat]);
+            return { x: point.x, y: point.y };
+        });
+
+        return this.canvasToBlob(canvas);
+    }
+
+    private async generateWithRasterTiles(bbox: BBox, width: number, height: number): Promise<Blob | null> {
         const zoom = this.getBestZoom(bbox, width, height);
         const centerLat = (bbox.minLat + bbox.maxLat) / 2;
         const centerLng = (bbox.minLng + bbox.maxLng) / 2;
@@ -116,28 +240,42 @@ export class StaticMapService {
 
         await Promise.all(promises);
 
-        // 2. Draw BBox
-        const pMin = this.latLngToPoint(bbox.maxLat, bbox.minLng, zoom);
-        const pMax = this.latLngToPoint(bbox.minLat, bbox.maxLng, zoom);
-
-        const bx = pMin.x - viewMinX;
-        const by = pMin.y - viewMinY;
-        const bw = pMax.x - pMin.x;
-        const bh = pMax.y - pMin.y;
-
-        ctx.lineWidth = 2;
-        ctx.strokeStyle = 'blue';
-        ctx.fillStyle = 'rgba(0, 0, 255, 0.2)';
-        ctx.beginPath();
-        ctx.rect(bx, by, bw, bh);
-        ctx.fill();
-        ctx.stroke();
+        this.drawBBoxOverlay(ctx, bbox, (lng, lat) => {
+            const point = this.latLngToPoint(lat, lng, zoom);
+            return { x: point.x - viewMinX, y: point.y - viewMinY };
+        });
 
         if (canvas instanceof OffscreenCanvas) {
             return canvas.convertToBlob({ type: 'image/png' });
         } else {
-            return new Promise(resolve => (canvas as HTMLCanvasElement).toBlob(resolve, 'image/png'));
+            return this.canvasToBlob(canvas as HTMLCanvasElement);
         }
+    }
+
+    private drawBBoxOverlay(
+        ctx: OffscreenCanvasRenderingContext2D | CanvasRenderingContext2D,
+        bbox: BBox,
+        project: (lng: number, lat: number) => { x: number; y: number },
+    ) {
+        const topLeft = project(bbox.minLng, bbox.maxLat);
+        const bottomRight = project(bbox.maxLng, bbox.minLat);
+        const x = Math.min(topLeft.x, bottomRight.x);
+        const y = Math.min(topLeft.y, bottomRight.y);
+        const width = Math.abs(bottomRight.x - topLeft.x);
+        const height = Math.abs(bottomRight.y - topLeft.y);
+
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = "#2f62b8";
+        ctx.fillStyle = "rgba(47, 98, 184, 0.24)";
+        ctx.beginPath();
+        ctx.rect(x, y, width, height);
+        ctx.fill();
+        ctx.stroke();
+    }
+
+    private canvasToBlob(canvas: HTMLCanvasElement): Promise<Blob | null> {
+        if (typeof canvas.toBlob !== "function") return Promise.resolve(null);
+        return new Promise(resolve => canvas.toBlob(resolve, "image/png"));
     }
 
     private async resolveBBox(): Promise<BBox | null> {
@@ -186,6 +324,9 @@ export class StaticMapService {
             return this.normalizeBBox(w, s, e, n);
         }
 
+        const wkt = this.bboxFromWkt(geom);
+        if (wkt) return wkt;
+
         const parts = geom.split(',').map(p => Number(p.trim()));
         if (parts.length === 4 && parts.every(Number.isFinite)) {
             return this.normalizeBBox(parts[0], parts[1], parts[2], parts[3]);
@@ -196,6 +337,19 @@ export class StaticMapService {
         } catch {
             return null;
         }
+    }
+
+    private bboxFromWkt(value: string): BBox | null {
+        if (!/^(?:MULTI)?POLYGON\s*\(/i.test(value.trim())) return null;
+        const numbers = value.match(/[-+]?\d*\.?\d+(?:e[-+]?\d+)?/gi)?.map(Number) ?? [];
+        if (numbers.length < 4 || numbers.length % 2 !== 0) return null;
+        const xs: number[] = [];
+        const ys: number[] = [];
+        for (let index = 0; index + 1 < numbers.length; index += 2) {
+            xs.push(numbers[index]);
+            ys.push(numbers[index + 1]);
+        }
+        return this.normalizeBBox(Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys));
     }
 
     private async parseBBoxFromReferences(): Promise<BBox | null> {
