@@ -74,26 +74,26 @@ export const ResourceList: React.FC<ResourceListProps> = ({
     };
 
     return (
-        <div className="flex h-full flex-col bg-gray-50 dark:bg-slate-900 transition-colors duration-200">
+        <div className="ogm-admin-page transition-colors duration-200">
             {/* Header / Toolbar */}
-            <div className="flex items-center justify-between border-b border-gray-200 dark:border-slate-800 bg-white/50 dark:bg-slate-900/50 p-4 backdrop-blur-sm">
+            <div className="ogm-admin-toolbar">
                 <div className="flex items-center gap-4">
-                    <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-100">Resources</h2>
-                    <span className="rounded-full bg-gray-100 dark:bg-slate-800 px-2 py-0.5 text-xs text-slate-600 dark:text-slate-400">
+                    <h2 className="ogm-page-title">Resources</h2>
+                    <span className="ogm-count-badge">
                         {total} total
                     </span>
                 </div>
-                <div className="flex items-center gap-3">
+                <div className="flex flex-wrap items-center gap-3">
                     <input
                         type="text"
                         placeholder="Search resources..."
                         value={search}
                         onChange={(e) => setSearch(e.target.value)}
-                        className="w-64 rounded-md border border-gray-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-1.5 text-sm text-slate-900 dark:text-slate-100 placeholder-slate-400 dark:placeholder-slate-500 focus:border-indigo-500 focus:outline-none"
+                        className="ogm-field w-64 max-w-full px-3 py-1.5 text-sm"
                     />
                     <button
                         onClick={onCreate}
-                        className="rounded-md bg-indigo-600 px-4 py-1.5 text-sm font-medium text-white shadow-sm hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                        className="ogm-primary-button"
                     >
                         Create New
                     </button>
@@ -102,7 +102,7 @@ export const ResourceList: React.FC<ResourceListProps> = ({
 
             {/* Table */}
             <TableContainer>
-                <thead className="bg-gray-50 dark:bg-slate-950">
+                <thead>
                     <tr>
                         <SortHeader
                             label="ID"
@@ -132,54 +132,51 @@ export const ResourceList: React.FC<ResourceListProps> = ({
                             sortOrder={sortOrder}
                             onClick={handleSort}
                         />
-                        <th className="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-slate-500 dark:text-slate-400">
+                        <th className="ogm-sort-header">
                             Actions
                         </th>
                     </tr>
                 </thead>
-                <tbody className="divide-y divide-gray-200 dark:divide-slate-800 bg-white dark:bg-slate-900/50">
+                <tbody>
                     {loading ? (
                         <tr>
-                            <td colSpan={5} className="px-4 py-8 text-center text-sm text-slate-500">
+                            <td colSpan={5} className="px-4 py-8 text-center text-sm font-bold text-[#5a5547] dark:text-[#ffffff]/70">
                                 Loading...
                             </td>
                         </tr>
                     ) : resources.length === 0 ? (
                         <tr>
-                            <td colSpan={5} className="px-4 py-8 text-center text-sm text-slate-500">
+                            <td colSpan={5} className="px-4 py-8 text-center text-sm font-bold text-[#5a5547] dark:text-[#ffffff]/70">
                                 No resources found.
                             </td>
                         </tr>
                     ) : (
                         resources.map((r) => (
-                            <tr key={r.id} className="hover:bg-gray-50 dark:hover:bg-slate-800/50 transition-colors">
-                                <td className="whitespace-nowrap px-4 py-3 font-mono text-sm text-slate-600 dark:text-slate-300">
-                                    <Link href={`/resources/${r.id}`} className="hover:text-indigo-600 dark:hover:text-indigo-400 hover:underline">
+                            <tr key={r.id} className="transition-colors">
+                                <td className="whitespace-nowrap px-4 py-3 font-mono text-sm text-[#5a5547] dark:text-[#ffffff]/75">
+                                    <Link href={`/resources/${r.id}`} className="ogm-table-link">
                                         {r.id}
                                     </Link>
                                 </td>
-                                <td className="px-4 py-3 text-sm text-slate-900 dark:text-slate-100 font-medium">
-                                    {r.dct_title_s || <span className="text-slate-400 italic">Untitled</span>}
+                                <td className="px-4 py-3 text-sm font-bold text-[#111111] dark:text-[#ffffff]">
+                                    {r.dct_title_s || <span className="text-[#9a927e] italic">Untitled</span>}
                                 </td>
-                                <td className="px-4 py-3 text-sm text-slate-600 dark:text-slate-300">
+                                <td className="px-4 py-3 text-sm text-[#5a5547] dark:text-[#ffffff]/75">
                                     {r.gbl_resourceClass_sm.map((c, idx) => (
-                                        <span key={`${r.id}:gbl_resourceClass_sm:${c || "<empty>"}:${idx}`} className="mr-1 inline-flex items-center rounded bg-gray-100 dark:bg-slate-800 px-2 py-0.5 text-xs font-medium text-slate-700 dark:text-slate-300 border border-gray-200 dark:border-slate-700">
+                                        <span key={`${r.id}:gbl_resourceClass_sm:${c || "<empty>"}:${idx}`} className="ogm-tag mr-1 inline-flex items-center px-2 py-0.5 text-xs">
                                             {c}
                                         </span>
                                     ))}
                                 </td>
-                                <td className="px-4 py-3 text-sm text-slate-600 dark:text-slate-300">
-                                    <span className={`inline-flex items-center rounded px-2 py-0.5 text-xs font-medium ${r.dct_accessRights_s === "Public"
-                                        ? "bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400"
-                                        : "bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400"
-                                        }`}>
+                                <td className="px-4 py-3 text-sm text-[#5a5547] dark:text-[#ffffff]/75">
+                                    <span className="ogm-access-badge inline-flex items-center px-2 py-0.5 text-xs">
                                         {r.dct_accessRights_s}
                                     </span>
                                 </td>
                                 <td className="whitespace-nowrap px-4 py-3 text-sm">
                                     <button
                                         onClick={() => onEdit(r.id)}
-                                        className="font-medium text-indigo-600 dark:text-indigo-400 hover:text-indigo-800 dark:hover:text-indigo-300 hover:underline"
+                                        className="font-black text-[#2f62b8] hover:text-[#111111] hover:underline dark:text-[#f6d94d] dark:hover:text-[#ffffff]"
                                     >
                                         Edit
                                     </button>

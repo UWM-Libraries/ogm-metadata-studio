@@ -202,6 +202,47 @@ describe('DuckDB Queries', () => {
             expect(res.globalCount).toBe(5);
             expect(mockConn.query.mock.calls[0][0]).toContain('resources.dcat_centroid as centroid');
         });
+
+        it('falls back to bbox-derived H3 when rows do not have centroids yet', async () => {
+            const expectedHex = latLngToCell(35.5, -114.5, 4);
+            mockConn.query
+                .mockResolvedValueOnce({
+                    toArray: () => [
+                        {
+                            h3: '',
+                            centroid: null,
+                            bbox: 'ENVELOPE(-115,-114,36,35)',
+                            geometry: null,
+                            c: 2,
+                        },
+                    ]
+                })
+                .mockResolvedValueOnce({ toArray: () => [{ c: 2 }] });
+
+            const res = await queries.getMapH3({ resolution: 4 });
+
+            expect(res.hexes).toEqual([{ h3: expectedHex, count: 2 }]);
+            expect(mockConn.query.mock.calls[0][0]).toContain('resources.dcat_bbox as bbox');
+            expect(mockConn.query.mock.calls[0][0]).toContain('resources.locn_geometry as geometry');
+        });
+
+        it('uses dcat_bbox as a spatial filter fallback for map hexes', async () => {
+            mockConn.query
+                .mockResolvedValueOnce({})
+                .mockResolvedValueOnce({ toArray: () => [] })
+                .mockResolvedValueOnce({ toArray: () => [{ c: 0 }] })
+                .mockResolvedValueOnce({});
+
+            await queries.getMapH3({
+                resolution: 4,
+                bbox: { minX: -116, minY: 34, maxX: -113, maxY: 37 },
+            });
+
+            const createTempSql = mockConn.query.mock.calls[0][0];
+            expect(createTempSql).toContain('ST_Intersects');
+            expect(createTempSql).toContain("dcat_bbox LIKE 'ENVELOPE(%'");
+            expect(createTempSql).toContain('TRY_CAST');
+        });
     });
 
     describe('getSearchNeighbors', () => {

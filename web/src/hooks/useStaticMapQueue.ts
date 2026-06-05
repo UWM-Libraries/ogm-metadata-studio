@@ -3,8 +3,9 @@ import { Resource } from "../aardvark/model";
 import { default as pLimit } from "p-limit";
 import { StaticMapService } from "../services/StaticMapService";
 import { getStaticMap, upsertStaticMap } from "../duckdb/duckdbClient";
+import { staticMapCacheKey } from "../config/mapStyles";
 
-// OSM Usage Policy: Be nice.
+// Keep generated static-map work from piling up in the browser.
 const limit = pLimit(2);
 
 interface QueueItem {
@@ -27,7 +28,8 @@ export function useStaticMapQueue() {
             limit(async () => {
                 try {
                     // 1. Check DB Cache
-                    const cachedUrl = await getStaticMap(item.id);
+                    const cacheKey = staticMapCacheKey(item.id);
+                    const cachedUrl = await getStaticMap(cacheKey);
                     if (cachedUrl) {
                         setMapUrls(prev => ({ ...prev, [item.id]: cachedUrl }));
                         return;
@@ -39,7 +41,7 @@ export function useStaticMapQueue() {
 
                     if (blob) {
                         // 3. Cache
-                        await upsertStaticMap(item.id, blob);
+                        await upsertStaticMap(cacheKey, blob);
 
                         // 4. Update State
                         const url = URL.createObjectURL(blob);

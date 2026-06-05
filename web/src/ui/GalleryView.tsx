@@ -39,7 +39,7 @@ export const GalleryView: React.FC<GalleryViewProps> = ({ resources, thumbnails,
 
     if (resources.length === 0) {
         return (
-            <div className="flex h-64 items-center justify-center text-slate-500">
+            <div className="flex h-64 items-center justify-center text-[#5a5547] dark:text-[#ffffff]/70">
                 No results found.
             </div>
         );
@@ -47,17 +47,17 @@ export const GalleryView: React.FC<GalleryViewProps> = ({ resources, thumbnails,
 
     return (
         <div className="flex flex-col">
-            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4 p-4">
+            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-5 p-1">
                 {resources.map(r => {
                     const thumbnailUrl = displayThumbnailUrl(r, thumbnails);
                     return (
                     <div
                         key={r.id}
-                        className="group relative bg-white dark:bg-slate-900 border border-gray-200 dark:border-slate-800 rounded-lg overflow-hidden hover:shadow-md transition-shadow cursor-pointer flex flex-col"
+                        className="ogm-result-card group cursor-pointer flex flex-col p-0"
                         onClick={() => onSelect?.(r.id)}
                     >
                         {/* Thumbnail Aspect Ratio 1:1 or 4:3? Aardvark usually squares. */}
-                        <div className="aspect-square bg-gray-100 dark:bg-slate-950 flex items-center justify-center overflow-hidden relative">
+                        <div className="aspect-square bg-[#f5f5f5] dark:bg-[#111111] flex items-center justify-center overflow-hidden relative border-b-2 border-[#111111] dark:border-[#f6d94d] ml-3">
                             <ResourceThumbnail
                                 resource={r}
                                 src={thumbnailUrl}
@@ -70,13 +70,13 @@ export const GalleryView: React.FC<GalleryViewProps> = ({ resources, thumbnails,
                             <div className="absolute inset-0 bg-black/0 group-hover:bg-black/10 transition-colors" />
                         </div>
 
-                        <div className="p-2 flex flex-col flex-1">
-                            <h3 className="text-xs font-semibold text-slate-800 dark:text-slate-200 line-clamp-2 mb-1 leading-snug" title={r.dct_title_s}>
+                        <div className="p-3 pl-5 flex flex-col flex-1">
+                            <h3 className="text-xs ogm-result-title line-clamp-2 mb-2 leading-snug" title={r.dct_title_s}>
                                 {r.dct_title_s}
                             </h3>
-                            <div className="mt-auto flex items-center justify-between text-[10px] text-slate-500 dark:text-slate-400">
+                            <div className="mt-auto flex items-center justify-between text-[10px] font-bold text-[#5a5547] dark:text-[#ffffff]/70">
                                 <span>{r.gbl_indexYear_im || "-"}</span>
-                                <span className="uppercase tracking-tighter opacity-70 border border-gray-200 dark:border-slate-700 px-1 rounded">
+                                <span className="ogm-tag uppercase px-1">
                                     {r.gbl_resourceClass_sm?.[0] || "Item"}
                                 </span>
                             </div>

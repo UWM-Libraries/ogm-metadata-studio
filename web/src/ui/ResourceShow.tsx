@@ -162,37 +162,36 @@ export const ResourceShow: React.FC<ResourceShowProps> = ({ id, onBack }) => {
     };
 
     if (loading) {
-        return <div className="p-8 text-center text-slate-500">{recoveryMessage || "Loading resource..."}</div>;
+        return <div className="ogm-page-card m-6 p-8 text-center text-[#5a5547] dark:text-[#ffffff]/80">{recoveryMessage || "Loading resource..."}</div>;
     }
 
     if (!resource) {
-        return <div className="p-8 text-center text-red-500">Resource not found: {id}</div>;
+        return <div className="ogm-page-card m-6 p-8 text-center text-[#cf3f32]">Resource not found: {id}</div>;
     }
 
     return (
-        <div className="max-w-7xl mx-auto w-full bg-white dark:bg-slate-900 min-h-full">
-            <ResourceHeader
-                resource={resource}
-                pagination={pagination}
-                onNavigate={navigateToId}
-                onDelete={handleDelete}
-            />
+        <div className="ogm-resource-page h-full min-h-0 overflow-auto">
+            <div className="mx-auto flex w-full max-w-7xl flex-col gap-6 p-6">
+                <ResourceHeader
+                    resource={resource}
+                    pagination={pagination}
+                    onNavigate={navigateToId}
+                    onDelete={handleDelete}
+                />
 
-            {/* Resource Viewer */}
-            <div className="px-6 pt-6">
                 <ResourceViewer resource={resource} distributions={distributions} />
+
+                <ResourceDistributions distributions={distributions} />
+
+                <div className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1fr)_24rem]">
+                    <ResourceMetadata resource={resource} />
+                    <ResourceSidebar resource={resource} distributions={distributions} />
+                </div>
+
+                {similarResources.length > 0 && (
+                    <SimilarResourcesCarousel items={similarResources} />
+                )}
             </div>
-
-            <ResourceDistributions distributions={distributions} />
-
-            <div className="flex flex-col lg:flex-row">
-                <ResourceMetadata resource={resource} />
-                <ResourceSidebar resource={resource} distributions={distributions} />
-            </div>
-
-            {similarResources.length > 0 && (
-                <SimilarResourcesCarousel items={similarResources} />
-            )}
         </div>
     );
 };

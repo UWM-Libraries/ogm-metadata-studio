@@ -5,8 +5,9 @@ import { cellToBoundary, gridDisk } from "h3-js";
 import { DUCKDB_RESTORED_EVENT } from "../duckdb/dbInit";
 import { databaseService } from "../services/DatabaseService";
 import { zoomToResolution } from "../utils/h3Resolution";
+import { OPENFREEMAP_BRIGHT_STYLE } from "../config/mapStyles";
 
-const MAP_STYLE = "https://tiles.openfreemap.org/styles/bright";
+const MAP_STYLE = OPENFREEMAP_BRIGHT_STYLE;
 
 const HEX_SOURCE_ID = "h3-hexes";
 const HEX_LAYER_ID = "h3-hexes-fill";
@@ -198,6 +199,10 @@ export const MapFacet: React.FC<MapFacetProps> = ({ bbox, onChange, q = "", filt
     const mapRef = useRef<maplibregl.Map | null>(null);
     const [hexLoading, setHexLoading] = useState(false);
     const [hexData, setHexData] = useState<{ h3: string; count: number }[]>([]);
+    const [hexGlobalCount, setHexGlobalCount] = useState<number | undefined>(undefined);
+    const [hexQuerySource, setHexQuerySource] = useState("");
+    const [hexQueryBbox, setHexQueryBbox] = useState("");
+    const [mapReady, setMapReady] = useState(false);
     const [restoreVersion, setRestoreVersion] = useState(0);
     const hasInitialFitRef = useRef(false);
     const lastGlobalContextRef = useRef<string | null>(null);
@@ -211,6 +216,7 @@ export const MapFacet: React.FC<MapFacetProps> = ({ bbox, onChange, q = "", filt
     const fetchHexes = useCallback(async () => {
         const map = mapRef.current;
         if (!map || !map.isStyleLoaded()) return;
+        if (!bboxRef.current && !hasInitialFitRef.current) return;
         const bounds = map.getBounds();
         const zoom = map.getZoom();
         const resolution = zoomToResolution(zoom);
@@ -220,6 +226,8 @@ export const MapFacet: React.FC<MapFacetProps> = ({ bbox, onChange, q = "", filt
             maxX: bounds.getEast(),
             maxY: bounds.getNorth(),
         };
+        setHexQuerySource("viewport");
+        setHexQueryBbox(`${bboxReq.minX.toFixed(4)},${bboxReq.minY.toFixed(4)},${bboxReq.maxX.toFixed(4)},${bboxReq.maxY.toFixed(4)}`);
         setHexLoading(true);
         try {
             const res = await databaseService.getMapH3({
@@ -228,8 +236,14 @@ export const MapFacet: React.FC<MapFacetProps> = ({ bbox, onChange, q = "", filt
                 q: q.trim() || undefined,
                 filters: Object.keys(filters).length ? filters : undefined,
             });
+            setHexGlobalCount(res.globalCount);
+            if (!bboxRef.current && res.hexes.length === 0 && hexDataRef.current.length > 0) {
+                return;
+            }
             setHexData(res.hexes);
-        } catch {
+        } catch (error) {
+            console.warn("Failed to load map hex aggregation", error);
+            setHexGlobalCount(undefined);
             setHexData([]);
         } finally {
             setHexLoading(false);
@@ -242,6 +256,7 @@ export const MapFacet: React.FC<MapFacetProps> = ({ bbox, onChange, q = "", filt
             mapRef.current = null;
         }
         if (!containerRef.current) return;
+        setMapReady(false);
         const map = new maplibregl.Map({
             container: containerRef.current,
             style: MAP_STYLE,
@@ -249,7 +264,10 @@ export const MapFacet: React.FC<MapFacetProps> = ({ bbox, onChange, q = "", filt
             zoom: 3,
         });
         mapRef.current = map;
+        let disposed = false;
         map.on("load", () => {
+            if (disposed) return;
+            setMapReady(true);
             if (hexDataRef.current.length > 0) {
                 upsertHexLayer(map, hexDataRef.current);
             }
@@ -260,8 +278,10 @@ export const MapFacet: React.FC<MapFacetProps> = ({ bbox, onChange, q = "", filt
             }
         });
         return () => {
+            disposed = true;
             mapRef.current?.remove();
             mapRef.current = null;
+            setMapReady(false);
         };
     }, []);
 
@@ -281,22 +301,15 @@ export const MapFacet: React.FC<MapFacetProps> = ({ bbox, onChange, q = "", filt
     // Fetch H3 hexes on load and when map moves/zooms or search context changes
     useEffect(() => {
         const map = mapRef.current;
-        if (!map) return;
-        const onReady = () => {
-            void fetchHexes();
-        };
-        if (map.isStyleLoaded()) {
-            onReady();
-        } else {
-            map.once("load", onReady);
-        }
+        if (!map || !mapReady) return;
+        void fetchHexes();
         map.on("moveend", fetchHexes);
         map.on("zoomend", fetchHexes);
         return () => {
             map.off("moveend", fetchHexes);
             map.off("zoomend", fetchHexes);
         };
-    }, [fetchHexes]);
+    }, [fetchHexes, mapReady]);
 
     useEffect(() => {
         const handleRestored = () => {
@@ -313,7 +326,7 @@ export const MapFacet: React.FC<MapFacetProps> = ({ bbox, onChange, q = "", filt
     // jump the map to the primary hex cluster instead of staying over the US.
     useEffect(() => {
         const map = mapRef.current;
-        if (!map || bbox) return;
+        if (!map || !mapReady || bbox) return;
 
         const ctxKey = JSON.stringify({ q: q.trim() || "", filters: filters || {}, restoreVersion });
         if (lastGlobalContextRef.current === ctxKey) return;
@@ -323,6 +336,8 @@ export const MapFacet: React.FC<MapFacetProps> = ({ bbox, onChange, q = "", filt
         let cancelled = false;
         const run = async () => {
             setHexLoading(true);
+            setHexQuerySource("global");
+            setHexQueryBbox("");
             try {
                 const res = await databaseService.getMapH3({
                     // Use a slightly finer resolution so the dominant cluster localizes
@@ -333,29 +348,29 @@ export const MapFacet: React.FC<MapFacetProps> = ({ bbox, onChange, q = "", filt
                     // No bbox: query uses full extent so we can see all matching hexes
                 });
                 if (cancelled) return;
+                setHexGlobalCount(res.globalCount);
                 setHexData(res.hexes);
                 const view = dominantClusterView(res.hexes);
                 if (view.bounds) {
                     pendingAutoFitViewRef.current = view as { bounds: maplibregl.LngLatBounds; center: [number, number] | null };
                 }
-            } catch {
-                if (!cancelled) setHexData([]);
+            } catch (error) {
+                console.warn("Failed to load global map hex aggregation", error);
+                if (!cancelled) {
+                    setHexGlobalCount(undefined);
+                    setHexData([]);
+                }
             } finally {
                 if (!cancelled) setHexLoading(false);
             }
         };
 
-        // If style not yet loaded, wait for map load first
-        if (!map.isStyleLoaded()) {
-            map.once("load", run);
-        } else {
-            void run();
-        }
+        void run();
 
         return () => {
             cancelled = true;
         };
-    }, [q, filters, bbox, restoreVersion]);
+    }, [q, filters, bbox, restoreVersion, mapReady]);
 
     // Update GeoJSON layer when hexData changes
     useEffect(() => {
@@ -388,11 +403,18 @@ export const MapFacet: React.FC<MapFacetProps> = ({ bbox, onChange, q = "", filt
     };
 
     return (
-        <div className="w-full h-72 rounded overflow-hidden border border-gray-200 dark:border-slate-800 relative z-0 mb-6">
+        <div
+            className="ogm-map-facet w-full h-72 overflow-hidden relative z-0 mb-6"
+            data-hex-count={hexData.length}
+            data-hex-global-count={hexGlobalCount ?? ""}
+            data-hex-loading={hexLoading ? "true" : "false"}
+            data-hex-query-source={hexQuerySource}
+            data-hex-query-bbox={hexQueryBbox}
+        >
             <div ref={containerRef} className="w-full h-full" />
             {hexLoading && (
-                <div className="absolute inset-0 flex items-center justify-center bg-black/10 rounded z-[500] pointer-events-none">
-                    <span className="text-xs text-slate-600 dark:text-slate-300">Loading…</span>
+                <div className="absolute inset-0 flex items-center justify-center bg-[#ffffff]/55 dark:bg-[#111111]/55 z-[500] pointer-events-none">
+                    <span className="text-xs font-bold text-[#111111] dark:text-[#ffffff]">Loading...</span>
                 </div>
             )}
             <div className="absolute top-2 right-2 z-[1000]">
@@ -403,7 +425,7 @@ export const MapFacet: React.FC<MapFacetProps> = ({ bbox, onChange, q = "", filt
                         e.preventDefault();
                         handleSearchHere();
                     }}
-                    className="bg-white dark:bg-slate-800 text-slate-800 dark:text-slate-200 px-3 py-1.5 rounded shadow-md border border-gray-300 dark:border-slate-600 text-xs font-semibold hover:bg-gray-50 dark:hover:bg-slate-700 transition-colors"
+                    className="ogm-map-action px-3 py-1.5 text-xs"
                 >
                     Search Here
                 </button>
@@ -413,7 +435,7 @@ export const MapFacet: React.FC<MapFacetProps> = ({ bbox, onChange, q = "", filt
                     <button
                         type="button"
                         onClick={() => onChange(undefined)}
-                        className="bg-red-500 text-white px-2 py-1 rounded text-[10px] shadow opacity-80 hover:opacity-100"
+                        className="ogm-danger-action px-2 py-1 text-[10px] opacity-90 hover:opacity-100"
                     >
                         Clear Map
                     </button>

@@ -117,10 +117,10 @@ export const Dashboard: React.FC<DashboardProps> = ({ onEdit, onSelect }) => {
 
 
     return (
-        <div className="flex bg-gray-50 dark:bg-slate-900 h-full transition-colors duration-200">
+        <div className="ogm-dashboard-shell transition-colors duration-200">
             {/* Sidebar: Facets */}
-            <div className="hidden md:block w-96 lg:w-[420px] flex-shrink-0 border-r border-gray-200 dark:border-slate-800 p-5 overflow-y-auto bg-white dark:bg-transparent">
-                <h3 className="text-xs font-semibold text-slate-500 dark:text-slate-400 mb-3 uppercase tracking-wider">Refine Results</h3>
+            <div className="ogm-dashboard-sidebar hidden md:block w-96 lg:w-[420px] flex-shrink-0 p-5 overflow-y-auto">
+                <h3 className="ogm-section-label mb-3">Refine Results</h3>
                 <ErrorBoundary>
                     <MapFacet
                         bbox={currentBBox}
@@ -191,20 +191,20 @@ export const Dashboard: React.FC<DashboardProps> = ({ onEdit, onSelect }) => {
             {/* Main: Results */}
             <div className="flex-1 flex flex-col min-w-0">
                 {/* Top Bar */}
-                <div className="z-10 relative border-b border-gray-200 dark:border-slate-800 bg-white/50 dark:bg-slate-900/50 p-4 flex flex-col gap-4 backdrop-blur-sm">
+                <div className="ogm-dashboard-toolbar z-10 relative p-4 flex flex-col gap-4 backdrop-blur-sm">
 
-                    <div className="flex items-center justify-between gap-4">
+                    <div className="flex items-center justify-between gap-4 flex-wrap">
                         <div className="flex items-center gap-4 flex-shrink-0">
-                            <span className="text-sm text-slate-500 dark:text-slate-400">
-                                Found <span className="text-slate-900 dark:text-white font-medium">{total}</span> results
+                            <span className="ogm-section-label normal-case tracking-normal">
+                                Found <span className="text-[#111111] dark:text-[#f6d94d] font-black">{total}</span> results
                             </span>
                         </div>
-                        <div className="flex items-center gap-4 flex-shrink-0">
+                        <div className="flex items-center gap-3 flex-wrap min-w-0 justify-start sm:justify-end">
 
-                            <div className="flex bg-gray-100 dark:bg-slate-800 rounded-md p-0.5 border border-gray-200 dark:border-slate-700 mr-2">
+                            <div className="ogm-control-group">
                                 <button
                                     onClick={() => setState(prev => ({ ...prev, view: 'list' }))}
-                                    className={`px-2 py-1.5 rounded text-xs transition-colors ${view === 'list' || !view ? 'bg-white dark:bg-slate-700 shadow-sm text-indigo-600 dark:text-indigo-400 font-medium' : 'text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200'}`}
+                                    className={`ogm-icon-button ${view === 'list' || !view ? 'ogm-icon-button-active' : ''}`}
                                     title="List View"
                                 >
                                     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4">
@@ -213,7 +213,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ onEdit, onSelect }) => {
                                 </button>
                                 <button
                                     onClick={() => setState(prev => ({ ...prev, view: 'gallery' }))}
-                                    className={`px-2 py-1.5 rounded text-xs transition-colors ${view === 'gallery' ? 'bg-white dark:bg-slate-700 shadow-sm text-indigo-600 dark:text-indigo-400 font-medium' : 'text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200'}`}
+                                    className={`ogm-icon-button ${view === 'gallery' ? 'ogm-icon-button-active' : ''}`}
                                     title="Gallery View"
                                 >
                                     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4">
@@ -222,7 +222,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ onEdit, onSelect }) => {
                                 </button>
                                 <button
                                     onClick={() => setState(prev => ({ ...prev, view: 'map' }))}
-                                    className={`px-2 py-1.5 rounded text-xs transition-colors ${view === 'map' ? 'bg-white dark:bg-slate-700 shadow-sm text-indigo-600 dark:text-indigo-400 font-medium' : 'text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200'}`}
+                                    className={`ogm-icon-button ${view === 'map' ? 'ogm-icon-button-active' : ''}`}
                                     title="Map View"
                                 >
                                     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4">
@@ -234,7 +234,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ onEdit, onSelect }) => {
                             <select
                                 value={state.sort || "relevance"}
                                 onChange={(e) => setState(prev => ({ ...prev, sort: e.target.value, page: 1 }))}
-                                className="text-xs sm:text-sm rounded border border-gray-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 focus:ring-1 focus:ring-indigo-500 py-1.5 pl-2 pr-8"
+                                className="ogm-select max-w-full text-xs sm:text-sm focus:ring-2 focus:ring-[#2f62b8] py-1.5 pl-2 pr-8"
                             >
                                 <option value="relevance">Relevance</option>
                                 <option value="year_desc">Year (Newest)</option>
@@ -242,10 +242,10 @@ export const Dashboard: React.FC<DashboardProps> = ({ onEdit, onSelect }) => {
                                 <option value="title_asc">Title (A-Z)</option>
                                 <option value="title_desc">Title (Z-A)</option>
                             </select>
-                            <div className="flex items-center bg-gray-100 dark:bg-slate-800 rounded-md p-0.5 border border-gray-200 dark:border-slate-700">
-                                <button onClick={() => handleExport('json')} disabled={isExporting || total === 0} className="px-3 py-1.5 text-xs font-medium text-slate-500 dark:text-slate-300 hover:bg-white dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-white rounded disabled:opacity-50 disabled:cursor-not-allowed transition-colors shadow-sm hover:shadow">JSON</button>
-                                <div className="w-px bg-gray-300 dark:bg-slate-700 h-4 mx-0.5"></div>
-                                <button onClick={() => handleExport('csv')} disabled={isExporting || total === 0} className="px-3 py-1.5 text-xs font-medium text-slate-500 dark:text-slate-300 hover:bg-white dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-white rounded disabled:opacity-50 disabled:cursor-not-allowed transition-colors shadow-sm hover:shadow">CSV</button>
+                            <div className="ogm-control-group">
+                                <button onClick={() => handleExport('json')} disabled={isExporting || total === 0} className="ogm-export-button disabled:opacity-50 disabled:cursor-not-allowed">JSON</button>
+                                <div className="w-[2px] bg-[#111111] dark:bg-[#f6d94d] h-8"></div>
+                                <button onClick={() => handleExport('csv')} disabled={isExporting || total === 0} className="ogm-export-button disabled:opacity-50 disabled:cursor-not-allowed">CSV</button>
                             </div>
                         </div>
                     </div>
@@ -273,24 +273,24 @@ export const Dashboard: React.FC<DashboardProps> = ({ onEdit, onSelect }) => {
                 {view === 'map' ? (
                     <div className="flex-1 flex items-start">
                         {/* Condensed List Column */}
-                        <div className="w-[32rem] flex-shrink-0 border-r border-gray-200 dark:border-slate-800 bg-white dark:bg-slate-900 pb-20">
+                        <div className="w-[32rem] flex-shrink-0 border-r-2 border-[#111111] dark:border-[#f6d94d] bg-[#ffffff]/90 dark:bg-[#111111]/90 pb-20">
                             {loading ? (
-                                <div className="flex h-64 items-center justify-center text-slate-500">Loading...</div>
+                                <div className="flex h-64 items-center justify-center text-[#5a5547] dark:text-[#ffffff]/70">Loading...</div>
                             ) : (
-                                <ul className="divide-y divide-gray-100 dark:divide-slate-800">
+                                <ul>
                                     {resources.map(r => {
                                         const thumbnailUrl = displayThumbnailUrl(r, thumbnails);
                                         return (
                                         <li
                                             key={r.id}
-                                            className="p-3 hover:bg-gray-50 dark:hover:bg-slate-800/50 transition-colors group cursor-pointer"
+                                            className="ogm-map-list-item p-3 transition-colors group cursor-pointer"
                                             onMouseEnter={() => setHoveredResourceId(r.id)}
                                             onMouseLeave={() => setHoveredResourceId(null)}
                                             onClick={() => onSelect?.(r.id)}
                                         >
                                             <div className="flex gap-3">
                                                 {/* Thumbnail */}
-                                                <div className="w-16 h-16 flex-shrink-0 bg-gray-100 dark:bg-slate-800 rounded overflow-hidden relative border border-gray-200 dark:border-slate-700">
+                                                <div className="ogm-media-frame w-16 h-16 flex-shrink-0 overflow-hidden relative">
                                                     <div className="flex h-full w-full items-center justify-center text-slate-300 dark:text-slate-600">
                                                         <ResourceThumbnail
                                                             resource={r}
@@ -301,10 +301,10 @@ export const Dashboard: React.FC<DashboardProps> = ({ onEdit, onSelect }) => {
                                                 </div>
                                                 {/* Meta */}
                                                 <div className="flex-1 min-w-0 flex flex-col justify-center">
-                                                    <h4 className="text-sm font-medium text-slate-900 dark:text-white truncate" title={r.dct_title_s}>
+                                                    <h4 className="text-sm font-bold text-[#111111] dark:text-[#ffffff] truncate" title={r.dct_title_s}>
                                                         {r.dct_title_s}
                                                     </h4>
-                                                    <div className="mt-1 flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
+                                                    <div className="mt-1 flex items-center justify-between text-xs font-mono text-[#5a5547] dark:text-[#f6d94d]">
                                                         <span>{r.gbl_indexYear_im || "n.d."}</span>
                                                     </div>
                                                 </div>
@@ -318,16 +318,16 @@ export const Dashboard: React.FC<DashboardProps> = ({ onEdit, onSelect }) => {
                         {/* Map Column */}
                         <div className="flex-1 sticky top-[88px] h-[calc(100vh-100px)]">
                             {loading ? (
-                                <div className="absolute inset-0 flex items-center justify-center bg-gray-50/50 dark:bg-slate-900/50 backdrop-blur-sm z-10">Loading...</div>
+                                <div className="absolute inset-0 flex items-center justify-center bg-[#ffffff]/70 dark:bg-[#111111]/70 backdrop-blur-sm z-10">Loading...</div>
                             ) : (
                                 <ResultsMapView resources={resources} onEdit={onEdit} onSelect={onSelect} highlightedResourceId={hoveredResourceId} />
                             )}
                         </div>
                     </div>
                 ) : (
-                    <div className="flex-1 overflow-y-auto p-4">
+                    <div className="ogm-results-scroll flex-1 overflow-y-auto p-5">
                         {loading && resources.length === 0 ? (
-                            <div className="flex h-64 items-center justify-center text-slate-500">Loading...</div>
+                            <div className="flex h-64 items-center justify-center text-[#5a5547] dark:text-[#ffffff]/70">Loading...</div>
                         ) : view === 'gallery' ? (
                             <>
                                 <GalleryView
@@ -351,23 +351,23 @@ export const Dashboard: React.FC<DashboardProps> = ({ onEdit, onSelect }) => {
 
                 {/* Pagination */}
                 {totalPages > 1 && view !== 'gallery' && (
-                    <div className="border-t border-gray-200 dark:border-slate-800 bg-gray-50 dark:bg-slate-900 p-4 flex items-center justify-between">
+                    <div className="ogm-pagination p-4 flex items-center justify-between">
                         <button
                             disabled={page <= 1}
                             onClick={() => setState(prev => ({ ...prev, page: prev.page - 1 }))}
-                            className="rounded border border-gray-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-1 text-sm text-slate-700 dark:text-slate-300 disabled:opacity-50 hover:bg-gray-50 dark:hover:bg-slate-700 shadow-sm"
+                            className="ogm-page-button px-3 py-1 text-sm disabled:cursor-not-allowed"
                         >
                             Previous
                         </button>
-                        <span className="text-sm text-slate-500 dark:text-slate-400">
-                            Showing <span className="font-medium text-slate-900 dark:text-white">{(page - 1) * 20 + 1}</span> to{" "}
-                            <span className="font-medium text-slate-900 dark:text-white">{Math.min(page * 20, total)}</span> of{" "}
-                            <span className="font-medium text-slate-900 dark:text-white">{total}</span> results
+                        <span className="ogm-section-label normal-case tracking-normal">
+                            Showing <span className="font-black text-[#111111] dark:text-[#f6d94d]">{(page - 1) * 20 + 1}</span> to{" "}
+                            <span className="font-black text-[#111111] dark:text-[#f6d94d]">{Math.min(page * 20, total)}</span> of{" "}
+                            <span className="font-black text-[#111111] dark:text-[#f6d94d]">{total}</span> results
                         </span>
                         <button
                             disabled={page >= totalPages}
                             onClick={() => setState(prev => ({ ...prev, page: prev.page + 1 }))}
-                            className="rounded border border-gray-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-1 text-sm text-slate-700 dark:text-slate-300 disabled:opacity-50 hover:bg-gray-50 dark:hover:bg-slate-700 shadow-sm"
+                            className="ogm-page-button px-3 py-1 text-sm disabled:cursor-not-allowed"
                         >
                             Next
                         </button>
@@ -402,15 +402,15 @@ const FacetSection: React.FC<{
     if (data.length === 0 && !hasActiveSelection) return null;
 
     return (
-        <div className="border-b border-gray-200 dark:border-slate-800 pb-2 last:border-0 last:pb-0">
+        <div className="ogm-facet-section pb-3 first:border-t-0 first:pt-0">
             <button
                 className="flex items-center justify-between w-full py-2 group"
                 onClick={() => setIsOpen(!isOpen)}
             >
-                <h4 className="text-sm font-medium text-slate-900 dark:text-slate-300 group-hover:text-indigo-600 dark:group-hover:text-indigo-400 transition-colors">
+                <h4 className="text-sm font-extrabold text-[#111111] dark:text-[#ffffff] group-hover:text-[#2f62b8] dark:group-hover:text-[#f6d94d] transition-colors">
                     {label}
                 </h4>
-                <span className={`text-slate-400 dark:text-slate-500 transition-transform duration-200 ${isOpen ? 'rotate-180' : ''}`}>
+                <span className={`text-[#5a5547] dark:text-[#f6d94d] transition-transform duration-200 ${isOpen ? 'rotate-180' : ''}`}>
                     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4">
                         <path fillRule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.168l3.71-3.938a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clipRule="evenodd" />
                     </svg>
@@ -428,14 +428,14 @@ const FacetSection: React.FC<{
                                 <button
                                     onClick={() => onToggle(field, item.value, 'include')}
                                     className={`flex-1 flex items-center text-sm cursor-pointer py-0.5 text-left min-w-0 ${isIncluded
-                                        ? "font-bold text-indigo-600 dark:text-indigo-400"
+                                        ? "font-black text-[#2f62b8] dark:text-[#f6d94d]"
                                         : isExcluded
-                                            ? "text-red-500 line-through decoration-red-500 opacity-70"
-                                            : "text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200"
+                                            ? "text-[#cf3f32] line-through decoration-[#cf3f32] opacity-70"
+                                            : "text-[#5a5547] dark:text-[#ffffff]/70 hover:text-[#111111] dark:hover:text-[#ffffff]"
                                         }`}
                                 >
                                     <span className="flex-1 truncate" title={item.value}>{item.value ? displayAardvarkValue(field, item.value) : "<Empty>"}</span>
-                                    <span className="ml-2 text-xs text-slate-400 dark:text-slate-600 font-mono flex-shrink-0">{item.count}</span>
+                                    <span className="ogm-facet-count ml-2 text-xs font-mono flex-shrink-0">{item.count}</span>
                                 </button>
 
                                 <button
@@ -443,7 +443,7 @@ const FacetSection: React.FC<{
                                         e.stopPropagation();
                                         onToggle(field, item.value, 'exclude');
                                     }}
-                                    className={`ml-1 p-0.5 rounded hover:bg-red-100 dark:hover:bg-red-900/30 text-slate-400 hover:text-red-600 transition-colors opacity-0 group-hover/item:opacity-100 focus:opacity-100 ${isExcluded ? 'text-red-600 opacity-100' : ''}`}
+                                    className={`ml-1 p-0.5 text-[#5a5547] hover:text-[#cf3f32] transition-colors opacity-0 group-hover/item:opacity-100 focus:opacity-100 ${isExcluded ? 'text-[#cf3f32] opacity-100' : ''}`}
                                     title="Exclude this value"
                                 >
                                     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4">
@@ -459,7 +459,7 @@ const FacetSection: React.FC<{
             {isOpen && onShowMore && (
                 <button
                     onClick={onShowMore}
-                    className="w-full text-left text-xs text-indigo-600 dark:text-indigo-400 hover:underline pl-1 py-1"
+                    className="w-full text-left text-xs font-bold text-[#2f62b8] dark:text-[#f6d94d] hover:underline pl-1 py-1"
                 >
                     More {label.endsWith('s') ? `${label}es` : `${label}s`}...
                 </button>

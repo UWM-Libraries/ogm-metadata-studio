@@ -20,30 +20,30 @@ export const ResourceDistributions: React.FC<ResourceDistributionsProps> = ({ di
     if (visibleDistributions.length === 0) return null;
 
     return (
-        <section className="px-6 pt-6">
-            <div className="rounded-lg border border-gray-200 bg-white shadow-sm dark:border-slate-700 dark:bg-slate-800">
-                <div className="flex items-center justify-between border-b border-gray-200 px-4 py-3 dark:border-slate-700">
-                    <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">Related Distributions</h2>
-                    <span className="text-xs text-slate-500 dark:text-slate-400">{visibleDistributions.length} link{visibleDistributions.length === 1 ? "" : "s"}</span>
+        <section className="ogm-table-card">
+            <div>
+                <div className="flex items-center justify-between border-b-2 border-[#111111] px-4 py-3 dark:border-[#f6d94d]">
+                    <h2 className="ogm-page-card-title text-sm">Related Distributions</h2>
+                    <span className="ogm-count-badge">{visibleDistributions.length} link{visibleDistributions.length === 1 ? "" : "s"}</span>
                 </div>
                 <div className="overflow-x-auto">
-                    <table className="min-w-full divide-y divide-gray-200 text-sm dark:divide-slate-700">
-                        <thead className="bg-gray-50 dark:bg-slate-900/50">
+                    <table className="ogm-table min-w-full text-sm">
+                        <thead>
                             <tr>
-                                <th className="px-4 py-2 text-left text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Type</th>
-                                <th className="px-4 py-2 text-left text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Relation</th>
-                                <th className="px-4 py-2 text-left text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">URL</th>
-                                <th className="px-4 py-2 text-right text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Open</th>
+                                <th className="ogm-sort-header">Type</th>
+                                <th className="ogm-sort-header">Relation</th>
+                                <th className="ogm-sort-header">URL</th>
+                                <th className="ogm-sort-header text-right">Open</th>
                             </tr>
                         </thead>
-                        <tbody className="divide-y divide-gray-100 dark:divide-slate-700">
+                        <tbody>
                             {visibleDistributions.map((distribution) => (
                                 <tr key={`${distribution.relation_key}-${distribution.url}`} className="align-top">
-                                    <td className="whitespace-nowrap px-4 py-3 font-medium text-slate-900 dark:text-slate-100">
+                                    <td className="whitespace-nowrap px-4 py-3 font-bold text-[#111111] dark:text-[#ffffff]">
                                         {relationLabel(distribution)}
                                     </td>
                                     <td className="px-4 py-3">
-                                        <code className="rounded bg-gray-100 px-1.5 py-0.5 text-xs text-slate-700 dark:bg-slate-900 dark:text-slate-300">
+                                        <code className="ogm-tag px-1.5 py-0.5 text-xs">
                                             {shortRelationKey(distribution.relation_key)}
                                         </code>
                                     </td>
@@ -52,7 +52,7 @@ export const ResourceDistributions: React.FC<ResourceDistributionsProps> = ({ di
                                             href={distribution.url}
                                             target="_blank"
                                             rel="noopener noreferrer"
-                                            className="break-all text-indigo-600 hover:underline dark:text-indigo-400"
+                                            className="ogm-table-link break-all"
                                             title={distribution.url}
                                         >
                                             {displayUrl(distribution.url)}
@@ -63,7 +63,7 @@ export const ResourceDistributions: React.FC<ResourceDistributionsProps> = ({ di
                                             href={distribution.url}
                                             target="_blank"
                                             rel="noopener noreferrer"
-                                            className="rounded border border-gray-200 px-2 py-1 text-xs font-medium text-slate-700 hover:bg-gray-50 dark:border-slate-600 dark:text-slate-200 dark:hover:bg-slate-700"
+                                            className="ogm-secondary-button inline-flex px-2 py-1"
                                         >
                                             Open
                                         </a>

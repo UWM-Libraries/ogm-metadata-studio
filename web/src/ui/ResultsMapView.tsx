@@ -2,9 +2,10 @@ import React, { useEffect, useLayoutEffect, useMemo, useRef } from 'react';
 import maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import { Resource } from '../aardvark/model';
+import { OPENFREEMAP_BRIGHT_STYLE } from '../config/mapStyles';
 import { textToLngLatBounds } from './viewers/maplibreBounds';
 
-const MAP_STYLE = "https://tiles.openfreemap.org/styles/bright";
+const MAP_STYLE = OPENFREEMAP_BRIGHT_STYLE;
 
 interface ResultsMapViewProps {
     resources: Resource[];

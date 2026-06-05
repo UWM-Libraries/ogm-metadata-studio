@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">OpenGeoMetadata map legend logo variation: topographic relief</title>
+  <desc id="desc">A Bauhaus grid logo using historic topographic map symbols: contours, spot elevation, bench mark, and hachured relief.</desc>
+  <defs>
+    <clipPath id="yellow-square"><rect x="32" y="32" width="80" height="80"/></clipPath>
+    <clipPath id="red-circle"><circle cx="184" cy="72" r="40"/></clipPath>
+    <clipPath id="blue-triangle"><path d="M72 144 32 224h80z"/></clipPath>
+    <clipPath id="black-square"><rect x="144" y="144" width="80" height="80"/></clipPath>
+  </defs>
+  <rect width="256" height="256" fill="#fffdf3"/>
+  <rect x="32" y="32" width="80" height="80" fill="#f6d94d"/>
+  <circle cx="184" cy="72" r="40" fill="#d52b1e"/>
+  <path d="M72 144 32 224h80z" fill="#0057b8"/>
+  <rect x="144" y="144" width="80" height="80" fill="#111111"/>
+
+  <g clip-path="url(#yellow-square)" fill="none" stroke="#111111" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M37 96c12-18 25-26 43-24 15 1 24 8 30 20" stroke-width="5"/>
+    <path d="M42 78c12-16 26-23 42-20 12 2 20 8 25 18" stroke-width="5"/>
+    <path d="M51 61c9-11 19-15 30-13 9 1 17 6 21 15" stroke-width="5"/>
+    <path d="M62 83c8-8 17-11 26-8" stroke-width="4"/>
+    <circle cx="77" cy="73" r="4" fill="#111111" stroke="none"/>
+  </g>
+
+  <g clip-path="url(#red-circle)" fill="none" stroke="#fffdf3" stroke-linecap="square">
+    <path d="M184 48v48M160 72h48" stroke-width="7"/>
+    <path d="M170 58 198 86M198 58 170 86" stroke-width="4"/>
+    <text x="184" y="103" fill="#fffdf3" stroke="none" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="700">1284</text>
+  </g>
+
+  <g clip-path="url(#blue-triangle)" fill="none" stroke="#fffdf3" stroke-linecap="square" stroke-linejoin="miter">
+    <path d="M72 158 48 210h48z" stroke-width="6"/>
+    <path d="M72 174v24M60 186h24" stroke-width="6"/>
+    <circle cx="72" cy="186" r="4" fill="#fffdf3" stroke="none"/>
+    <text x="72" y="207" fill="#fffdf3" stroke="none" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="700">BM</text>
+  </g>
+
+  <g clip-path="url(#black-square)" fill="none" stroke="#fffdf3" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M152 200c13-25 35-39 64-39" stroke-width="6"/>
+    <path d="M152 184c18-24 40-36 64-36" stroke-width="4"/>
+    <path d="M162 210l-8-13M174 197l-8-13M188 186l-8-13M203 178l-8-13" stroke-width="4"/>
+    <path d="M154 154h26M154 154v26" stroke-width="7" stroke-linecap="square"/>
+  </g>
+</svg>

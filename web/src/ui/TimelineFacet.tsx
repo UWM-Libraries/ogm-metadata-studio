@@ -62,13 +62,13 @@ export const TimelineFacet: React.FC<TimelineFacetProps> = ({ data, range, onCha
     }
 
     return (
-        <div className="w-full h-40 mb-4 bg-white dark:bg-slate-900 rounded border border-gray-200 dark:border-slate-800 p-2">
-            <div className="text-xs font-semibold text-slate-500 dark:text-slate-400 mb-2 uppercase tracking-wider flex justify-between">
+        <div className="ogm-panel-card w-full h-40 mb-5 p-3">
+            <div className="ogm-section-label mb-2 flex justify-between">
                 <span>Year Distribution</span>
                 {range && (
                     <button
                         onClick={() => onChange(undefined)}
-                        className="text-primary hover:underline text-[10px]"
+                        className="text-[#2f62b8] dark:text-[#f6d94d] hover:underline text-[10px] font-black"
                     >
                         Reset ({range[0]} - {range[1]})
                     </button>
@@ -86,14 +86,14 @@ export const TimelineFacet: React.FC<TimelineFacetProps> = ({ data, range, onCha
                             minTickGap={30}
                         />
                         <Tooltip
-                            contentStyle={{ fontSize: '12px', padding: '4px', borderRadius: '4px' }}
+                            contentStyle={{ fontSize: '12px', padding: '4px', borderRadius: '2px', border: '2px solid #111111', background: '#ffffff' }}
                             labelStyle={{ fontWeight: 'bold' }}
                             cursor={{ fill: 'rgba(0,0,0,0.05)' }}
                         />
                         <Bar
                             dataKey="count"
-                            fill="#3b82f6"
-                            radius={[2, 2, 0, 0]}
+                            fill="#2f62b8"
+                            radius={[0, 0, 0, 0]}
                             animationDuration={300}
                             className="cursor-pointer hover:opacity-80 transition-opacity"
                             onClick={(data: any) => {
@@ -107,13 +107,13 @@ export const TimelineFacet: React.FC<TimelineFacetProps> = ({ data, range, onCha
 
                         <Brush
                             height={20}
-                            stroke="#94a3b8"
+                            stroke="#111111"
                             travellerWidth={10}
                             startIndex={startIndex}
                             endIndex={endIndex}
                             onChange={handleBrushChange}
                             alwaysShowText={false}
-                            fill="#f1f5f9"
+                            fill="#ffffff"
                         />
                     </BarChart>
                 </ResponsiveContainer>

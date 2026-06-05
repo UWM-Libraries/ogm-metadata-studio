@@ -12,14 +12,14 @@ interface ResourceEditProps {
 }
 
 const RenderSection = ({ title, children }: { title: string; children: React.ReactNode }) => (
-    <div className="mb-6 p-4 border border-gray-200 dark:border-slate-800 rounded bg-gray-50/50 dark:bg-slate-900/20">
-        <h3 className="text-sm font-semibold text-slate-800 dark:text-slate-200 mb-4 uppercase tracking-wider border-b border-gray-200 dark:border-slate-800 pb-1">
+    <section className="ogm-page-card mb-5 p-4">
+        <h3 className="ogm-section-label mb-4 border-b-2 border-[#111111]/15 pb-2 dark:border-[#f6d94d]/25">
             {title}
         </h3>
         <div className="grid grid-cols-1 gap-4">
             {children}
         </div>
-    </div>
+    </section>
 );
 
 export const ResourceEdit: React.FC<ResourceEditProps> = ({
@@ -65,13 +65,13 @@ export const ResourceEdit: React.FC<ResourceEditProps> = ({
     };
 
     const renderTextField = (label: string, field: keyof Resource, required = false) => (
-        <div className="mb-3">
-            <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">
-                {label} {required && <span className="text-red-500 dark:text-red-400">*</span>}
+        <div>
+            <label className="mb-1 block text-xs font-extrabold text-[#5a5547] dark:text-[#ffffff]/75">
+                {label} {required && <span className="text-[#cf3f32] dark:text-[#f6d94d]">*</span>}
             </label>
             <input
                 type="text"
-                className="w-full rounded bg-white dark:bg-slate-950 border border-gray-300 dark:border-slate-700 px-3 py-1.5 text-sm text-slate-900 dark:text-white focus:ring-1 focus:ring-indigo-500 focus:outline-none"
+                className="ogm-field w-full px-3 py-2 text-sm focus:outline-none"
                 value={String(resource[field] || "")}
                 onChange={(e) => handleChange(field, e.target.value)}
             />
@@ -79,10 +79,10 @@ export const ResourceEdit: React.FC<ResourceEditProps> = ({
     );
 
     const renderTextArea = (label: string, field: keyof Resource) => (
-        <div className="mb-3">
-            <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">{label}</label>
+        <div>
+            <label className="mb-1 block text-xs font-extrabold text-[#5a5547] dark:text-[#ffffff]/75">{label}</label>
             <textarea
-                className="w-full rounded bg-white dark:bg-slate-950 border border-gray-300 dark:border-slate-700 px-3 py-1.5 text-sm text-slate-900 dark:text-white focus:ring-1 focus:ring-indigo-500 focus:outline-none h-20"
+                className="ogm-field h-24 w-full px-3 py-2 text-sm focus:outline-none"
                 value={String(resource[field] || "")}
                 onChange={(e) => handleChange(field, e.target.value)}
             />
@@ -90,8 +90,8 @@ export const ResourceEdit: React.FC<ResourceEditProps> = ({
     );
 
     const renderTagInput = (label: string, field: string) => (
-        <div className="mb-3">
-            <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">{label}</label>
+        <div>
+            <label className="mb-1 block text-xs font-extrabold text-[#5a5547] dark:text-[#ffffff]/75">{label}</label>
             <TagInput
                 value={(resource as any)[field] || []}
                 onChange={(vals) => handleArrayChange(field as keyof Resource, vals)}
@@ -101,10 +101,10 @@ export const ResourceEdit: React.FC<ResourceEditProps> = ({
     );
 
     const renderBoolSelect = (label: string, field: keyof Resource) => (
-        <div className="mb-3">
-            <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">{label}</label>
+        <div>
+            <label className="mb-1 block text-xs font-extrabold text-[#5a5547] dark:text-[#ffffff]/75">{label}</label>
             <select
-                className="w-full rounded bg-white dark:bg-slate-950 border border-gray-300 dark:border-slate-700 px-3 py-1.5 text-sm text-slate-900 dark:text-white focus:ring-1 focus:ring-indigo-500 focus:outline-none"
+                className="ogm-select w-full px-3 py-2 text-sm focus:outline-none"
                 value={resource[field] === true ? "true" : resource[field] === false ? "false" : ""}
                 onChange={(e) => {
                     const val = e.target.value;
@@ -119,21 +119,24 @@ export const ResourceEdit: React.FC<ResourceEditProps> = ({
     );
 
     return (
-        <form onSubmit={handleSubmit} className="flex flex-col h-full">
-            <div className="flex items-center gap-4 border-b border-gray-200 dark:border-slate-800 pb-4 mb-4">
-                <h2 className="text-lg font-semibold text-slate-900 dark:text-white">Edit Resource</h2>
-                <div className="flex gap-2 ml-auto">
+        <form onSubmit={handleSubmit} className="ogm-admin-page h-full min-h-0">
+            <div className="ogm-admin-toolbar -mx-6 -mt-6 mb-4">
+                <div className="min-w-0">
+                    <h2 className="ogm-page-title">Edit Resource</h2>
+                    <p className="ogm-page-copy mt-1 truncate">{resource.dct_title_s || resource.id || "Untitled resource"}</p>
+                </div>
+                <div className="ml-auto flex flex-wrap gap-2">
                     <button
                         type="button"
                         onClick={onCancel}
-                        className="px-3 py-1.5 text-xs text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white border border-gray-300 dark:border-slate-700 rounded hover:bg-gray-100 dark:hover:bg-slate-800"
+                        className="ogm-secondary-button"
                     >
                         Cancel
                     </button>
                     <button
                         type="submit"
                         disabled={isSaving}
-                        className="px-3 py-1.5 text-xs bg-indigo-600 text-white rounded hover:bg-indigo-500 disabled:opacity-50"
+                        className="ogm-primary-button disabled:opacity-50"
                     >
                         {isSaving ? "Saving..." : "Save Changes"}
                     </button>
@@ -141,22 +144,19 @@ export const ResourceEdit: React.FC<ResourceEditProps> = ({
             </div>
 
             {saveError && (
-                <div className="mb-4 p-3 bg-red-50 dark:bg-red-900/40 border border-red-200 dark:border-red-800 rounded text-red-700 dark:text-red-200 text-xs">
+                <div className="mb-4 border-2 border-[#111111] bg-[#cf3f32]/12 p-3 text-xs font-bold text-[#111111] shadow-[3px_3px_0_rgba(17,17,17,0.14)] dark:border-[#f6d94d] dark:bg-[#cf3f32]/35 dark:text-[#ffffff]">
                     Error saving: {saveError}
                 </div>
             )}
 
             {/* Tabs */}
-            <div className="flex gap-1 border-b border-gray-200 dark:border-slate-800 mb-4 overflow-x-auto">
+            <div className="ogm-tab-strip mb-4 overflow-x-auto">
                 {(["required", "identification", "provenance", "object", "administrative", "related"] as const).map((tab) => (
                     <button
                         key={tab}
                         type="button"
                         onClick={() => setActiveTab(tab)}
-                        className={`px-4 py-2 text-xs font-medium border-b-2 transition-colors whitespace-nowrap ${activeTab === tab
-                            ? "border-indigo-500 text-indigo-600 dark:text-indigo-400"
-                            : "border-transparent text-slate-500 hover:text-slate-700 dark:hover:text-slate-300"
-                            }`}
+                        className={`ogm-tab-button whitespace-nowrap transition-colors ${activeTab === tab ? "ogm-tab-button-active" : ""}`}
                     >
                         {tab.charAt(0).toUpperCase() + tab.slice(1)}
                     </button>
@@ -166,13 +166,13 @@ export const ResourceEdit: React.FC<ResourceEditProps> = ({
             <div className="flex-1 overflow-y-auto pr-2">
 
                 {activeTab === "required" && (
-                    <div className="space-y-4 p-1">
+                    <RenderSection title="Required Metadata">
                         {renderTextField("ID", "id", true)}
                         {renderTextField("Title", "dct_title_s", true)}
                         {renderTextField("Access Rights", "dct_accessRights_s", true)}
                         {renderTagInput("Resource Class", "gbl_resourceClass_sm")}
                         {renderTextField("Metadata Version", "gbl_mdVersion_s")}
-                    </div>
+                    </RenderSection>
                 )}
 
                 {activeTab === "identification" && (
@@ -217,7 +217,7 @@ export const ResourceEdit: React.FC<ResourceEditProps> = ({
                             {renderTextField("Provider", "schema_provider_s")}
                         </RenderSection>
                         <RenderSection title="Provenance Activity">
-                            <p className="text-xs text-slate-500 italic">No specific Aardvark fields mapped yet.</p>
+                            <p className="ogm-page-copy italic">No specific Aardvark fields mapped yet.</p>
                         </RenderSection>
                     </div>
                 )}
@@ -270,43 +270,43 @@ export const ResourceEdit: React.FC<ResourceEditProps> = ({
 
                         <RenderSection title="Distributions & Assets">
                             <div className="space-y-4">
-                                <div className="flex justify-between items-center mb-2">
-                                    <p className="text-xs text-slate-500 dark:text-slate-400">Manage download links, WMS services, etc.</p>
-                                    <button type="button" onClick={addDistribution} className="text-xs bg-gray-100 dark:bg-slate-800 hover:bg-gray-200 dark:hover:bg-slate-700 px-2 py-1 rounded border border-gray-300 dark:border-slate-600 text-slate-700 dark:text-slate-200">
+                                <div className="mb-2 flex flex-wrap items-center justify-between gap-3">
+                                    <p className="ogm-page-copy">Manage download links, WMS services, and related assets.</p>
+                                    <button type="button" onClick={addDistribution} className="ogm-secondary-button">
                                         + Add Item
                                     </button>
                                 </div>
 
                                 {distributions.length === 0 ? (
-                                    <div className="p-4 bg-white dark:bg-slate-950 rounded border border-gray-200 dark:border-slate-800 text-center text-xs text-slate-500">
+                                    <div className="ogm-empty-state p-4 text-center text-xs font-bold text-[#5a5547] dark:text-[#ffffff]/70">
                                         No distributions defined.
                                     </div>
                                 ) : (
                                     <div className="space-y-2">
                                         {distributions.map((dist, idx) => (
-                                            <div key={idx} className="flex gap-2 items-start bg-white dark:bg-slate-950 p-2 rounded border border-gray-200 dark:border-slate-800">
+                                            <div key={idx} className="ogm-panel-card grid gap-3 p-3 md:grid-cols-[minmax(8rem,1fr)_minmax(8rem,1fr)_minmax(12rem,2fr)_auto]">
                                                 <div className="flex-1">
-                                                    <label className="block text-[10px] text-slate-600 dark:text-slate-500 mb-0.5">Type (Relation)</label>
+                                                    <label className="mb-1 block text-[10px] font-extrabold uppercase text-[#5a5547] dark:text-[#ffffff]/70">Type (Relation)</label>
                                                     <input
-                                                        className="w-full bg-gray-50 dark:bg-slate-900 border border-gray-300 dark:border-slate-700 rounded px-2 py-1 text-xs text-slate-900 dark:text-white"
+                                                        className="ogm-field w-full px-2 py-1.5 text-xs"
                                                         placeholder="e.g. download, wms"
                                                         value={dist.relation_key}
                                                         onChange={(e) => updateDistribution(idx, "relation_key", e.target.value)}
                                                     />
                                                 </div>
                                                 <div className="flex-1">
-                                                    <label className="block text-[10px] text-slate-600 dark:text-slate-500 mb-0.5">Label (Optional)</label>
+                                                    <label className="mb-1 block text-[10px] font-extrabold uppercase text-[#5a5547] dark:text-[#ffffff]/70">Label (Optional)</label>
                                                     <input
-                                                        className="w-full bg-gray-50 dark:bg-slate-900 border border-gray-300 dark:border-slate-700 rounded px-2 py-1 text-xs text-slate-900 dark:text-white"
+                                                        className="ogm-field w-full px-2 py-1.5 text-xs"
                                                         placeholder="e.g. Shapefile, TIFF"
                                                         value={dist.label || ""}
                                                         onChange={(e) => updateDistribution(idx, "label", e.target.value)}
                                                     />
                                                 </div>
                                                 <div className="flex-[2]">
-                                                    <label className="block text-[10px] text-slate-600 dark:text-slate-500 mb-0.5">URL</label>
+                                                    <label className="mb-1 block text-[10px] font-extrabold uppercase text-[#5a5547] dark:text-[#ffffff]/70">URL</label>
                                                     <input
-                                                        className="w-full bg-gray-50 dark:bg-slate-900 border border-gray-300 dark:border-slate-700 rounded px-2 py-1 text-xs text-slate-900 dark:text-white"
+                                                        className="ogm-field w-full px-2 py-1.5 text-xs"
                                                         placeholder="https://..."
                                                         value={dist.url}
                                                         onChange={(e) => updateDistribution(idx, "url", e.target.value)}
@@ -315,9 +315,9 @@ export const ResourceEdit: React.FC<ResourceEditProps> = ({
                                                 <button
                                                     type="button"
                                                     onClick={() => removeDistribution(idx)}
-                                                    className="mt-4 text-slate-400 hover:text-red-500 dark:text-slate-500 dark:hover:text-red-400"
+                                                    className="ogm-danger-button self-end px-2 py-1 text-xs"
                                                 >
-                                                    ✕
+                                                    Remove
                                                 </button>
                                             </div>
                                         ))}
@@ -328,7 +328,7 @@ export const ResourceEdit: React.FC<ResourceEditProps> = ({
 
                         <RenderSection title="Extra (Read Only)">
                             {renderTagInput("Display Note", "gbl_displayNote_sm")}
-                            <div className="p-4 bg-white dark:bg-slate-950 rounded border border-gray-200 dark:border-slate-800 text-xs font-mono text-slate-600 dark:text-slate-400 max-h-40 overflow-auto">
+                            <div className="ogm-resource-code-box max-h-44 overflow-auto p-4 text-xs font-mono">
                                 {JSON.stringify(resource.extra || {}, null, 2)}
                             </div>
                         </RenderSection>

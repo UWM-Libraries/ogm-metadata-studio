@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">OpenGeoMetadata map legend logo: township plat alternative</title>
+  <desc id="desc">A Bauhaus grid logo combining railroad, spot elevation, bench mark, and an irregular cadastral township plat.</desc>
+  <defs>
+    <clipPath id="yellow-square"><rect x="32" y="32" width="80" height="80"/></clipPath>
+    <clipPath id="red-circle"><circle cx="184" cy="72" r="40"/></clipPath>
+    <clipPath id="blue-triangle"><path d="M72 144 32 224h80z"/></clipPath>
+    <clipPath id="black-square"><rect x="144" y="144" width="80" height="80"/></clipPath>
+  </defs>
+  <rect width="256" height="256" fill="#fffdf3"/>
+  <rect x="32" y="32" width="80" height="80" fill="#f6d94d"/>
+  <circle cx="184" cy="72" r="40" fill="#d52b1e"/>
+  <path d="M72 144 32 224h80z" fill="#0057b8"/>
+  <rect x="144" y="144" width="80" height="80" fill="#111111"/>
+
+  <g clip-path="url(#yellow-square)" fill="none" stroke="#111111" stroke-linecap="square">
+    <path d="M40 64h64M40 82h64" stroke-width="5"/>
+    <path d="M48 54v38M60 54v38M72 54v38M84 54v38M96 54v38" stroke-width="4"/>
+  </g>
+
+  <g clip-path="url(#red-circle)" fill="none" stroke="#fffdf3" stroke-linecap="square">
+    <path d="M184 47v50M159 72h50" stroke-width="7"/>
+    <path d="M169 57 199 87M199 57 169 87" stroke-width="4"/>
+    <circle cx="184" cy="72" r="5" fill="#fffdf3" stroke="none"/>
+  </g>
+
+  <g clip-path="url(#blue-triangle)" fill="none" stroke="#fffdf3" stroke-linecap="square">
+    <path d="M72 181v28M58 195h28" stroke-width="7"/>
+  </g>
+
+  <g clip-path="url(#black-square)" fill="none" stroke="#fffdf3" stroke-linecap="square" stroke-linejoin="miter">
+    <rect x="154" y="154" width="60" height="60" stroke-width="5"/>
+    <path d="M170 154v26M170 192v22M190 154v14M190 180v34M202 154v60" stroke-width="3"/>
+    <path d="M154 170h36M202 170h12M154 188h22M190 188h24M154 202h60" stroke-width="3"/>
+    <path d="M176 170v18M190 168h12M176 188h14" stroke-width="3"/>
+    <circle cx="154" cy="154" r="3" fill="#fffdf3" stroke="none"/>
+    <circle cx="214" cy="154" r="3" fill="#fffdf3" stroke="none"/>
+    <circle cx="154" cy="214" r="3" fill="#fffdf3" stroke="none"/>
+    <circle cx="214" cy="214" r="3" fill="#fffdf3" stroke="none"/>
+  </g>
+</svg>

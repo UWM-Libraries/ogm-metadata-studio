@@ -85,7 +85,7 @@ export const AutosuggestInput: React.FC<AutosuggestInputProps> = ({
             </div>
             <input
                 type="text"
-                className="block h-12 w-full rounded-md border-2 border-[#1e1e1e] bg-[#fffdf3] pl-11 pr-3 py-2 text-[#141414] placeholder-[#5a5547]/70 shadow-[2px_2px_0_#111111] transition-colors focus:border-[#0057b8] focus:outline-none focus:ring-2 focus:ring-[#0057b8]/30 dark:border-[#f6d94d] dark:bg-slate-950 dark:text-[#fffdf3] dark:placeholder-[#fffdf3]/50 dark:shadow-[2px_2px_0_#f6d94d] sm:text-sm"
+                className="block h-12 w-full rounded-md border-2 border-[#1e1e1e] bg-[#ffffff] pl-11 pr-3 py-2 text-[#141414] placeholder-[#5a5547]/70 shadow-[2px_2px_0_#111111] transition-colors focus:border-[#0057b8] focus:outline-none focus:ring-2 focus:ring-[#0057b8]/30 dark:border-[#f6d94d] dark:bg-slate-950 dark:text-[#ffffff] dark:placeholder-[#ffffff]/50 dark:shadow-[2px_2px_0_#f6d94d] sm:text-sm"
                 placeholder={placeholder}
                 value={value}
                 onChange={(e) => onChange(e.target.value)}
@@ -96,11 +96,11 @@ export const AutosuggestInput: React.FC<AutosuggestInputProps> = ({
             />
 
             {isOpen && (
-                <ul className="absolute z-50 mt-2 max-h-60 w-full overflow-auto rounded-md bg-[#fffdf3] dark:bg-slate-950 py-1 text-base shadow-[4px_4px_0_#111111] dark:shadow-[4px_4px_0_#f6d94d] focus:outline-none sm:text-sm border-2 border-[#1e1e1e] dark:border-[#f6d94d]">
+                <ul className="absolute z-50 mt-2 max-h-60 w-full overflow-auto rounded-md bg-[#ffffff] dark:bg-slate-950 py-1 text-base shadow-[4px_4px_0_#111111] dark:shadow-[4px_4px_0_#f6d94d] focus:outline-none sm:text-sm border-2 border-[#1e1e1e] dark:border-[#f6d94d]">
                     {suggestions.map((suggestion, index) => (
                         <li
                             key={index}
-                            className={`relative cursor-default select-none py-2 pl-3 pr-9 ${index === focusedIndex ? "bg-[#0057b8] text-white" : "text-[#141414] dark:text-[#fffdf3] hover:bg-[#f6d94d]/40 dark:hover:bg-slate-800"
+                            className={`relative cursor-default select-none py-2 pl-3 pr-9 ${index === focusedIndex ? "bg-[#0057b8] text-white" : "text-[#141414] dark:text-[#ffffff] hover:bg-[#f6d94d]/40 dark:hover:bg-slate-800"
                                 }`}
                             onClick={() => selectSuggestion(suggestion)}
                             onMouseEnter={() => setFocusedIndex(index)}
@@ -109,7 +109,7 @@ export const AutosuggestInput: React.FC<AutosuggestInputProps> = ({
                                 <span className={`block truncate ${index === focusedIndex ? "font-semibold" : "font-normal"}`}>
                                     {suggestion.text}
                                 </span>
-                                <span className={`text-xs ml-2 ${index === focusedIndex ? "text-blue-100" : "text-[#5a5547] dark:text-[#fffdf3]/60"}`}>
+                                <span className={`text-xs ml-2 ${index === focusedIndex ? "text-blue-100" : "text-[#5a5547] dark:text-[#ffffff]/60"}`}>
                                     {suggestion.type}
                                 </span>
                             </div>

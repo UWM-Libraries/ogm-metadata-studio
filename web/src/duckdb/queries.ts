@@ -12,6 +12,28 @@ import { latLngToCell } from "h3-js";
 
 const REPEATABLE_FIELD_SET = new Set(REPEATABLE_STRING_FIELDS);
 
+function dcatBboxEnvelopeIntersectsClause(minX: number, minY: number, maxX: number, maxY: number): string {
+    const parts = "string_split(regexp_replace(dcat_bbox, 'ENVELOPE\\\\(|\\\\)', '', 'g'), ',')";
+    const west = `TRY_CAST((${parts})[1] AS DOUBLE)`;
+    const east = `TRY_CAST((${parts})[2] AS DOUBLE)`;
+    const north = `TRY_CAST((${parts})[3] AS DOUBLE)`;
+    const south = `TRY_CAST((${parts})[4] AS DOUBLE)`;
+    return `(
+        dcat_bbox LIKE 'ENVELOPE(%'
+        AND ${west} <= ${maxX}
+        AND ${east} >= ${minX}
+        AND ${south} <= ${maxY}
+        AND ${north} >= ${minY}
+    )`;
+}
+
+function spatialIntersectsClause(minX: number, minY: number, maxX: number, maxY: number): string {
+    return `(
+        ST_Intersects(geom, ST_MakeEnvelope(${minX}, ${minY}, ${maxX}, ${maxY}))
+        OR ${dcatBboxEnvelopeIntersectsClause(minX, minY, maxX, maxY)}
+    )`;
+}
+
 // Helper: Fetch full resource objects by ID
 export async function fetchResourcesByIds(conn: duckdb.AsyncDuckDBConnection, ids: string[]): Promise<Resource[]> {
     if (ids.length === 0) return [];
@@ -240,7 +262,7 @@ export function compileFacetedWhere(req: FacetedSearchRequest, omitField: string
 
     if (emitGlobal && req.bbox) {
         const { minX, minY, maxX, maxY } = req.bbox;
-        clauses.push(`ST_Intersects(geom, ST_MakeEnvelope(${minX}, ${minY}, ${maxX}, ${maxY}))`);
+        clauses.push(spatialIntersectsClause(minX, minY, maxX, maxY));
     }
 
     if (req.filters) {
@@ -299,7 +321,7 @@ export async function facetedSearch(req: FacetedSearchRequest): Promise<FacetedS
     if (req.bbox) {
         useGlobal = true;
         const { minX, minY, maxX, maxY } = req.bbox;
-        globalClauses.push(`ST_Intersects(geom, ST_MakeEnvelope(${minX}, ${minY}, ${maxX}, ${maxY}))`);
+        globalClauses.push(spatialIntersectsClause(minX, minY, maxX, maxY));
     }
 
     const globalHitsTable = `global_hits_${Math.random().toString(36).substring(7)}`;
@@ -445,7 +467,7 @@ export async function getMapH3(req: MapH3Request): Promise<MapH3Response> {
     if (req.bbox) {
         useGlobal = true;
         const { minX, minY, maxX, maxY } = req.bbox;
-        globalClauses.push(`ST_Intersects(geom, ST_MakeEnvelope(${minX}, ${minY}, ${maxX}, ${maxY}))`);
+        globalClauses.push(spatialIntersectsClause(minX, minY, maxX, maxY));
     }
     const baseWhere = compileFacetedWhere(facetedReq, null, false).sql;
 
@@ -460,20 +482,27 @@ export async function getMapH3(req: MapH3Request): Promise<MapH3Response> {
             ? `resources JOIN ${globalHitsTable} gh ON resources.id = gh.id`
             : "resources";
         const sql = `
-            SELECT resources."${col}" as h3, resources.dcat_centroid as centroid, count(*) as c
+            SELECT
+              resources."${col}" as h3,
+              resources.dcat_centroid as centroid,
+              resources.dcat_bbox as bbox,
+              resources.locn_geometry as geometry,
+              count(*) as c
             FROM ${fromClause}
             WHERE ${baseWhere}
               AND (
                 (resources."${col}" IS NOT NULL AND resources."${col}" != '')
                 OR (resources.dcat_centroid IS NOT NULL AND trim(resources.dcat_centroid) != '')
+                OR (resources.dcat_bbox IS NOT NULL AND trim(resources.dcat_bbox) != '')
+                OR (resources.locn_geometry IS NOT NULL AND trim(resources.locn_geometry) != '')
               )
-            GROUP BY resources."${col}", resources.dcat_centroid
+            GROUP BY resources."${col}", resources.dcat_centroid, resources.dcat_bbox, resources.locn_geometry
         `;
         const res = await conn.query(sql);
         const hexCounts = new Map<string, number>();
-        for (const row of res.toArray() as { h3?: unknown; centroid?: unknown; c?: unknown }[]) {
+        for (const row of res.toArray() as { h3?: unknown; centroid?: unknown; bbox?: unknown; geometry?: unknown; c?: unknown }[]) {
             const fromColumn = row.h3 == null ? "" : String(row.h3).trim();
-            const h3 = fromColumn || h3FromCentroid(row.centroid, resolution);
+            const h3 = fromColumn || h3FromCentroid(row.centroid, resolution) || h3FromGeometry(row.bbox, row.geometry, resolution);
             if (!h3) continue;
             hexCounts.set(h3, (hexCounts.get(h3) ?? 0) + Number(row.c ?? 0));
         }
@@ -506,12 +535,87 @@ function h3FromCentroid(value: unknown, resolution: number): string | null {
     return latLngToCell(centroid[0], centroid[1], resolution);
 }
 
+function h3FromGeometry(bbox: unknown, geometry: unknown, resolution: number): string | null {
+    const center = parseEnvelopeCenterForH3(bbox) || parseGeometryCenterForH3(geometry);
+    if (!center) return null;
+    return latLngToCell(center[0], center[1], resolution);
+}
+
+function parseEnvelopeCenterForH3(value: unknown): [number, number] | null {
+    if (value == null || String(value).trim() === "") return null;
+    const s = String(value).trim();
+    const envelope = s.match(/^ENVELOPE\(([^,]+),([^,]+),([^,]+),([^,]+)\)$/i);
+    if (envelope) {
+        const west = Number(envelope[1]);
+        const east = Number(envelope[2]);
+        const north = Number(envelope[3]);
+        const south = Number(envelope[4]);
+        const lat = (north + south) / 2;
+        const lng = (west + east) / 2;
+        if (validLatLng(lat, lng)) return [lat, lng];
+    }
+
+    const csv = s.split(",").map((part) => Number(part.trim()));
+    if (csv.length === 4 && csv.every(Number.isFinite)) {
+        const [west, south, east, north] = csv;
+        const lat = (north + south) / 2;
+        const lng = (west + east) / 2;
+        if (validLatLng(lat, lng)) return [lat, lng];
+    }
+
+    return null;
+}
+
+function parseGeometryCenterForH3(value: unknown): [number, number] | null {
+    if (value == null || String(value).trim() === "") return null;
+    const s = String(value).trim();
+
+    try {
+        const parsed = JSON.parse(s);
+        const bounds = coordinateBounds(parsed?.coordinates);
+        if (!bounds) return null;
+        const lat = (bounds.minLat + bounds.maxLat) / 2;
+        const lng = (bounds.minLng + bounds.maxLng) / 2;
+        if (validLatLng(lat, lng)) return [lat, lng];
+    } catch {
+        return parseEnvelopeCenterForH3(s);
+    }
+
+    return null;
+}
+
+function coordinateBounds(value: unknown): { minLat: number; maxLat: number; minLng: number; maxLng: number } | null {
+    if (!Array.isArray(value)) return null;
+    if (value.length >= 2 && typeof value[0] === "number" && typeof value[1] === "number") {
+        const lng = Number(value[0]);
+        const lat = Number(value[1]);
+        if (!validLatLng(lat, lng)) return null;
+        return { minLat: lat, maxLat: lat, minLng: lng, maxLng: lng };
+    }
+
+    let merged: { minLat: number; maxLat: number; minLng: number; maxLng: number } | null = null;
+    for (const item of value) {
+        const bounds = coordinateBounds(item);
+        if (!bounds) continue;
+        merged = merged
+            ? {
+                minLat: Math.min(merged.minLat, bounds.minLat),
+                maxLat: Math.max(merged.maxLat, bounds.maxLat),
+                minLng: Math.min(merged.minLng, bounds.minLng),
+                maxLng: Math.max(merged.maxLng, bounds.maxLng),
+            }
+            : bounds;
+    }
+    return merged;
+}
+
+function validLatLng(lat: number, lng: number): boolean {
+    return Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180;
+}
+
 function parseCentroidForH3(value: unknown): [number, number] | null {
     if (value == null || String(value).trim() === "") return null;
     const s = String(value).trim();
-    const valid = (lat: number, lng: number) => (
-        Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180
-    );
 
     try {
         if (s.startsWith("[")) {
@@ -519,15 +623,15 @@ function parseCentroidForH3(value: unknown): [number, number] | null {
             if (Array.isArray(arr) && arr.length >= 2) {
                 const first = Number(arr[0]);
                 const second = Number(arr[1]);
-                if (valid(second, first)) return [second, first];
-                if (valid(first, second)) return [first, second];
+                if (validLatLng(second, first)) return [second, first];
+                if (validLatLng(first, second)) return [first, second];
             }
         }
         const obj = JSON.parse(s);
         if (obj?.type === "Point" && Array.isArray(obj.coordinates) && obj.coordinates.length >= 2) {
             const lon = Number(obj.coordinates[0]);
             const lat = Number(obj.coordinates[1]);
-            if (valid(lat, lon)) return [lat, lon];
+            if (validLatLng(lat, lon)) return [lat, lon];
         }
     } catch {
         // Not JSON; try legacy comma-separated values below.
@@ -537,8 +641,8 @@ function parseCentroidForH3(value: unknown): [number, number] | null {
     if (!commaPair) return null;
     const first = Number(commaPair[1]);
     const second = Number(commaPair[2]);
-    if (valid(first, second)) return [first, second];
-    if (valid(second, first)) return [second, first];
+    if (validLatLng(first, second)) return [first, second];
+    if (validLatLng(second, first)) return [second, first];
     return null;
 }
 

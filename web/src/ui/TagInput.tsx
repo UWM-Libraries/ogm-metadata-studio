@@ -54,18 +54,18 @@ export const TagInput: React.FC<TagInputProps> = ({
             placeholder={placeholder || "Select or type to create..."}
             classNames={{
                 control: (state) =>
-                    `!bg-white dark:!bg-slate-950 !border-gray-300 dark:!border-slate-700 !rounded-md !min-h-[38px] ${state.isFocused ? "!border-indigo-500 !ring-1 !ring-indigo-500" : ""
+                    `!border-2 !border-[#111111] dark:!border-[#f6d94d] !bg-[#ffffff] dark:!bg-[#111111] !rounded !min-h-[42px] !shadow-[3px_3px_0_rgba(17,17,17,0.12)] ${state.isFocused ? "!outline !outline-2 !outline-[#2f62b8] !outline-offset-1" : ""
                     }`,
-                menu: () => "!bg-white dark:!bg-slate-900 !border !border-gray-200 dark:!border-slate-700 !rounded-md !mt-1 !shadow-lg",
+                menu: () => "!bg-[#ffffff] dark:!bg-[#111111] !border-2 !border-[#111111] dark:!border-[#f6d94d] !rounded !mt-1 !shadow-[4px_4px_0_rgba(17,17,17,0.18)]",
                 option: (state) =>
-                    `!cursor-pointer ${state.isFocused ? "!bg-gray-100 dark:!bg-slate-800" : "!bg-white dark:!bg-slate-900"
-                    } !text-slate-900 dark:!text-slate-200`,
-                multiValue: () => "!bg-indigo-50 dark:!bg-indigo-900/50 !rounded",
-                multiValueLabel: () => "!text-indigo-700 dark:!text-indigo-200 !text-xs",
+                    `!cursor-pointer ${state.isFocused ? "!bg-[#f6d94d]/35 dark:!bg-[#f6d94d]/20" : "!bg-[#ffffff] dark:!bg-[#111111]"
+                    } !text-[#111111] dark:!text-[#ffffff] !text-sm`,
+                multiValue: () => "!border !border-[#111111]/35 dark:!border-[#f6d94d]/65 !bg-[#f5f5f5] dark:!bg-[#ffffff]/10 !rounded-sm",
+                multiValueLabel: () => "!text-[#3f3a31] dark:!text-[#ffffff] !text-xs !font-bold",
                 multiValueRemove: () =>
-                    "!text-indigo-500 dark:!text-indigo-300 hover:!bg-indigo-100 dark:hover:!bg-indigo-800 hover:!text-indigo-700 dark:hover:!text-white !rounded-r",
-                input: () => "!text-slate-900 dark:!text-slate-100 !text-xs",
-                placeholder: () => "!text-slate-400 dark:!text-slate-500 !text-xs",
+                    "!text-[#5a5547] dark:!text-[#f6d94d] hover:!bg-[#cf3f32]/16 hover:!text-[#111111] dark:hover:!text-[#ffffff] !rounded-r-sm",
+                input: () => "!text-[#111111] dark:!text-[#ffffff] !text-sm",
+                placeholder: () => "!text-[#5a5547]/70 dark:!text-[#ffffff]/55 !text-sm",
             }}
             styles={{
                 control: (base) => ({

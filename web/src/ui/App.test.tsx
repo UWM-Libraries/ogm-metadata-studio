@@ -33,7 +33,16 @@ vi.mock('../duckdb/duckdbClient', () => ({
     queryResourceById: vi.fn(),
     upsertResource: vi.fn(),
     queryDistributionsForResource: vi.fn(),
-    countResources: vi.fn()
+    countResources: vi.fn(),
+    deleteResource: vi.fn()
+}));
+
+vi.mock('../services/processedResourceRecovery', () => ({
+    recoverProcessedS3ResourcesToLocalCatalog: vi.fn().mockResolvedValue({
+        requested: 0,
+        recovered: [],
+        missing: [],
+    }),
 }));
 
 vi.mock('../auth/useAuth', () => ({
@@ -255,16 +264,24 @@ describe('App Component', () => {
 import { appUrlOptions } from './App';
 
 describe('App URL Options', () => {
-    it('generates URL params from state', () => {
+    it('does not generate query params for path-backed state', () => {
         const p = appUrlOptions.toUrl({ view: 'edit', id: '123' });
-        expect(p.get('view')).toBe('edit');
-        expect(p.get('id')).toBe('123');
+        expect(p.toString()).toBe('');
     });
 
     it('parses state from URL params', () => {
         const p = new URLSearchParams('view=edit&id=123');
         const state = appUrlOptions.fromUrl(p, '/');
         expect(state).toEqual({ view: 'edit', id: '123' });
+    });
+
+    it('parses admin paths', () => {
+        expect(appUrlOptions.fromUrl(new URLSearchParams(), '/admin')).toEqual({ view: 'admin' });
+        expect(appUrlOptions.fromUrl(new URLSearchParams(), '/admin/resources')).toEqual({ view: 'admin' });
+        expect(appUrlOptions.fromUrl(new URLSearchParams(), '/admin/distributions')).toEqual({ view: 'distributions' });
+        expect(appUrlOptions.fromUrl(new URLSearchParams(), '/admin/import')).toEqual({ view: 'import' });
+        expect(appUrlOptions.fromUrl(new URLSearchParams(), '/admin/enrichments')).toEqual({ view: 'enrichments' });
+        expect(appUrlOptions.fromUrl(new URLSearchParams(), '/admin/resources/new')).toEqual({ view: 'create' });
     });
 
     it('parses RESTful resource edit path', () => {
@@ -287,5 +304,13 @@ describe('App URL Options', () => {
         expect(appUrlOptions.path({ view: 'resource_admin', id: '123' })).toBe('/resources/123/admin');
         expect(appUrlOptions.path({ view: 'resource', id: '123' })).toBe('/resources/123');
         expect(appUrlOptions.path({ view: 'dashboard' })).toBe('/');
+    });
+
+    it('generates paths for admin views', () => {
+        expect(appUrlOptions.path({ view: 'admin' })).toBe('/admin/resources');
+        expect(appUrlOptions.path({ view: 'distributions' })).toBe('/admin/distributions');
+        expect(appUrlOptions.path({ view: 'import' })).toBe('/admin/import');
+        expect(appUrlOptions.path({ view: 'enrichments' })).toBe('/admin/enrichments');
+        expect(appUrlOptions.path({ view: 'create' })).toBe('/admin/resources/new');
     });
 });

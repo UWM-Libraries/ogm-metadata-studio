@@ -159,7 +159,7 @@ export const ResourceViewer: React.FC<ResourceViewerProps> = ({ resource, distri
 
     if (viewerType === 'clover') {
         return (
-            <div className="mb-8 border border-gray-200 dark:border-slate-700 rounded-lg overflow-hidden bg-black">
+            <div className="ogm-resource-viewer overflow-hidden bg-black">
                 <CloverViewer
                     key={endpoint}
                     iiifManifestUrl={endpoint}
@@ -171,7 +171,7 @@ export const ResourceViewer: React.FC<ResourceViewerProps> = ({ resource, distri
 
     if (viewerType === 'iiif-image') {
         return (
-            <div className="mb-8 border border-gray-200 dark:border-slate-700 rounded-lg overflow-hidden bg-black">
+            <div className="ogm-resource-viewer overflow-hidden bg-black">
                 <IiifImageViewer
                     key={endpoint}
                     infoUrl={endpoint}
@@ -194,7 +194,7 @@ export const ResourceViewer: React.FC<ResourceViewerProps> = ({ resource, distri
 
         return (
             <>
-                <div className="mb-8 border border-gray-200 dark:border-slate-700 rounded-lg overflow-hidden relative z-0">
+                <div className="ogm-resource-viewer relative z-0 overflow-hidden">
                     <div key={endpoint} className="viewer h-[500px] w-full">
                         <MapLibreResourceViewer
                             protocol={protocol}

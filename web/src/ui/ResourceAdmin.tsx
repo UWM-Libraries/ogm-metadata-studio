@@ -2,12 +2,13 @@ import React, { useLayoutEffect, useRef, useEffect, useState } from 'react';
 import maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import { Resource } from '../aardvark/model';
+import { OPENFREEMAP_BRIGHT_STYLE } from '../config/mapStyles';
 import { queryResourceById } from '../duckdb/duckdbClient';
 import { textToLngLatBounds, type LngLatBoundsTuple } from './viewers/maplibreBounds';
 
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 
-const MAP_STYLE = "https://tiles.openfreemap.org/styles/bright";
+const MAP_STYLE = OPENFREEMAP_BRIGHT_STYLE;
 
 const AdminStaticMap: React.FC<{ bounds: LngLatBoundsTuple }> = ({ bounds }) => {
     const containerRef = useRef<HTMLDivElement>(null);

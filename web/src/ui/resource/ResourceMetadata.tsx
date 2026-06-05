@@ -28,10 +28,10 @@ interface ResourceMetadataProps {
 
 export const ResourceMetadata: React.FC<ResourceMetadataProps> = ({ resource }) => {
     return (
-        <div className="flex-1 min-w-0 p-6 border-r border-gray-200 dark:border-slate-800">
-            <h2 className="text-lg font-semibold mb-4 text-slate-900 dark:text-white">Full Details</h2>
+        <section className="ogm-resource-metadata ogm-page-card min-w-0 p-6">
+            <h2 className="ogm-page-card-title mb-4 text-lg">Full Details</h2>
 
-            <dl className="grid grid-cols-[160px_1fr] gap-y-4 text-sm">
+            <dl className="grid gap-y-4 text-sm md:grid-cols-[160px_1fr]">
                 {Object.entries(resource).map(([key, value]) => {
                     if (!value || (Array.isArray(value) && value.length === 0) || HIDDEN_DETAIL_FIELDS.has(key) || key.startsWith('_')) return null;
                     // Basic label formatting
@@ -39,8 +39,8 @@ export const ResourceMetadata: React.FC<ResourceMetadataProps> = ({ resource }) 
 
                     return (
                         <React.Fragment key={key}>
-                            <dt className="font-medium text-slate-500 dark:text-slate-400">{label}</dt>
-                            <dd className="text-slate-900 dark:text-slate-200 break-all">
+                            <dt className="ogm-section-label">{label}</dt>
+                            <dd className="break-all font-semibold text-[#141414] dark:text-[#ffffff]">
                                 {(() => {
                                     const isFacetable = FACETABLE_FIELDS.includes(key);
                                     const values = Array.isArray(value) ? value : [String(value)];
@@ -51,7 +51,7 @@ export const ResourceMetadata: React.FC<ResourceMetadataProps> = ({ resource }) 
                                             {isFacetable ? (
                                                 <Link
                                                     href={`/?include_filters[${key}][]=${encodeURIComponent(val)}`}
-                                                    className="text-indigo-600 dark:text-indigo-400 hover:underline"
+                                                    className="ogm-table-link"
                                                     title={val}
                                                 >
                                                     {displayAardvarkValue(key, val)}
@@ -67,6 +67,6 @@ export const ResourceMetadata: React.FC<ResourceMetadataProps> = ({ resource }) 
                     );
                 })}
             </dl>
-        </div>
+        </section>
     );
 };

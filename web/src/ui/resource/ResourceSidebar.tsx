@@ -2,6 +2,7 @@ import React, { useLayoutEffect, useMemo, useRef } from 'react';
 import maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import { Distribution, Resource } from '../../aardvark/model';
+import { OPENFREEMAP_BRIGHT_STYLE } from '../../config/mapStyles';
 import { CopyButton } from './CopyButton';
 import { textToLngLatBounds, type LngLatBoundsTuple } from '../viewers/maplibreBounds';
 import {
@@ -13,7 +14,7 @@ import {
     uniqueSortedDistributions,
 } from './distributionLinks';
 
-const MAP_STYLE = "https://tiles.openfreemap.org/styles/bright";
+const MAP_STYLE = OPENFREEMAP_BRIGHT_STYLE;
 const EMPTY_DISTRIBUTIONS: Distribution[] = [];
 
 interface ResourceSidebarProps {
@@ -95,10 +96,10 @@ export const ResourceSidebar: React.FC<ResourceSidebarProps> = ({ resource, dist
     }, [resource]);
 
     return (
-        <div className="w-full lg:w-96 p-6 flex flex-col gap-6 bg-gray-50 dark:bg-slate-900/50">
-            <div className="bg-white dark:bg-slate-800 rounded-lg shadow-sm border border-gray-200 dark:border-slate-700 overflow-hidden">
-                <div className="p-3 border-b border-gray-200 dark:border-slate-700 font-semibold text-sm">Location</div>
-                <div className="h-64 relative z-0">
+        <aside className="ogm-resource-sidebar flex w-full flex-col gap-6 lg:w-96">
+            <div className="ogm-page-card overflow-hidden">
+                <div className="border-b-2 border-[#111111] p-3 text-sm font-black dark:border-[#f6d94d]">Location</div>
+                <div className="ogm-media-frame relative z-0 h-64 border-0">
                     {bounds ? (
                         <div ref={containerRef} className="h-full w-full" />
                     ) : (
@@ -107,18 +108,18 @@ export const ResourceSidebar: React.FC<ResourceSidebarProps> = ({ resource, dist
                 </div>
             </div>
 
-            <div className="bg-white dark:bg-slate-800 rounded-lg shadow-sm border border-gray-200 dark:border-slate-700">
-                <div className="flex items-center justify-between border-b border-gray-200 p-3 text-sm font-semibold dark:border-slate-700">
+            <div className="ogm-page-card">
+                <div className="flex items-center justify-between border-b-2 border-[#111111] p-3 text-sm font-black dark:border-[#f6d94d]">
                     <span>Downloads</span>
                     {downloadItems.length > 0 && (
-                        <span className="text-xs font-medium text-slate-500 dark:text-slate-400">
+                        <span className="ogm-count-badge">
                             {downloadItems.length} file{downloadItems.length === 1 ? "" : "s"}
                         </span>
                     )}
                 </div>
                 <div className="p-4">
                     {downloadItems.length > 0 ? (
-                        <ul className="divide-y divide-gray-100 dark:divide-slate-700">
+                        <ul className="divide-y divide-[#111111]/15 dark:divide-[#f6d94d]/20">
                             {downloadItems.map((distribution) => {
                                 const label = relationLabel(distribution);
                                 const actionLabel = label.toLowerCase() === "download" ? "Download resource" : `Download ${label}`;
@@ -126,12 +127,12 @@ export const ResourceSidebar: React.FC<ResourceSidebarProps> = ({ resource, dist
                                     <li key={`${distribution.relation_key}-${distribution.url}`} className="py-3 first:pt-0 last:pb-0">
                                         <div className="flex items-start gap-3">
                                             <div className="min-w-0 flex-1">
-                                                <div className="text-sm font-semibold text-slate-900 dark:text-slate-100">{label}</div>
-                                                <code className="mt-1 inline-block max-w-full truncate rounded bg-gray-100 px-1.5 py-0.5 text-xs text-slate-700 dark:bg-slate-900 dark:text-slate-300">
+                                                <div className="text-sm font-black text-[#111111] dark:text-[#ffffff]">{label}</div>
+                                                <code className="ogm-tag mt-1 inline-block max-w-full truncate px-1.5 py-0.5 text-xs">
                                                     {shortRelationKey(distribution.relation_key)}
                                                 </code>
                                                 <div
-                                                    className="mt-1 truncate text-xs text-slate-500 dark:text-slate-400"
+                                                    className="ogm-page-copy mt-1 truncate text-xs"
                                                     title={distribution.url}
                                                 >
                                                     {displayUrl(distribution.url)}
@@ -142,7 +143,7 @@ export const ResourceSidebar: React.FC<ResourceSidebarProps> = ({ resource, dist
                                                 target="_blank"
                                                 rel="noopener noreferrer"
                                                 aria-label={actionLabel}
-                                                className="shrink-0 rounded border border-gray-200 px-2.5 py-1.5 text-xs font-medium text-slate-700 transition-colors hover:bg-gray-50 dark:border-slate-600 dark:text-slate-200 dark:hover:bg-slate-700"
+                                                className="ogm-secondary-button shrink-0 px-2.5 py-1.5 text-xs"
                                             >
                                                 Download
                                             </a>
@@ -152,31 +153,31 @@ export const ResourceSidebar: React.FC<ResourceSidebarProps> = ({ resource, dist
                             })}
                         </ul>
                     ) : (
-                        <span className="text-sm text-slate-500">No direct download available.</span>
+                        <span className="ogm-page-copy text-sm">No direct download available.</span>
                     )}
                 </div>
             </div>
 
-            <div className="bg-white dark:bg-slate-800 rounded-lg shadow-sm border border-gray-200 dark:border-slate-700">
-                <div className="p-3 border-b border-gray-200 dark:border-slate-700 font-semibold text-sm">Cite & Reference</div>
+            <div className="ogm-page-card">
+                <div className="border-b-2 border-[#111111] p-3 text-sm font-black dark:border-[#f6d94d]">Cite & Reference</div>
                 <div className="p-4 space-y-4">
                     <div>
-                        <label className="block text-xs font-semibold text-slate-500 dark:text-slate-400 mb-1">Citation</label>
+                        <label className="ogm-section-label mb-1 block">Citation</label>
                         <div className="flex gap-2">
-                            <div className="flex-1 min-w-0 bg-gray-50 dark:bg-slate-900 border border-gray-200 dark:border-slate-700 rounded p-2 text-xs text-slate-700 dark:text-slate-300 break-words font-mono">
+                            <div className="ogm-resource-code-box flex-1 min-w-0 break-words p-2 font-mono text-xs">
                                 {citationText}
                             </div>
                             <CopyButton text={citationText} />
                         </div>
                     </div>
                     <div>
-                        <label className="block text-xs font-semibold text-slate-500 dark:text-slate-400 mb-1">Share Link</label>
+                        <label className="ogm-section-label mb-1 block">Share Link</label>
                         <div className="flex gap-2">
                             <input
                                 type="text"
                                 readOnly
                                 value={window.location.href}
-                                className="flex-1 min-w-0 bg-gray-50 dark:bg-slate-900 border border-gray-200 dark:border-slate-700 rounded p-2 text-xs text-slate-700 dark:text-slate-300 font-mono focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                                className="ogm-field flex-1 min-w-0 p-2 font-mono text-xs"
                                 onClick={(e) => e.currentTarget.select()}
                             />
                             <CopyButton text={window.location.href} />
@@ -184,6 +185,6 @@ export const ResourceSidebar: React.FC<ResourceSidebarProps> = ({ resource, dist
                     </div>
                 </div>
             </div>
-        </div>
+        </aside>
     );
 };
