@@ -2,24 +2,24 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
-const SEATTLE_BBOX = [-122.46, 47.48, -122.22, 47.75];
+const NEVADA_BBOX = [-120.006, 35.001, -114.039, 42.002];
 
-function bboxString(bbox = SEATTLE_BBOX) {
+function bboxString(bbox = NEVADA_BBOX) {
   return bbox.join(",");
 }
 
-export function gazetteerSourceJobs({ bbox = SEATTLE_BBOX, generatedAt = new Date().toISOString() } = {}) {
+export function gazetteerSourceJobs({ bbox = NEVADA_BBOX, generatedAt = new Date().toISOString() } = {}) {
   return {
     schemaVersion: "gazetteer-source-jobs-v1",
     region: {
-      id: "seattle",
-      label: "Seattle pilot",
+      id: "nevada",
+      label: "Nevada pilot",
       bbox,
     },
     generatedAt,
     jobs: [
       {
-        id: "gnis-us-wa",
+        id: "gnis-us-nv",
         source: "USGS GNIS",
         status: "ready",
         licenseClass: "public_domain",
@@ -30,7 +30,7 @@ export function gazetteerSourceJobs({ bbox = SEATTLE_BBOX, generatedAt = new Dat
           {
             kind: "download",
             url: "https://prd-tnm.s3.amazonaws.com/index.html?prefix=StagedProducts/GeographicNames/DomesticNames/",
-            note: "Use the current DomesticNames_WA_Text.zip for the Seattle pilot; switch to the National text zip for broader builds.",
+            note: "Use the current DomesticNames_NV_Text.zip for the Nevada pilot; switch to the National text zip for broader builds.",
           },
           {
             kind: "normalize",
@@ -39,12 +39,12 @@ export function gazetteerSourceJobs({ bbox = SEATTLE_BBOX, generatedAt = new Dat
         ],
       },
       {
-        id: "wikidata-seattle-places",
+        id: "wikidata-nevada-places",
         source: "Wikidata",
         status: "ready",
         licenseClass: "cc0",
         attribution: "Wikidata contributors",
-        purpose: "Aliases, multilingual labels, and crosslinks for records with Wikidata ids or coordinates in the Seattle bbox.",
+        purpose: "Aliases, multilingual labels, and crosslinks for records with Wikidata ids or coordinates in the Nevada bbox.",
         output: ".cache/gazetteers/wikidata/index.ndjson",
         steps: [
           {
@@ -54,52 +54,52 @@ export function gazetteerSourceJobs({ bbox = SEATTLE_BBOX, generatedAt = new Dat
           },
           {
             kind: "normalize",
-            command: `npm run build:wikidata-index -- --bbox=${bboxString(bbox)} --output=./.cache/gazetteers/wikidata/index.ndjson --refresh`,
+            command: `npm run build:wikidata-index -- --bbox=${bboxString(bbox)} --output=./.cache/gazetteers/wikidata/index.ndjson --no-aliases --refresh`,
           },
         ],
       },
       {
-        id: "seattle-open-data-places",
-        source: "Seattle GeoData",
+        id: "nevada-open-data-places",
+        source: "Nevada open GIS",
         status: "ready",
         licenseClass: "attribution_or_local_open_data",
-        attribution: "City of Seattle Open Data",
+        attribution: "Nevada open data providers",
         purpose: "Local parks, libraries, civic places, landmarks, neighborhoods, and transportation features.",
-        output: ".cache/gazetteers/seattle-gis/index.ndjson",
+        output: ".cache/gazetteers/nevada-gis/index.ndjson",
         steps: [
           {
             kind: "discover",
-            url: "https://data-seattlecitygis.opendata.arcgis.com/",
+            url: "https://data-ndot.opendata.arcgis.com/",
             note: "Resolve current ArcGIS layer URLs and persist source snapshots before normalization.",
           },
           {
             kind: "normalize",
-            command: `node ./scripts/build-arcgis-gazetteer-index.mjs --bbox=${bboxString(bbox)} --source=seattle --output=./.cache/gazetteers/seattle-gis/index.ndjson`,
+            command: `node ./scripts/build-arcgis-gazetteer-index.mjs --bbox=${bboxString(bbox)} --source=nevada --output=./.cache/gazetteers/nevada-gis/index.ndjson`,
           },
         ],
       },
       {
-        id: "king-county-open-data-places",
-        source: "King County GIS Open Data",
+        id: "clark-county-open-data-places",
+        source: "Clark County GIS Open Data",
         status: "ready",
         licenseClass: "attribution_or_local_open_data",
-        attribution: "King County GIS Open Data",
+        attribution: "Clark County GIS Open Data",
         purpose: "County parks, places, regional facilities, water features, and administrative context.",
-        output: ".cache/gazetteers/king-county-gis/index.ndjson",
+        output: ".cache/gazetteers/clark-county-gis/index.ndjson",
         steps: [
           {
             kind: "discover",
-            url: "https://gis-kingcounty.opendata.arcgis.com/",
+            url: "https://clarkcountygis-ccgismo.hub.arcgis.com/",
             note: "Resolve current ArcGIS layer URLs and persist source snapshots before normalization.",
           },
           {
             kind: "normalize",
-            command: `node ./scripts/build-arcgis-gazetteer-index.mjs --bbox=${bboxString(bbox)} --source=king-county --output=./.cache/gazetteers/king-county-gis/index.ndjson`,
+            command: `node ./scripts/build-arcgis-gazetteer-index.mjs --bbox=${bboxString(bbox)} --source=clark-county --output=./.cache/gazetteers/clark-county-gis/index.ndjson`,
           },
         ],
       },
       {
-        id: "openhistoricalmap-seattle",
+        id: "openhistoricalmap-nevada",
         source: "OpenHistoricalMap",
         status: "ready",
         licenseClass: "odbl",
@@ -110,7 +110,7 @@ export function gazetteerSourceJobs({ bbox = SEATTLE_BBOX, generatedAt = new Dat
           {
             kind: "overpass",
             url: "https://overpass-api.openhistoricalmap.org/api/interpreter",
-            note: "Fetch named features in Seattle bbox with start/end date tags.",
+            note: "Fetch named features in Nevada bbox with start/end date tags.",
           },
           {
             kind: "normalize",
@@ -125,7 +125,7 @@ export function gazetteerSourceJobs({ bbox = SEATTLE_BBOX, generatedAt = new Dat
 function parseArgs(argv) {
   const options = {
     output: "",
-    bbox: SEATTLE_BBOX,
+    bbox: NEVADA_BBOX,
   };
   for (const arg of argv) {
     if (arg.startsWith("--output=")) options.output = path.resolve(arg.slice("--output=".length));
@@ -144,14 +144,14 @@ function parseArgs(argv) {
 }
 
 function printHelp() {
-  console.log(`Generate source expansion job manifest for the Seattle gazetteer.
+  console.log(`Generate source expansion job manifest for the Nevada gazetteer.
 
 Usage:
   npm run plan:gazetteer-sources -- [options]
 
 Options:
   --output=PATH                 Write JSON manifest to path.
-  --bbox=west,south,east,north  Region bbox. Defaults to Seattle.
+  --bbox=west,south,east,north  Region bbox. Defaults to Nevada.
 `);
 }
 

@@ -5,10 +5,10 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_OUTPUT = path.resolve(__dirname, "../.cache/gazetteers/wikidata/index.ndjson");
-const DEFAULT_SOURCE = path.resolve(__dirname, "../.cache/gazetteers/wikidata/sources/seattle-wikidata.json");
+const DEFAULT_SOURCE = path.resolve(__dirname, "../.cache/gazetteers/wikidata/sources/nevada-wikidata.json");
 const DEFAULT_ENDPOINT = "https://query.wikidata.org/sparql";
-const DEFAULT_BBOX = [-122.46, 47.48, -122.22, 47.75];
-const DEFAULT_LABEL = "wikidata-seattle";
+const DEFAULT_BBOX = [-120.006, 35.001, -114.039, 42.002];
+const DEFAULT_LABEL = "wikidata-nevada";
 
 function parseArgs(argv) {
   const options = {
@@ -18,9 +18,11 @@ function parseArgs(argv) {
     endpoint: DEFAULT_ENDPOINT,
     label: DEFAULT_LABEL,
     refresh: false,
+    includeAliases: true,
   };
   for (const arg of argv) {
     if (arg === "--refresh") options.refresh = true;
+    else if (arg === "--no-aliases") options.includeAliases = false;
     else if (arg.startsWith("--bbox=")) {
       const bbox = arg.slice("--bbox=".length).split(",").map((item) => Number(item.trim()));
       if (bbox.length !== 4 || bbox.some((item) => !Number.isFinite(item))) throw new Error(`Invalid --bbox: ${arg}`);
@@ -46,10 +48,11 @@ Usage:
   npm run build:wikidata-index -- [options]
 
 Options:
-  --bbox=west,south,east,north  Bounding box. Defaults to Seattle.
+  --bbox=west,south,east,north  Bounding box. Defaults to Nevada.
   --output=PATH                 NDJSON index path.
   --source=PATH                 Cached Wikidata SPARQL JSON response path.
   --refresh                     Fetch the Wikidata Query Service before indexing.
+  --no-aliases                  Omit English aliases from the SPARQL query.
   --endpoint=URL                SPARQL endpoint.
   --label=LABEL                 Metadata label.
 `);
@@ -125,7 +128,9 @@ function addExternalId(record, namespace, value) {
   if (!record.externalIds[namespace].includes(text)) record.externalIds[namespace].push(text);
 }
 
-export function buildWikidataSparqlQuery([west, south, east, north]) {
+export function buildWikidataSparqlQuery([west, south, east, north], { includeAliases = true } = {}) {
+  const aliasSelect = includeAliases ? "?alias" : "";
+  const aliasClause = includeAliases ? "  OPTIONAL { ?place skos:altLabel ?alias FILTER(LANG(?alias) = \"en\") . }\n" : "";
   return `PREFIX bd: <http://www.bigdata.com/rdf#>
 PREFIX geo: <http://www.opengis.net/ont/geosparql#>
 PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
@@ -133,7 +138,7 @@ PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
 PREFIX wd: <http://www.wikidata.org/entity/>
 PREFIX wdt: <http://www.wikidata.org/prop/direct/>
 
-SELECT ?place ?placeLabel ?alias ?coord ?instanceLabel ?geonamesId ?gnisId ?osmRelId ?wofId WHERE {
+SELECT ?place ?placeLabel ${aliasSelect} ?coord ?instanceLabel ?geonamesId ?gnisId ?osmRelId ?wofId WHERE {
   SERVICE wikibase:box {
     ?place wdt:P625 ?coord .
     bd:serviceParam wikibase:cornerWest "Point(${west} ${south})"^^geo:wktLiteral .
@@ -144,8 +149,7 @@ SELECT ?place ?placeLabel ?alias ?coord ?instanceLabel ?geonamesId ?gnisId ?osmR
   OPTIONAL { ?place wdt:P590 ?gnisId . }
   OPTIONAL { ?place wdt:P402 ?osmRelId . }
   OPTIONAL { ?place wdt:P6766 ?wofId . }
-  OPTIONAL { ?place skos:altLabel ?alias FILTER(LANG(?alias) = "en") . }
-  SERVICE wikibase:label {
+${aliasClause}  SERVICE wikibase:label {
     bd:serviceParam wikibase:language "en" .
     ?place rdfs:label ?placeLabel .
     ?instance rdfs:label ?instanceLabel .
@@ -155,7 +159,7 @@ LIMIT 20000`;
 }
 
 async function fetchWikidata(options) {
-  const query = buildWikidataSparqlQuery(options.bbox);
+  const query = buildWikidataSparqlQuery(options.bbox, { includeAliases: options.includeAliases });
   const response = await fetch(`${options.endpoint}?${new URLSearchParams({ query, format: "json" })}`, {
     headers: {
       accept: "application/sparql-results+json",
@@ -166,7 +170,17 @@ async function fetchWikidata(options) {
     const text = await response.text().catch(() => "");
     throw new Error(`Wikidata query returned ${response.status}: ${text.slice(0, 500)}`);
   }
-  return response.json();
+  const text = await response.text();
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    const sanitized = text.replace(/[\u0000-\u001F]/g, " ");
+    try {
+      return JSON.parse(sanitized);
+    } catch {
+      throw error;
+    }
+  }
 }
 
 export function buildWikidataIndex(sparqlJson) {

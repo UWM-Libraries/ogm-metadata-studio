@@ -7,8 +7,8 @@ import JSZip from "jszip";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_SOURCE = path.resolve(__dirname, "../.cache/gazetteers/geonames/sources/US.zip");
 const DEFAULT_OUTPUT = path.resolve(__dirname, "../.cache/gazetteers/geonames/index.ndjson");
-const DEFAULT_BBOX = [-122.435956, 47.495514, -122.236044, 47.734165];
-const DEFAULT_LABEL = "geonames-seattle";
+const DEFAULT_BBOX = [-120.006, 35.001, -114.039, 42.002];
+const DEFAULT_LABEL = "geonames-nevada";
 const GEONAMES_US_URL = "https://download.geonames.org/export/dump/US.zip";
 
 const ADMIN1_NAMES = {
@@ -125,7 +125,7 @@ Usage:
 Options:
   --source=PATH                 GeoNames .zip or .txt source. Defaults to US.zip in the local cache.
   --output=PATH                 NDJSON index path.
-  --bbox=west,south,east,north  Bounding box filter. Defaults to Seattle.
+  --bbox=west,south,east,north  Bounding box filter. Defaults to Nevada.
   --refresh                     Download --source when it is missing or stale.
   --include-outside-bbox        Keep all source records instead of filtering to --bbox.
   --label=LABEL                 Metadata label.

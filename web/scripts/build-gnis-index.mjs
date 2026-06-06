@@ -5,11 +5,11 @@ import { fileURLToPath } from "node:url";
 import JSZip from "jszip";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DEFAULT_SOURCE = path.resolve(__dirname, "../.cache/gazetteers/gnis/sources/DomesticNames_WA_Text.zip");
+const DEFAULT_SOURCE = path.resolve(__dirname, "../.cache/gazetteers/gnis/sources/DomesticNames_NV_Text.zip");
 const DEFAULT_OUTPUT = path.resolve(__dirname, "../.cache/gazetteers/gnis/index.ndjson");
-const DEFAULT_BBOX = [-122.46, 47.48, -122.22, 47.75];
-const DEFAULT_LABEL = "gnis-seattle";
-const DEFAULT_DOWNLOAD_URL = "https://prd-tnm.s3.amazonaws.com/StagedProducts/GeographicNames/DomesticNames/DomesticNames_WA_Text.zip";
+const DEFAULT_BBOX = [-120.006, 35.001, -114.039, 42.002];
+const DEFAULT_LABEL = "gnis-nevada";
+const DEFAULT_DOWNLOAD_URL = "https://prd-tnm.s3.amazonaws.com/StagedProducts/GeographicNames/DomesticNames/DomesticNames_NV_Text.zip";
 
 const FEATURE_CATEGORY_BY_CLASS = {
   airport: "transportation",
@@ -114,7 +114,7 @@ Usage:
 Options:
   --source=PATH                 GNIS .zip, .txt, .psv, or .csv source.
   --output=PATH                 NDJSON index path.
-  --bbox=west,south,east,north  Bounding box filter. Defaults to Seattle.
+  --bbox=west,south,east,north  Bounding box filter. Defaults to Nevada.
   --refresh                     Download --source before indexing.
   --include-outside-bbox        Keep all source records instead of filtering to --bbox.
   --label=LABEL                 Metadata label.

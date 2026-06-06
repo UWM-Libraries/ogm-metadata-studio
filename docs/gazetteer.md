@@ -7,7 +7,7 @@ This project should treat gazetteer matching as entity resolution with provenanc
 - Match OCR-extracted map labels to canonical place candidates with reviewable evidence.
 - Keep WOF, OSM, GeoNames, GNIS, Wikidata, and local authority records as peer source evidence.
 - Preserve source snapshots, licenses, identifiers, names, geometry, hierarchy, and confidence.
-- Start with Seattle data only, then scale the same model to regional, national, and global builds.
+- Start with Nevada data for the current map-object work, then scale the same model to regional, national, and global builds.
 - Avoid runtime calls to public gazetteer APIs during enrichment. Runtime matching should query local indexes built from reproducible snapshots.
 
 ## First Implementation
@@ -29,14 +29,14 @@ Then it writes:
 - `concordance_edges.ndjson`
 - `canonical_places.ndjson`
 
-Run the Seattle build after the source indexes exist:
+Run the Nevada build after the source indexes exist:
 
 ```bash
 cd web
 npm run build:canonical-gazetteer -- \
-  --bbox=-122.46,47.48,-122.22,47.75 \
-  --output-dir ./.cache/gazetteers/canonical/seattle \
-  --label canonical-seattle
+  --bbox=-120.006,35.001,-114.039,42.002 \
+  --output-dir ./.cache/gazetteers/canonical/nevada \
+  --label canonical-nevada
 ```
 
 The current builder clusters records through two classes of evidence:
@@ -53,17 +53,18 @@ GNIS and Wikidata are now first-class canonical source inputs. They are not runt
 ```bash
 cd web
 npm run build:gnis-index -- \
-  --source ./.cache/gazetteers/gnis/sources/DomesticNames_WA_Text.zip \
+  --source ./.cache/gazetteers/gnis/sources/DomesticNames_NV_Text.zip \
   --output ./.cache/gazetteers/gnis/index.ndjson \
-  --bbox=-122.46,47.48,-122.22,47.75 \
-  --label gnis-seattle \
+  --bbox=-120.006,35.001,-114.039,42.002 \
+  --label gnis-nevada \
   --refresh
 
 npm run build:wikidata-index -- \
-  --source ./.cache/gazetteers/wikidata/sources/seattle-wikidata.json \
+  --source ./.cache/gazetteers/wikidata/sources/nevada-wikidata.json \
   --output ./.cache/gazetteers/wikidata/index.ndjson \
-  --bbox=-122.46,47.48,-122.22,47.75 \
-  --label wikidata-seattle \
+  --bbox=-120.006,35.001,-114.039,42.002 \
+  --label wikidata-nevada \
+  --no-aliases \
   --refresh
 ```
 
@@ -92,17 +93,17 @@ Each canonical place should eventually map to these tables or Parquet datasets:
 - `canonical_place`: OGM place cluster with stable id, representative label, representative geometry, source ids, review status.
 - `ocr_match_evidence`: OCR box/text group to canonical candidate evidence, stored back into `ai-enrichments.json`.
 
-## Seattle Source Priority
+## Nevada Source Priority
 
 Start with these inputs:
 
-- WOF admin and Washington venues for stable place ids, hierarchy, supersession, and existing concordances.
+- WOF admin and Nevada venues for stable place ids, hierarchy, supersession, and existing concordances.
 - OSM Overpass extract for current neighborhoods, natural features, parks, transit, civic features, landmarks, and useful tags.
 - OSM named `highway=*` ways for street-name reconciliation and abbreviation normalization.
 - GeoNames US dump for populated places, named natural features, alternate names, and GeoNames ids.
 - USGS GNIS for authoritative domestic geographic names, official/variant names, historical status, and public-domain U.S. coverage.
 - Wikidata for aliases, multilingual labels, and crosslinks where source licenses permit use.
-- City of Seattle and King County open GIS layers for local parks, libraries, civic buildings, neighborhoods, landmarks, and transportation assets.
+- Nevada state, county, and municipal open GIS layers for parks, libraries, civic buildings, neighborhoods, landmarks, and transportation assets.
 - OpenHistoricalMap for historical names and features, especially when matching older maps.
 
 Do not ingest a new source into canonical production until its license, update cadence, schema, and attribution text are recorded in `source_snapshot`.
@@ -141,12 +142,12 @@ The evaluation report includes `precision@1`, `recall@5`, ambiguity rate, new ma
 
 ## Automated QA and Expansion
 
-Use the canonical cluster audit after every Seattle build:
+Use the canonical cluster audit after every Nevada build:
 
 ```bash
 cd web
 npm run audit:canonical-gazetteer -- \
-  --index=./.cache/gazetteers/canonical/seattle/canonical_places.ndjson \
+  --index=./.cache/gazetteers/canonical/nevada/canonical_places.ndjson \
   --output=/tmp/ogm-canonical-audit.json
 ```
 
@@ -159,7 +160,7 @@ cd web
 npm run plan:gazetteer-sources -- --output=/tmp/ogm-gazetteer-source-jobs.json
 ```
 
-The generated manifest currently covers GNIS, Wikidata, City of Seattle open GIS, King County open GIS, and OpenHistoricalMap jobs for the Seattle bbox. Treat each job as a source-snapshot contract: resolve the current source URL, capture license/attribution, normalize into a compact local index, then add it to the canonical builder.
+The generated manifest currently covers GNIS, Wikidata, local open GIS, and OpenHistoricalMap jobs for the active bbox. Treat each job as a source-snapshot contract: resolve the current source URL, capture license/attribution, normalize into a compact local index, then add it to the canonical builder.
 
 After running an enrichment refresh, generate review notes with:
 
@@ -174,7 +175,7 @@ The triage report highlights placenames with missing canonical matches, ambiguou
 
 ## Scale Path
 
-The Seattle build can use NDJSON and local cache files. The web-scale version should use:
+The Nevada build can use NDJSON and local cache files. The web-scale version should use:
 
 - Object storage for raw source snapshots and generated Parquet.
 - DuckDB for local development and reproducible batch builds.
@@ -191,9 +192,9 @@ Keep license-aware product boundaries:
 - `odbl`: OSM-derived records and any derivative database output that must follow ODbL obligations.
 - `max-coverage`: all compatible sources with full attribution and license metadata.
 
-## Seattle Success Metrics
+## Nevada Success Metrics
 
-Use a hand-reviewed Seattle map set as the gold corpus. Track:
+Use a hand-reviewed Nevada map set as the gold corpus. Track:
 
 - Precision at 1 for accepted high-confidence matches.
 - Recall at 5 for visible named non-street labels.
