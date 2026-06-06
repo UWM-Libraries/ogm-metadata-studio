@@ -75,7 +75,7 @@ export const useGithubScanner = () => {
                 files = subtreeFiles.map(f => ({ ...f, path: `metadata-aardvark/${f.path}` }));
                 console.log(`[GithubImport] Found metadata-aardvark. Got ${files.length} items.`);
                 mode = 'aardvark';
-            } catch (e) {
+            } catch {
                 console.warn("[GithubImport] No metadata-aardvark folder found. Keeping checks open.");
 
                 // 2. Fallback: Check for 'json' folder (common in GBL v1 repos like Harvard)
@@ -87,7 +87,7 @@ export const useGithubScanner = () => {
                     files = subtreeFiles.map(f => ({ ...f, path: `json/${f.path}` }));
                     console.log(`[GithubImport] Found json folder. Got ${files.length} items.`);
                     mode = 'gbl1';
-                } catch (e2) {
+                } catch {
                     // 3. Fallback: Full Scan
                     console.warn("[GithubImport] No json folder found either. Falling back to full recursive.");
                     files = await client.fetchRecursiveTree({ ...repoRef, branch: effectiveBranch });

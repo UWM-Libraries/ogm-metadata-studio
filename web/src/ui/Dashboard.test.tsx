@@ -194,6 +194,7 @@ describe('Dashboard Component', () => {
         await waitFor(() => {
             expect(alertSpy).toHaveBeenCalledWith('Export failed. See console.');
         });
+        expect(consoleSpy).toHaveBeenCalledWith("Export failed", expect.any(Error));
     });
 
     it('interactions with map facet update state', () => {

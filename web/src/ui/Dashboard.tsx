@@ -398,7 +398,6 @@ const FacetSection: React.FC<{
 
     useEffect(() => {
         if (hasActiveSelection) {
-            // eslint-disable-next-line react-hooks/set-state-in-effect
             setIsOpen(true);
         }
     }, [hasActiveSelection]);

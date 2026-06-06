@@ -232,7 +232,6 @@ export async function queryResourceById(id: string): Promise<Resource | null> {
     const ctx = await getDuckDbContext();
     if (!ctx) return null;
     const { conn } = ctx;
-    const safeId = id.replace(/'/g, "''");
 
     // Slight redundancy with fetchResourcesByIds but simpler for single item
     const resources = await fetchResourcesByIds(conn, [id]);
@@ -428,7 +427,7 @@ export async function facetedSearch(req: FacetedSearchRequest): Promise<FacetedS
                         value: String(r.val),
                         count: Number(r.c)
                     }));
-                } catch (e) {
+                } catch {
                     facets[f.field] = [];
                 }
             }));
@@ -795,7 +794,7 @@ export async function suggest(text: string, limit: number = 10): Promise<Suggest
     try {
         const res = await conn.query(fullQuery);
         return res.toArray().map((r: any) => ({ text: r.match, type: r.type }));
-    } catch (e) {
+    } catch {
         return [];
     }
 }
@@ -850,7 +849,7 @@ export async function getSearchNeighbors(req: FacetedSearchRequest, currentId: s
             prevId: row.prev_id ? String(row.prev_id) : undefined,
             nextId: row.next_id ? String(row.next_id) : undefined
         };
-    } catch (e) {
+    } catch {
         return { position: 0, total: 0 };
     }
 }
@@ -919,7 +918,7 @@ export async function getFacetValues(req: FacetValueRequest): Promise<FacetValue
             values: res.toArray().map((r: any) => ({ value: String(r.val), count: Number(r.c) })),
             total: Number(countRes.toArray()[0].total)
         };
-    } catch (e) {
+    } catch {
         return { values: [], total: 0 };
     }
 }

@@ -6,8 +6,7 @@ import {
     saveProjectConfig,
     loadProjectConfig,
     clearStoredAuth,
-    upsertJsonFile,
-    upsertTextFile
+    upsertJsonFile
 } from './GithubService';
 
 describe('GithubService', () => {
@@ -33,7 +32,7 @@ describe('GithubService', () => {
             let store: Record<string, string> = {};
             return {
                 getItem: vi.fn((key: string) => store[key] || null),
-                setItem: vi.fn((key: string, value: string) => { saveProjectConfig; store[key] = value.toString(); }),
+                setItem: vi.fn((key: string, value: string) => { store[key] = value.toString(); }),
                 removeItem: vi.fn((key: string) => { delete store[key]; }),
                 clear: vi.fn(() => { store = {}; })
             };

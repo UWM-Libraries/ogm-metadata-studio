@@ -1,6 +1,6 @@
 import { getDuckDbContext } from "./dbInit";
 import { saveDb } from "./lifecycle";
-import { upsertResource, parseCentroidForH3 } from "./mutations";
+import { parseCentroidForH3 } from "./mutations";
 import { Resource, SCALAR_FIELDS, REPEATABLE_STRING_FIELDS, CSV_HEADER_MAPPING, REFERENCE_URI_MAPPING, Distribution } from "../aardvark/model";
 import { normalizeRepeatableStringValues } from "../aardvark/mapping";
 import * as duckdb from "@duckdb/duckdb-wasm";

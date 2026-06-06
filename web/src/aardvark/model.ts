@@ -329,14 +329,6 @@ export const REFERENCE_URI_MAPPING: Record<string, string> = {
   "image_map_layer": "urn:x-esri:serviceType:ArcGIS#ImageMapLayer"
 };
 
-const REQUIRED_FIELDS = [
-  "id",
-  "dct_title_s",
-  "gbl_resourceClass_sm",
-  "dct_accessRights_s",
-  "gbl_mdVersion_s",
-];
-
 function ensureMdVersion(data: AardvarkJson): void {
   if (data["gbl_mdVersion_s"] !== "Aardvark") {
     data["gbl_mdVersion_s"] = "Aardvark";

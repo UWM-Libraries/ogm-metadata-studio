@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import * as exporter from './export';
 import * as dbInit from './dbInit';
 import JSZip from 'jszip';

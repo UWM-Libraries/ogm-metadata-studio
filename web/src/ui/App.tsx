@@ -136,7 +136,6 @@ export const App: React.FC = () => {
 
   // Local state only
   const [resourceCount, setResourceCount] = useState<number>(0);
-  const [resourceCountLoading, setResourceCountLoading] = useState(true);
   const [restoreProgress, setRestoreProgress] = useState(getDuckDbRestoreStatus);
   const [canonicalResourceIdsReady, setCanonicalResourceIdsReady] = useState(false);
 
@@ -165,15 +164,12 @@ export const App: React.FC = () => {
 
   // Refresh resource count from DuckDB
   async function refreshResourceCount() {
-    setResourceCountLoading(true);
     try {
       const count = await countResources();
       setResourceCount(count);
     } catch (err) {
       console.error("Failed to refresh resource count from DuckDB", err);
       setResourceCount(0);
-    } finally {
-      setResourceCountLoading(false);
     }
   }
 

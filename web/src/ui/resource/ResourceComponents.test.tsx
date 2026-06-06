@@ -26,7 +26,7 @@ vi.mock('maplibre-gl', () => ({
 }));
 
 vi.mock('./CopyButton', () => ({
-    CopyButton: ({ text }: { text: string }) => <button data-testid="copy-btn" onClick={() => { }}>Copy</button>
+    CopyButton: () => <button data-testid="copy-btn" onClick={() => { }}>Copy</button>
 }));
 
 vi.mock('./useResourcePreviewAssets', () => ({
