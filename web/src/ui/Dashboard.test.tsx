@@ -40,7 +40,7 @@ vi.mock('./MapFacet', () => ({
     MapFacet: ({ onChange }: any) => <button onClick={() => onChange({ minX: 0, minY: 0, maxX: 10, maxY: 10 })}>Update Map Facet</button>
 }));
 vi.mock('./TimelineFacet', () => ({
-    TimelineFacet: ({ onChange }: any) => <button onClick={() => onChange([2000, 2020])}>Update Timeline Facet</button>
+    TimelineFacet: ({ onChange }: any) => <button onClick={() => onChange({ start: 2000, end: 2020 })}>Update Timeline Facet</button>
 }));
 vi.mock('./ActiveFilterBar', () => ({
     ActiveFilterBar: ({ onRemoveQuery, onRemoveFacet, onClearAll }: any) => (

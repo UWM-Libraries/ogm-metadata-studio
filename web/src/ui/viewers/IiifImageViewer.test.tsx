@@ -89,6 +89,70 @@ describe("IiifImageViewer", () => {
         vi.restoreAllMocks();
     });
 
+    it("starts with text boxes hidden, sections collapsed, and selected-only mode active", async () => {
+        render(
+            <IiifImageViewer
+                infoUrl="http://localhost/iiif/info.json"
+                textAnnotations={[
+                    makeLabelAnnotation({ id: "river", index: 1, content: "River", role: "waterbody", bbox: { x1: 0.1, y1: 0.1, x2: 0.2, y2: 0.14 }, color: "#0ea5e9" }),
+                    makeLabelAnnotation({ id: "lake", index: 2, content: "Lake", role: "waterbody", bbox: { x1: 0.3, y1: 0.3, x2: 0.4, y2: 0.34 }, color: "#0ea5e9" }),
+                ]}
+            />,
+        );
+
+        const panel = screen.getByTestId("iiif-annotation-panel");
+        await waitFor(() => expect(within(panel).getByRole("button", { name: /Water Bodies\s+2/i })).toHaveAttribute("aria-expanded", "false"));
+        expect(document.querySelectorAll('[data-annotation-overlay="true"]')).toHaveLength(0);
+        expect(within(panel).queryAllByTestId("iiif-annotation-row")).toHaveLength(0);
+        expect(within(panel).getByRole("button", { name: /Show All/i })).toBeInTheDocument();
+
+        fireEvent.click(within(panel).getByRole("button", { name: /Water Bodies\s+2/i }));
+        let rows = within(panel).getAllByTestId("iiif-annotation-row");
+        expect(rows).toHaveLength(2);
+
+        fireEvent.click(rows[0]);
+        await waitFor(() => expect(document.querySelectorAll('[data-annotation-overlay="true"]')).toHaveLength(1));
+        rows = within(panel).getAllByTestId("iiif-annotation-row");
+        expect(rows).toHaveLength(2);
+        expect(rows[0]).toHaveAttribute("data-selected", "true");
+        expect(rows[1]).toHaveAttribute("data-selected", "false");
+
+        fireEvent.click(rows[1], { ctrlKey: true });
+        await waitFor(() => expect(document.querySelectorAll('[data-annotation-overlay="true"]')).toHaveLength(2));
+        rows = within(panel).getAllByTestId("iiif-annotation-row");
+        expect(rows[0]).toHaveAttribute("data-selected", "true");
+        expect(rows[1]).toHaveAttribute("data-selected", "true");
+    });
+
+    it("keeps all boxes available while command-selecting multiple overlay boxes", async () => {
+        render(
+            <IiifImageViewer
+                infoUrl="http://localhost/iiif/info.json"
+                textAnnotations={[
+                    makeLabelAnnotation({ id: "river", index: 1, content: "River", role: "waterbody", bbox: { x1: 0.1, y1: 0.1, x2: 0.2, y2: 0.14 }, color: "#0ea5e9" }),
+                    makeLabelAnnotation({ id: "lake", index: 2, content: "Lake", role: "waterbody", bbox: { x1: 0.3, y1: 0.3, x2: 0.4, y2: 0.34 }, color: "#0ea5e9" }),
+                ]}
+            />,
+        );
+
+        const panel = screen.getByTestId("iiif-annotation-panel");
+        fireEvent.click(within(panel).getByRole("button", { name: /Show All/i }));
+
+        await waitFor(() => expect(document.querySelectorAll('[data-annotation-overlay="true"]')).toHaveLength(2));
+        let overlays = Array.from(document.querySelectorAll('[data-annotation-overlay="true"]'));
+        fireEvent.click(overlays[0], { metaKey: true });
+        overlays = Array.from(document.querySelectorAll('[data-annotation-overlay="true"]'));
+        expect(overlays).toHaveLength(2);
+        expect(overlays[0]).toHaveAttribute("data-selected", "true");
+        expect(overlays[1]).toHaveAttribute("data-selected", "false");
+
+        fireEvent.click(overlays[1], { ctrlKey: true });
+        overlays = Array.from(document.querySelectorAll('[data-annotation-overlay="true"]'));
+        expect(overlays).toHaveLength(2);
+        expect(overlays[0]).toHaveAttribute("data-selected", "true");
+        expect(overlays[1]).toHaveAttribute("data-selected", "true");
+    });
+
     it("groups peer gazetteer hits into one sidebar row and filters them from sidebar controls", async () => {
         render(
             <IiifImageViewer
@@ -144,6 +208,8 @@ describe("IiifImageViewer", () => {
 
         const panel = screen.getByTestId("iiif-annotation-panel");
         expect(within(panel).getByText("Gazetteer Matches")).toBeInTheDocument();
+        expect(within(panel).getByRole("button", { name: /Other Labels\s+1/i })).toHaveAttribute("aria-expanded", "false");
+        fireEvent.click(within(panel).getByRole("button", { name: /Other Labels\s+1/i }));
         expect(within(panel).getAllByTestId("iiif-annotation-row")).toHaveLength(1);
 
         const seattleRow = within(panel).getByTestId("iiif-annotation-row");
@@ -195,13 +261,20 @@ describe("IiifImageViewer", () => {
         const panel = screen.getByTestId("iiif-annotation-panel");
         await waitFor(() => expect(within(panel).getByRole("button", { name: /Title & Publication\s+1/i })).toBeInTheDocument());
 
-        expect(within(panel).getByRole("button", { name: /Legend & Scale\s+1/i })).toBeInTheDocument();
-        expect(within(panel).getByRole("button", { name: /Water Bodies\s+1/i })).toBeInTheDocument();
-        expect(within(panel).getByRole("button", { name: /Landmarks & Parks\s+4/i })).toBeInTheDocument();
-        expect(within(panel).getByRole("button", { name: /Neighborhoods \/ Districts\s+5/i })).toBeInTheDocument();
+        expect(within(panel).getByRole("button", { name: /Title & Publication\s+1/i })).toHaveAttribute("aria-expanded", "false");
+        expect(within(panel).getByRole("button", { name: /Legend & Scale\s+1/i })).toHaveAttribute("aria-expanded", "false");
+        expect(within(panel).getByRole("button", { name: /Water Bodies\s+1/i })).toHaveAttribute("aria-expanded", "false");
+        expect(within(panel).getByRole("button", { name: /Landmarks & Parks\s+4/i })).toHaveAttribute("aria-expanded", "false");
+        expect(within(panel).getByRole("button", { name: /Neighborhoods \/ Districts\s+5/i })).toHaveAttribute("aria-expanded", "false");
         expect(within(panel).getByRole("button", { name: /Streets & Routes\s+2/i })).toHaveAttribute("aria-expanded", "false");
         expect(within(panel).getByRole("button", { name: /Reference \/ Grid\s+1/i })).toHaveAttribute("aria-expanded", "false");
         expect(within(panel).queryByRole("button", { name: /Other Labels/i })).not.toBeInTheDocument();
+
+        fireEvent.click(within(panel).getByRole("button", { name: /Title & Publication\s+1/i }));
+        fireEvent.click(within(panel).getByRole("button", { name: /Legend & Scale\s+1/i }));
+        fireEvent.click(within(panel).getByRole("button", { name: /Water Bodies\s+1/i }));
+        fireEvent.click(within(panel).getByRole("button", { name: /Landmarks & Parks\s+4/i }));
+        fireEvent.click(within(panel).getByRole("button", { name: /Neighborhoods \/ Districts\s+5/i }));
 
         const rows = within(panel).getAllByTestId("iiif-annotation-row");
         expect(rows.map((row) => row.textContent)).toEqual(expect.arrayContaining([
@@ -250,6 +323,8 @@ describe("IiifImageViewer", () => {
         const panel = screen.getByTestId("iiif-annotation-panel");
         await waitFor(() => expect(within(panel).getByRole("button", { name: /Terrain \/ Elevation\s+2/i })).toBeInTheDocument());
         expect(within(panel).getByRole("button", { name: /Water Bodies\s+1/i })).toBeInTheDocument();
+        fireEvent.click(within(panel).getByRole("button", { name: /Terrain \/ Elevation\s+2/i }));
+        fireEvent.click(within(panel).getByRole("button", { name: /Water Bodies\s+1/i }));
         expect(panel.querySelector('[data-annotation-id="narrows"]')).not.toBeNull();
         expect(panel.querySelector('[data-annotation-id="elevation"]')).not.toBeNull();
         expect(panel.querySelector('[data-annotation-id="river"]')).not.toBeNull();
@@ -299,7 +374,7 @@ describe("IiifImageViewer", () => {
         fireEvent.change(search, { target: { value: "Pacific Heights" } });
 
         await waitFor(() => expect(within(panel).getAllByTestId("iiif-annotation-row")).toHaveLength(2));
-        expect(within(panel).getByText("2 / 4")).toBeInTheDocument();
+        expect(within(panel).getByText("0 / 2")).toBeInTheDocument();
         expect(within(panel).getAllByText("Pacific Heights")).toHaveLength(2);
         expect(within(panel).queryByText("Mission District")).not.toBeInTheDocument();
         expect(within(panel).queryByText("Golden Gate Park")).not.toBeInTheDocument();
@@ -307,7 +382,7 @@ describe("IiifImageViewer", () => {
         fireEvent.change(search, { target: { value: "5352499" } });
 
         await waitFor(() => expect(within(panel).getAllByTestId("iiif-annotation-row")).toHaveLength(1));
-        expect(within(panel).getByText("1 / 4")).toBeInTheDocument();
+        expect(within(panel).getByText("0 / 1")).toBeInTheDocument();
         const geonamesRow = within(panel).getByTestId("iiif-annotation-row");
         expect(within(geonamesRow).getByText("Pacific Heights")).toBeInTheDocument();
         expect(within(geonamesRow).getByText("GN")).toBeInTheDocument();

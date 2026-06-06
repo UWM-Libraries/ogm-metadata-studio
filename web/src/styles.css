@@ -450,7 +450,7 @@
     position: absolute;
     inset: 0 0 auto 0;
     height: 0.45rem;
-    background: linear-gradient(90deg, #cf3f32 0 33%, #2f62b8 33% 66%, #f6d94d 66% 100%);
+    background: linear-gradient(90deg, #cf3f32 0 25%, #2f62b8 25% 50%, #f6d94d 50% 75%, #111111 75% 100%);
   }
 
   .ogm-resource-breadcrumb {
@@ -468,6 +468,21 @@
     text-decoration: underline;
     text-decoration-color: #f6d94d;
     text-decoration-thickness: 2px;
+  }
+
+  .ogm-resource-nav-control {
+    min-height: 2.25rem;
+    border-width: 2px;
+    padding: 0.45rem 0.85rem;
+    font-size: 0.8125rem;
+    font-weight: 900;
+    line-height: 1;
+  }
+
+  .ogm-resource-nav-count {
+    justify-content: center;
+    border-radius: 4px;
+    box-shadow: 3px 3px 0 rgba(17, 17, 17, 0.18);
   }
 
   .ogm-resource-title {
@@ -1091,18 +1106,6 @@
     opacity: 0.42;
   }
 
-  .ogm-bg-official-logo {
-    position: absolute;
-    right: clamp(1.25rem, 4vw, 4.5rem);
-    bottom: clamp(1.5rem, 4vh, 3.25rem);
-    display: block;
-    width: clamp(9rem, 15vw, 16rem);
-    height: auto;
-    opacity: 0.62;
-    mix-blend-mode: multiply;
-    filter: saturate(1.05);
-  }
-
   .ogm-footer {
     position: relative;
     overflow: hidden;
@@ -1117,30 +1120,24 @@
     min-height: 27rem;
   }
 
-  .ogm-footer-blue-panel {
-    position: absolute;
-    inset-block: 0;
-    left: clamp(1rem, 8vw, 10.5rem);
-    width: clamp(14rem, 24vw, 24rem);
-    border-inline: 1px solid rgba(255, 255, 255, 0.05);
-    background: rgba(45, 91, 166, 0.42);
-    pointer-events: none;
-  }
-
   .ogm-footer-inner {
     position: relative;
     z-index: 1;
     width: 100%;
     margin: 0;
-    padding: clamp(3rem, 6vw, 5rem) clamp(1.25rem, 4vw, 2rem) clamp(3.5rem, 6vw, 5rem) clamp(2rem, 8vw, 10.5rem);
+    padding: clamp(3rem, 6vw, 5rem) 1.5rem clamp(3.5rem, 6vw, 5rem);
   }
 
   .ogm-footer-brand {
-    max-width: 60rem;
+    display: block;
+    width: max-content;
+    max-width: 100%;
     margin-bottom: clamp(3rem, 6vw, 5rem);
   }
 
   .ogm-footer-title {
+    display: block;
+    max-width: 100%;
     color: var(--ogm-paper);
     font-size: clamp(2.4rem, 5vw, 4rem);
     font-weight: 900;
@@ -1149,7 +1146,7 @@
   }
 
   .ogm-footer-rule {
-    width: min(38rem, 100%);
+    width: 100%;
     height: 0.55rem;
     margin-top: 0.7rem;
     background: var(--ogm-yellow);
@@ -1250,12 +1247,6 @@
     mix-blend-mode: normal;
   }
 
-  .dark .ogm-bg-official-logo {
-    opacity: 0.5;
-    mix-blend-mode: normal;
-    filter: saturate(0.95) brightness(0.92);
-  }
-
   .dark .ogm-footer {
     border-top-color: var(--ogm-yellow);
     background-color: var(--ogm-ink);
@@ -1273,25 +1264,12 @@
       display: none;
     }
 
-    .ogm-bg-official-logo {
-      right: -1.25rem;
-      bottom: 1.25rem;
-      width: 9rem;
-      opacity: 0.3;
-    }
-
     .ogm-footer {
       min-height: auto;
     }
 
-    .ogm-footer-blue-panel {
-      left: 0;
-      width: 72%;
-      opacity: 0.58;
-    }
-
     .ogm-footer-inner {
-      padding: 2.75rem 1rem 3.25rem;
+      padding: 2.75rem 1.5rem 3.25rem;
     }
 
     .ogm-footer-brand {

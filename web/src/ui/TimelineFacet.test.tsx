@@ -1,28 +1,30 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { describe, it, expect, vi } from 'vitest';
+import { render, screen, fireEvent } from '@testing-library/react';
 import { TimelineFacet } from './TimelineFacet';
 
 // Mock Recharts
-// We need to capture the props passed to Brush to trigger onChange manually
-const MockBrush = ({ onChange, startIndex, endIndex }: any) => (
-    <div data-testid="brush">
-        Brush Range: {startIndex}-{endIndex}
-        <button
-            data-testid="trigger-brush"
-            onClick={() => onChange({ startIndex: 0, endIndex: 1 })}
-        >
-            Trigger
-        </button>
-    </div>
-);
-
 vi.mock('recharts', () => ({
     ResponsiveContainer: ({ children }: any) => <div>{children}</div>,
-    BarChart: ({ children }: any) => <div>BarChart {children}</div>,
-    Bar: () => <div>Bar</div>,
+    BarChart: ({ children, onMouseDown, onMouseMove, onMouseUp }: any) => (
+        <div data-testid="bar-chart">
+            BarChart {children}
+            <button
+                data-testid="trigger-drag"
+                onClick={() => {
+                    onMouseDown({ activeLabel: 2000 });
+                    onMouseMove({ activeLabel: 2002 });
+                    onMouseUp();
+                }}
+            >
+                Trigger drag
+            </button>
+        </div>
+    ),
+    Bar: ({ children }: any) => <div>Bar {children}</div>,
+    Cell: () => null,
     XAxis: () => <div>XAxis</div>,
     Tooltip: () => <div>Tooltip</div>,
-    Brush: (props: any) => MockBrush(props)
+    ReferenceArea: () => <div>ReferenceArea</div>
 }));
 
 describe('TimelineFacet', () => {
@@ -41,38 +43,91 @@ describe('TimelineFacet', () => {
         render(<TimelineFacet data={mockData} onChange={vi.fn()} />);
         expect(screen.getByText('Year Distribution')).toBeDefined();
         expect(screen.getByText('BarChart')).toBeDefined();
+        expect(screen.getByTestId('timeline-selected-range')).toHaveTextContent('All Years');
+        expect(screen.getByLabelText('Start year')).toHaveValue('2000');
+        expect(screen.getByLabelText('End year')).toHaveValue('2002');
     });
 
-    it('handles brush change with debounce', async () => {
+    it('selects a single year from an accessible bar control', () => {
         const onChange = vi.fn();
         render(<TimelineFacet data={mockData} onChange={onChange} />);
 
-        // Chart data sorted: 2000, 2001, 2002
-        // Indices: 0, 1, 2
+        fireEvent.click(screen.getByRole('button', { name: 'Select 2001' }));
 
-        // Find the trigger button from our mock
-        const btn = screen.getByTestId('trigger-brush');
-
-        // Mock triggers startIndex:0 (2000), endIndex:1 (2001)
-        fireEvent.click(btn);
-
-        // Should not be called immediately (debounce 500ms)
-        expect(onChange).not.toHaveBeenCalled();
-
-        // Wait for debounce
-        await new Promise(r => setTimeout(r, 600));
-
-        expect(onChange).toHaveBeenCalledWith([2000, 2001]);
+        expect(onChange).toHaveBeenCalledWith({ start: 2001, end: 2001 });
     });
 
-    it('renders reset button when range provided', () => {
+    it('selects a dragged range from chart events', () => {
         const onChange = vi.fn();
-        render(<TimelineFacet data={mockData} range={[2000, 2001]} onChange={onChange} />);
+        render(<TimelineFacet data={mockData} onChange={onChange} />);
 
-        const resetBtn = screen.getByText('Reset (2000 - 2001)');
-        expect(resetBtn).toBeDefined();
+        fireEvent.click(screen.getByTestId('trigger-drag'));
 
-        fireEvent.click(resetBtn);
+        expect(onChange).toHaveBeenCalledWith({ start: 2000, end: 2002 });
+    });
+
+    it('renders selected range text and clears it', () => {
+        const onChange = vi.fn();
+        render(<TimelineFacet data={mockData} range={{ start: 2000, end: 2001 }} onChange={onChange} />);
+
+        expect(screen.getByTestId('timeline-selected-range')).toHaveTextContent('2000 - 2001');
+
+        fireEvent.click(screen.getByRole('button', { name: 'Clear' }));
         expect(onChange).toHaveBeenCalledWith(undefined);
+    });
+
+    it('allows start-only manual input', () => {
+        const onChange = vi.fn();
+        render(<TimelineFacet data={mockData} onChange={onChange} />);
+
+        fireEvent.change(screen.getByLabelText('Start year'), { target: { value: '2001' } });
+        fireEvent.change(screen.getByLabelText('End year'), { target: { value: '' } });
+        fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+
+        expect(onChange).toHaveBeenCalledWith({ start: 2001, end: null });
+    });
+
+    it('allows end-only manual input', () => {
+        const onChange = vi.fn();
+        render(<TimelineFacet data={mockData} onChange={onChange} />);
+
+        fireEvent.change(screen.getByLabelText('Start year'), { target: { value: '' } });
+        fireEvent.change(screen.getByLabelText('End year'), { target: { value: '2001' } });
+        fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+
+        expect(onChange).toHaveBeenCalledWith({ start: null, end: 2001 });
+    });
+
+    it('normalizes reversed manual input', () => {
+        const onChange = vi.fn();
+        render(<TimelineFacet data={mockData} onChange={onChange} />);
+
+        fireEvent.change(screen.getByLabelText('Start year'), { target: { value: '2002' } });
+        fireEvent.change(screen.getByLabelText('End year'), { target: { value: '2000' } });
+        fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+
+        expect(onChange).toHaveBeenCalledWith({ start: 2000, end: 2002 });
+    });
+
+    it('validates manual input', () => {
+        const onChange = vi.fn();
+        render(<TimelineFacet data={mockData} onChange={onChange} />);
+
+        fireEvent.change(screen.getByLabelText('Start year'), { target: { value: '999' } });
+        fireEvent.change(screen.getByLabelText('End year'), { target: { value: '' } });
+        fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+
+        expect(screen.getByText('Enter years as 4-digit numbers.')).toBeDefined();
+        expect(onChange).not.toHaveBeenCalled();
+    });
+
+    it('buckets long timelines by decade', () => {
+        const onChange = vi.fn();
+        const manyYears = Array.from({ length: 60 }, (_, index) => ({ value: String(1900 + index), count: 1 }));
+        render(<TimelineFacet data={manyYears} onChange={onChange} />);
+
+        fireEvent.click(screen.getByRole('button', { name: 'Select 1930 to 1939' }));
+
+        expect(onChange).toHaveBeenCalledWith({ start: 1930, end: 1939 });
     });
 });

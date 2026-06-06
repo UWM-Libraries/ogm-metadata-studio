@@ -182,6 +182,16 @@ describe('DuckDB Queries', () => {
             expect(res.values).toHaveLength(1);
             expect(res.total).toBe(100);
         });
+
+        it('applies open-ended year range filters', async () => {
+            mockConn.query.mockResolvedValueOnce({ toArray: () => [{ val: 'A', c: 10 }] });
+            mockConn.query.mockResolvedValueOnce({ toArray: () => [{ total: 100 }] });
+
+            await queries.getFacetValues({ field: 'dct_subject_sm', yearRange: ',1950' });
+
+            expect(mockConn.query.mock.calls[0][0]).toContain('CAST("gbl_indexYear_im" AS INTEGER) <= 1950');
+            expect(mockConn.query.mock.calls[0][0]).not.toContain('>= undefined');
+        });
     });
 
     describe('getMapH3', () => {

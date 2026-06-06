@@ -73,12 +73,12 @@ const CANDIDATE_LAYER_FALLBACK_COLOR = "#22c55e";
 const NEIGHBORHOOD_SECTION_ROLES = new Set(["neighborhood", "neighbourhood", "district"]);
 const NEIGHBORHOOD_SECTION_PLACETYPES = new Set(["borough", "district", "neighborhood", "neighbourhood"]);
 const ANNOTATION_SECTION_DEFINITIONS: Array<Omit<AnnotationListSection, "items">> = [
-    { id: "title", label: "Title & Publication", defaultOpen: true },
-    { id: "legend", label: "Legend & Scale", defaultOpen: true },
-    { id: "water", label: "Water Bodies", defaultOpen: true },
-    { id: "terrain", label: "Terrain / Elevation", defaultOpen: true },
-    { id: "landmark", label: "Landmarks & Parks", defaultOpen: true },
-    { id: "neighborhood", label: "Neighborhoods / Districts", defaultOpen: true },
+    { id: "title", label: "Title & Publication", defaultOpen: false },
+    { id: "legend", label: "Legend & Scale", defaultOpen: false },
+    { id: "water", label: "Water Bodies", defaultOpen: false },
+    { id: "terrain", label: "Terrain / Elevation", defaultOpen: false },
+    { id: "landmark", label: "Landmarks & Parks", defaultOpen: false },
+    { id: "neighborhood", label: "Neighborhoods / Districts", defaultOpen: false },
     { id: "street", label: "Streets & Routes", defaultOpen: false },
     { id: "reference", label: "Reference / Grid", defaultOpen: false },
     { id: "other", label: "Other Labels", defaultOpen: false },
@@ -475,7 +475,6 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
     });
     const [containerSize, setContainerSize] = useState({ width: 0, height: 0 });
     const [view, setView] = useState<ViewState>({ scale: 1, x: 0, y: 0 });
-    const [showTextOverlay, setShowTextOverlay] = useState(true);
     const [showWofAnnotations, setShowWofAnnotations] = useState(true);
     const [showOsmAnnotations, setShowOsmAnnotations] = useState(true);
     const [showGeoNamesAnnotations, setShowGeoNamesAnnotations] = useState(true);
@@ -483,9 +482,10 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
     const [showCandidateAnnotations, setShowCandidateAnnotations] = useState(true);
     const [showExtractionAnnotations, setShowExtractionAnnotations] = useState(true);
     const [showTextPanel, setShowTextPanel] = useState(true);
-    const [showSelectedTextOnly, setShowSelectedTextOnly] = useState(false);
+    const [showTextOverlay, setShowTextOverlay] = useState(false);
+    const [showSelectedTextOnly, setShowSelectedTextOnly] = useState(true);
     const [openAnnotationSectionIds, setOpenAnnotationSectionIds] = useState<Set<string>>(new Set());
-    const [selectedTextId, setSelectedTextId] = useState<string | null>(null);
+    const [selectedTextItems, setSelectedTextItems] = useState<{ ids: Set<string>; primaryId: string | null }>({ ids: new Set(), primaryId: null });
     const [annotationSearchQuery, setAnnotationSearchQuery] = useState("");
     const [isFullscreen, setIsFullscreen] = useState(false);
     const annotationDefaultsRef = useRef("");
@@ -517,12 +517,18 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
                         ? showOgmAnnotations
                     : showExtractionAnnotations
     ));
-    const activeSelectedAnnotation = enabledTextAnnotations.find((annotation) => annotation.id === selectedTextId) || null;
-    const activeSelectedTextId = activeSelectedAnnotation?.id || null;
-    const activeSelectedListItemId = activeSelectedAnnotation ? annotationListItemId(activeSelectedAnnotation) : null;
-    const isShowingSelectedTextOnly = showSelectedTextOnly && Boolean(activeSelectedListItemId);
     const annotationSearchTerm = normalizedListText(annotationSearchQuery);
     const annotationListItems = buildAnnotationListItems(enabledTextAnnotations);
+    const selectedAnnotationListItems = annotationListItems.filter((item) => selectedTextItems.ids.has(item.id));
+    const selectedVisibleListItemIds = new Set(selectedAnnotationListItems.map((item) => item.id));
+    const activeSelectedListItemId = selectedTextItems.primaryId && selectedVisibleListItemIds.has(selectedTextItems.primaryId)
+        ? selectedTextItems.primaryId
+        : selectedAnnotationListItems[0]?.id || null;
+    const activeSelectedListItem = activeSelectedListItemId
+        ? selectedAnnotationListItems.find((item) => item.id === activeSelectedListItemId) || null
+        : null;
+    const activeSelectedAnnotation = activeSelectedListItem ? preferredAnnotationForListItem(activeSelectedListItem) : null;
+    const isShowingSelectedTextOnly = showSelectedTextOnly;
     const searchedAnnotationListItems = annotationSearchTerm
         ? annotationListItems.filter((item) => annotationItemMatchesSearch(item, annotationSearchTerm))
         : annotationListItems;
@@ -532,23 +538,24 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
     const searchFilteredTextAnnotations = searchMatchedAnnotationIds
         ? enabledTextAnnotations.filter((annotation) => searchMatchedAnnotationIds.has(annotation.id))
         : enabledTextAnnotations;
-    const visibleTextAnnotations = !showTextOverlay
-        ? []
-        : isShowingSelectedTextOnly
-            ? enabledTextAnnotations.filter((annotation) => annotationListItemId(annotation) === activeSelectedListItemId)
-            : searchFilteredTextAnnotations;
-    const displayedAnnotationListItems = isShowingSelectedTextOnly && activeSelectedListItemId
-        ? annotationListItems.filter((item) => item.id === activeSelectedListItemId)
-        : searchedAnnotationListItems;
+    const selectedTextAnnotations = selectedVisibleListItemIds.size > 0
+        ? enabledTextAnnotations.filter((annotation) => selectedVisibleListItemIds.has(annotationListItemId(annotation)))
+        : [];
+    const visibleTextAnnotations = isShowingSelectedTextOnly
+        ? selectedTextAnnotations
+        : showTextOverlay ? searchFilteredTextAnnotations : [];
+    const displayedAnnotationListItems = searchedAnnotationListItems;
     const annotationListSections = buildAnnotationListSections(displayedAnnotationListItems);
+    const searchedSelectedAnnotationCount = searchedAnnotationListItems.filter((item) => selectedVisibleListItemIds.has(item.id)).length;
     const annotationCountLabel = isShowingSelectedTextOnly
-        ? `1 / ${annotationSearchTerm ? searchedAnnotationListItems.length : annotationListItems.length}`
+        ? `${searchedSelectedAnnotationCount} / ${searchedAnnotationListItems.length}`
         : annotationSearchTerm
             ? `${searchedAnnotationListItems.length} / ${annotationListItems.length}`
             : annotationListItems.length;
-    const selectedAnnotationSectionId = activeSelectedListItemId
-        ? annotationListSections.find((section) => section.items.some((item) => item.id === activeSelectedListItemId))?.id || null
-        : null;
+    const selectedAnnotationSectionSignature = annotationListSections
+        .filter((section) => section.items.some((item) => selectedVisibleListItemIds.has(item.id)))
+        .map((section) => section.id)
+        .join("|");
     const showOnlyCandidates = hasCandidateAnnotations && showCandidateAnnotations && !showWofAnnotations && !showOsmAnnotations && !showGeoNamesAnnotations && !showOgmAnnotations && !showExtractionAnnotations;
     const showOnlyExtraction = hasExtractionAnnotations && showExtractionAnnotations && !showWofAnnotations && !showOsmAnnotations && !showGeoNamesAnnotations && !showOgmAnnotations && !showCandidateAnnotations;
     const annotationPanelTitle = showOnlyCandidates
@@ -571,8 +578,9 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
         setShowOgmAnnotations(defaults.showOgm);
         setShowCandidateAnnotations(defaults.showCandidates);
         setShowExtractionAnnotations(defaults.showExtraction);
-        setShowSelectedTextOnly(false);
-        setSelectedTextId(null);
+        setShowTextOverlay(false);
+        setShowSelectedTextOnly(true);
+        setSelectedTextItems({ ids: new Set(), primaryId: null });
         setAnnotationSearchQuery("");
     }, [hasCandidateAnnotations, hasExtractionAnnotations, hasGeoNamesAnnotations, hasOgmAnnotations, hasOsmAnnotations, hasWofAnnotations, normalizedInfoUrl, textAnnotations]);
 
@@ -580,21 +588,18 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
         const signature = `${annotationSearchTerm}:${annotationListSections.map((section) => `${section.id}:${section.items.length}`).join("|")}`;
         if (annotationSectionsRef.current === signature) return;
         annotationSectionsRef.current = signature;
-        const shouldOpenAll = annotationSearchTerm || annotationListSections.length <= 3;
-        setOpenAnnotationSectionIds(new Set(annotationListSections
-            .filter((section) => shouldOpenAll || section.defaultOpen)
-            .map((section) => section.id)));
+        setOpenAnnotationSectionIds(new Set(annotationSearchTerm ? annotationListSections.map((section) => section.id) : []));
     }, [annotationListSections, annotationSearchTerm]);
 
     useEffect(() => {
-        if (!selectedAnnotationSectionId) return;
+        if (!selectedAnnotationSectionSignature) return;
+        const selectedAnnotationSectionIds = selectedAnnotationSectionSignature.split("|");
         setOpenAnnotationSectionIds((current) => {
-            if (current.has(selectedAnnotationSectionId)) return current;
             const next = new Set(current);
-            next.add(selectedAnnotationSectionId);
-            return next;
+            selectedAnnotationSectionIds.forEach((id) => next.add(id));
+            return next.size === current.size ? current : next;
         });
-    }, [selectedAnnotationSectionId]);
+    }, [selectedAnnotationSectionSignature]);
     /* eslint-enable react-hooks/set-state-in-effect */
 
     useEffect(() => {
@@ -674,11 +679,32 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
         if (target) animateViewTo(target);
     }, [animateViewTo, containerSize.height, containerSize.width, info, showTextPanel]);
 
-    const selectTextAnnotation = useCallback((annotation: TextExtractionAnnotation) => {
-        setSelectedTextId(annotation.id);
-        setShowTextOverlay(true);
-        focusTextAnnotation(annotation);
-    }, [focusTextAnnotation, setSelectedTextId, setShowTextOverlay]);
+    const selectAnnotationItem = useCallback((itemId: string, annotation: TextExtractionAnnotation, additive = false) => {
+        const isRemovingSelection = additive && selectedTextItems.ids.has(itemId);
+        setSelectedTextItems((current) => {
+            const nextIds = additive ? new Set(current.ids) : new Set<string>();
+            if (additive && nextIds.has(itemId)) nextIds.delete(itemId);
+            else nextIds.add(itemId);
+
+            const primaryId = nextIds.has(itemId)
+                ? itemId
+                : current.primaryId && nextIds.has(current.primaryId)
+                    ? current.primaryId
+                    : nextIds.values().next().value ?? null;
+
+            return { ids: nextIds, primaryId };
+        });
+
+        if (!additive) {
+            setShowSelectedTextOnly(true);
+            setShowTextOverlay(false);
+        }
+        if (!isRemovingSelection) focusTextAnnotation(annotation);
+    }, [focusTextAnnotation, selectedTextItems.ids]);
+
+    const selectTextAnnotation = useCallback((annotation: TextExtractionAnnotation, additive = false) => {
+        selectAnnotationItem(annotationListItemId(annotation), annotation, additive);
+    }, [selectAnnotationItem]);
 
     const setAnnotationEntryRef = useCallback((id: string, element: HTMLButtonElement | null) => {
         if (element) annotationEntryRefs.current.set(id, element);
@@ -922,13 +948,13 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
                 )) : (
                     <div className="flex h-full items-center justify-center text-sm text-slate-300">Loading IIIF image...</div>
                 )}
-                {info && showTextOverlay && visibleTextAnnotations.filter((annotation) => annotation.bbox).map((annotation) => {
+                {info && visibleTextAnnotations.filter((annotation) => annotation.bbox).map((annotation) => {
                     const bbox = annotation.bbox!;
                     const left = view.x + bbox.x1 * info.width * view.scale;
                     const top = view.y + bbox.y1 * info.height * view.scale;
                     const width = (bbox.x2 - bbox.x1) * info.width * view.scale;
                     const height = (bbox.y2 - bbox.y1) * info.height * view.scale;
-                    const isSelected = activeSelectedTextId === annotation.id;
+                    const isSelected = selectedVisibleListItemIds.has(annotationListItemId(annotation));
                     const needsGeometryReview = annotation.candidateStatus === "needs_review_geometry";
 
                     return (
@@ -937,6 +963,8 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
                             type="button"
                             data-annotation-id={annotation.id}
                             data-annotation-overlay="true"
+                            data-selected={isSelected ? "true" : "false"}
+                            aria-pressed={isSelected}
                             className={`absolute select-none rounded-sm border-2 text-left shadow-[0_0_0_1px_rgba(15,23,42,0.65)] transition ${isSelected ? "z-20 ring-2 ring-white" : "z-10 hover:ring-2 hover:ring-white/80"}`}
                             style={{
                                 left,
@@ -950,7 +978,7 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
                             title={`${annotation.index}. ${annotation.content}`}
                             onClick={(event) => {
                                 event.stopPropagation();
-                                selectTextAnnotation(annotation);
+                                selectTextAnnotation(annotation, event.metaKey || event.ctrlKey);
                             }}
                             onPointerDown={(event) => event.stopPropagation()}
                         >
@@ -997,9 +1025,17 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
                     <>
                         <button
                             type="button"
-                            className={`h-8 rounded px-2 text-xs font-medium ${showTextOverlay ? "bg-white/20 text-white" : "bg-white/10 text-slate-300 hover:bg-white/20"}`}
-                            title="Toggle text boxes"
-                            onClick={() => setShowTextOverlay((current) => !current)}
+                            className={`h-8 rounded px-2 text-xs font-medium ${!isShowingSelectedTextOnly && showTextOverlay ? "bg-white/20 text-white" : "bg-white/10 text-slate-300 hover:bg-white/20"}`}
+                            title={!isShowingSelectedTextOnly && showTextOverlay ? "Show selected text boxes" : "Show all text boxes"}
+                            onClick={() => {
+                                if (!isShowingSelectedTextOnly && showTextOverlay) {
+                                    setShowSelectedTextOnly(true);
+                                    setShowTextOverlay(false);
+                                } else {
+                                    setShowSelectedTextOnly(false);
+                                    setShowTextOverlay(true);
+                                }
+                            }}
                         >
                             Boxes
                         </button>
@@ -1049,18 +1085,19 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
                         <div className="text-slate-400">{annotationCountLabel}</div>
                         <button
                             type="button"
-                            className="ml-auto rounded bg-white/10 px-2 py-1 text-[10px] font-medium text-slate-200 hover:bg-white/20 disabled:cursor-not-allowed disabled:opacity-40"
-                            disabled={!activeSelectedListItemId}
-                            title={isShowingSelectedTextOnly ? "Show all rows" : "Show only the selected row"}
+                            className={`ml-auto rounded px-2 py-1 text-[10px] font-medium ${isShowingSelectedTextOnly ? "bg-white/20 text-white" : "bg-white/10 text-slate-200 hover:bg-white/20"}`}
+                            title={isShowingSelectedTextOnly ? "Show all text boxes" : "Show only selected text boxes"}
                             onClick={() => {
                                 if (isShowingSelectedTextOnly) {
                                     setShowSelectedTextOnly(false);
+                                    setShowTextOverlay(true);
                                 } else if (activeSelectedListItemId) {
                                     setShowSelectedTextOnly(true);
-                                    setShowTextOverlay(true);
-                                    const selectedItem = annotationListItems.find((item) => item.id === activeSelectedListItemId);
-                                    const annotation = selectedItem ? preferredAnnotationForListItem(selectedItem) : activeSelectedAnnotation;
-                                    if (annotation) focusTextAnnotation(annotation);
+                                    setShowTextOverlay(false);
+                                    if (activeSelectedAnnotation) focusTextAnnotation(activeSelectedAnnotation);
+                                } else {
+                                    setShowSelectedTextOnly(true);
+                                    setShowTextOverlay(false);
                                 }
                             }}
                         >
@@ -1143,7 +1180,6 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
                             value={annotationSearchQuery}
                             onChange={(event) => {
                                 setAnnotationSearchQuery(event.currentTarget.value);
-                                setShowSelectedTextOnly(false);
                             }}
                             className="min-w-0 flex-1 rounded border border-white/10 bg-white/10 px-2 py-1 text-xs text-slate-100 placeholder:text-slate-500 focus:border-indigo-300 focus:outline-none focus:ring-1 focus:ring-indigo-300"
                             placeholder="Search labels or matches..."
@@ -1154,7 +1190,6 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
                                 className="rounded bg-white/10 px-2 py-1 text-[10px] font-medium text-slate-200 hover:bg-white/20"
                                 onClick={() => {
                                     setAnnotationSearchQuery("");
-                                    setShowSelectedTextOnly(false);
                                 }}
                             >
                                 Clear
@@ -1184,7 +1219,7 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
                                     </button>
                                     {isOpen && section.items.map((item) => {
                                         const annotation = preferredAnnotationForListItem(item);
-                                        const isSelected = activeSelectedListItemId === item.id;
+                                        const isSelected = selectedVisibleListItemIds.has(item.id);
                                         const needsGeometryReview = annotation.candidateStatus === "needs_review_geometry";
                                         return (
                                             <button
@@ -1194,8 +1229,10 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
                                                 data-testid="iiif-annotation-row"
                                                 data-annotation-id={item.id}
                                                 data-annotation-row="true"
+                                                data-selected={isSelected ? "true" : "false"}
+                                                aria-pressed={isSelected}
                                                 className={`grid w-full grid-cols-[1.75rem_minmax(0,1fr)] gap-2 border-t border-white/10 px-3 py-2 text-left first:border-t-0 ${isSelected ? "bg-white/15" : "hover:bg-white/10"}`}
-                                                onClick={() => selectTextAnnotation(annotation)}
+                                                onClick={(event) => selectAnnotationItem(item.id, annotation, event.metaKey || event.ctrlKey)}
                                             >
                                                 <span
                                                     className="mt-0.5 inline-flex h-5 w-5 items-center justify-center rounded text-[10px] font-semibold text-slate-950"

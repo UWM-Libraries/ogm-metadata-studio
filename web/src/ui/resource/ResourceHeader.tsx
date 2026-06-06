@@ -54,11 +54,11 @@ export const ResourceHeader: React.FC<ResourceHeaderProps> = ({ resource, pagina
                 </div>
 
                 {/* Right: Navigation Controls */}
-                <div className="flex shrink-0 flex-wrap items-center gap-2">
+                <div className="ogm-resource-nav-controls flex shrink-0 flex-wrap items-center gap-2">
                     {/* Back to Results */}
                     <Link
                         href={`/?${window.location.search.substring(1)}`}
-                        className="ogm-secondary-button inline-flex items-center gap-1"
+                        className="ogm-secondary-button ogm-resource-nav-control inline-flex items-center gap-1"
                     >
                         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4">
                             <path fillRule="evenodd" d="M11.78 5.22a.75.75 0 010 1.06L8.06 10l3.72 3.72a.75.75 0 11-1.06 1.06l-4.25-4.25a.75.75 0 010-1.06l4.25-4.25a.75.75 0 011.06 0z" clipRule="evenodd" />
@@ -72,20 +72,20 @@ export const ResourceHeader: React.FC<ResourceHeaderProps> = ({ resource, pagina
                             <button
                                 onClick={() => pagination.prevId && onNavigate(pagination.prevId)}
                                 disabled={!pagination.prevId}
-                                className="ogm-page-button inline-flex items-center gap-1 px-3 py-1.5 text-xs"
+                                className="ogm-page-button ogm-resource-nav-control inline-flex items-center gap-1"
                             >
                                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4">
                                     <path fillRule="evenodd" d="M11.78 5.22a.75.75 0 010 1.06L8.06 10l3.72 3.72a.75.75 0 11-1.06 1.06l-4.25-4.25a.75.75 0 010-1.06l4.25-4.25a.75.75 0 011.06 0z" clipRule="evenodd" />
                                 </svg>
                                 Prev
                             </button>
-                            <span className="ogm-count-badge">
+                            <span className="ogm-count-badge ogm-resource-nav-control ogm-resource-nav-count inline-flex items-center">
                                 {pagination.position} of {pagination.total}
                             </span>
                             <button
                                 onClick={() => pagination.nextId && onNavigate(pagination.nextId)}
                                 disabled={!pagination.nextId}
-                                className="ogm-page-button inline-flex items-center gap-1 px-3 py-1.5 text-xs"
+                                className="ogm-page-button ogm-resource-nav-control inline-flex items-center gap-1"
                             >
                                 Next
                                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4">
@@ -98,7 +98,7 @@ export const ResourceHeader: React.FC<ResourceHeaderProps> = ({ resource, pagina
                     {/* Clear Search */}
                     <Link
                         href="/"
-                        className="ogm-secondary-button inline-flex items-center gap-1"
+                        className="ogm-secondary-button ogm-resource-nav-control inline-flex items-center gap-1"
                     >
                         Clear
                         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4">

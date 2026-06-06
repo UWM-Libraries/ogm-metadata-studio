@@ -6,12 +6,23 @@ import { displayAardvarkValue } from "../utils/aardvarkDisplay";
 interface ActiveFilterBarProps {
     query: string;
     facets: Record<string, string[]>;
-    yearRange?: string; // "min,max"
+    yearRange?: string; // "min,max" with either side optional
     fieldLabels?: Record<string, string>;
     onRemoveQuery: () => void;
     onRemoveFacet: (field: string, value: string) => void;
     onRemoveYearRange?: () => void;
     onClearAll: () => void;
+}
+
+function formatYearRangeLabel(yearRange: string): string {
+    const [startRaw = "", endRaw = ""] = yearRange.split(",", 2);
+    const start = startRaw.trim();
+    const end = endRaw.trim();
+
+    if (start && end) return `${start} - ${end}`;
+    if (start) return `${start}+`;
+    if (end) return `Up to ${end}`;
+    return "All Years";
 }
 
 export const ActiveFilterBar: React.FC<ActiveFilterBarProps> = ({
@@ -63,7 +74,7 @@ export const ActiveFilterBar: React.FC<ActiveFilterBarProps> = ({
             {hasYearRange && (
                 <span className="ogm-filter-chip ogm-filter-chip-year inline-flex items-center gap-1 px-3 py-1 text-xs">
                     <svg className="w-3 h-3 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>
-                    Year: {yearRange?.replace(',', ' - ')}
+                    Year: {formatYearRangeLabel(yearRange)}
                     {onRemoveYearRange && (
                         <button
                             onClick={onRemoveYearRange}

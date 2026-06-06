@@ -12,7 +12,7 @@ export interface FacetedSearchRequest {
     page?: { size: number; from: number };
     facets?: { field: string; limit?: number }[];
     bbox?: { minX: number; minY: number; maxX: number; maxY: number };
-    yearRange?: string; // "min,max" - Helper for UI, converted to filters
+    yearRange?: string; // "min,max" with either side optional - helper for UI, converted to filters
 }
 
 export interface FacetedSearchResponse {
@@ -36,7 +36,7 @@ export interface FacetValueRequest {
     q?: string; // Global Search
     filters?: Record<string, any>; // Global Filters
     bbox?: { minX: number; minY: number; maxX: number; maxY: number };
-    yearRange?: string; // "min,max"
+    yearRange?: string; // "min,max" with either side optional
 
     facetQuery?: string; // Search within facet values
     sort?: "count_desc" | "count_asc" | "alpha_asc" | "alpha_desc"; // Sort order

@@ -1,5 +1,5 @@
 import { Distribution, Resource } from '../../aardvark/model';
-import { envelopeToBounds, geoJsonToBounds, wktToBounds } from '../viewers/maplibreBounds';
+import { envelopeToBounds, geoJsonToBounds, isValidLngLatBounds, wktToBounds, type LngLatBoundsTuple } from '../viewers/maplibreBounds';
 import { vectorGeoJsonArtifactUrl } from '../viewers/artifactProxy';
 
 export interface ViewerConfig {
@@ -12,6 +12,7 @@ export interface ViewerConfig {
 }
 
 const AI_ENRICHMENTS_RELATION = "https://opengeometadata.org/reference/ai-enrichments";
+const PROJECTED_ENVELOPE_RE = /ENVELOPE\s*\(\s*([+-]?\d+(?:\.\d+)?)\s*,\s*([+-]?\d+(?:\.\d+)?)\s*,\s*([+-]?\d+(?:\.\d+)?)\s*,\s*([+-]?\d+(?:\.\d+)?)\s*\)/i;
 
 function referenceUrl(refs: Record<string, unknown>, keys: string[]): string | undefined {
     const extract = (value: unknown): string | undefined => {
@@ -187,6 +188,155 @@ function extractionEndpointFields(args: {
     };
 }
 
+function utmZoneFromResource(resource: Resource): { zone: number; northern: boolean } | null {
+    const values = [
+        resource.dct_title_s,
+        resource.dct_format_s,
+        resource.dct_accessRights_s,
+        resource.schema_provider_s,
+        ...(resource.dct_alternative_sm || []),
+        ...(resource.dct_description_sm || []),
+        ...(resource.gbl_displayNote_sm || []),
+        ...(resource.dct_subject_sm || []),
+        ...(resource.dcat_theme_sm || []),
+        ...(resource.dcat_keyword_sm || []),
+        ...(resource.dct_spatial_sm || []),
+        ...(resource.dct_identifier_sm || []),
+        ...(resource.dct_source_sm || []),
+        resource.dct_references_s,
+    ];
+    const text = values.filter(Boolean).join(" ");
+
+    const epsgMatch = text.match(/\b(?:EPSG[:\s]*)?(?:269|326)(\d{2})\b/i);
+    if (epsgMatch) {
+        const zone = Number(epsgMatch[1]);
+        if (zone >= 1 && zone <= 60) return { zone, northern: true };
+    }
+
+    const utmMatch = text.match(/\butm(?:\s+zone)?\s*(\d{1,2})\s*([ns])?\b/i);
+    if (!utmMatch) return null;
+    const zone = Number(utmMatch[1]);
+    if (!Number.isFinite(zone) || zone < 1 || zone > 60) return null;
+    return { zone, northern: (utmMatch[2] || "n").toLowerCase() !== "s" };
+}
+
+function collectCoordinatePairs(value: unknown, output: [number, number][]) {
+    if (!Array.isArray(value)) return;
+    if (value.length >= 2 && typeof value[0] === "number" && typeof value[1] === "number") {
+        output.push([value[0], value[1]]);
+        return;
+    }
+    for (const child of value) collectCoordinatePairs(child, output);
+}
+
+function coordinatePairsFromGeometryText(value: string): [number, number][] {
+    const text = value.trim();
+    if (!text) return [];
+
+    const envelopeMatch = text.match(PROJECTED_ENVELOPE_RE);
+    if (envelopeMatch) {
+        const west = Number(envelopeMatch[1]);
+        const east = Number(envelopeMatch[2]);
+        const north = Number(envelopeMatch[3]);
+        const south = Number(envelopeMatch[4]);
+        if ([west, east, north, south].every(Number.isFinite)) {
+            return [[west, north], [east, north], [east, south], [west, south]];
+        }
+    }
+
+    try {
+        const parsed = JSON.parse(text);
+        const coordinates: [number, number][] = [];
+        collectCoordinatePairs(parsed?.type === "Feature" ? parsed.geometry?.coordinates : parsed?.coordinates, coordinates);
+        if (coordinates.length > 0) return coordinates;
+    } catch {
+        // Not JSON; try WKT or comma-separated bbox below.
+    }
+
+    const numbers = text.match(/[-+]?\d*\.?\d+(?:e[-+]?\d+)?/gi)?.map(Number) ?? [];
+    if (numbers.length >= 4 && numbers.length % 2 === 0 && /^(?:MULTI)?POLYGON\s*\(/i.test(text)) {
+        const coordinates: [number, number][] = [];
+        for (let index = 0; index + 1 < numbers.length; index += 2) coordinates.push([numbers[index], numbers[index + 1]]);
+        return coordinates;
+    }
+
+    const parts = text.split(",").map(part => Number(part.trim()));
+    if (parts.length === 4 && parts.every(Number.isFinite)) {
+        const [west, south, east, north] = parts;
+        return [[west, north], [east, north], [east, south], [west, south]];
+    }
+
+    return [];
+}
+
+function utmToLngLat(easting: number, northing: number, zone: number, northern: boolean): [number, number] | null {
+    if (![easting, northing, zone].every(Number.isFinite) || zone < 1 || zone > 60) return null;
+
+    const a = 6378137;
+    const f = 1 / 298.257223563;
+    const k0 = 0.9996;
+    const eccentricitySquared = f * (2 - f);
+    const eccentricityPrimeSquared = eccentricitySquared / (1 - eccentricitySquared);
+    const x = easting - 500000;
+    const y = northern ? northing : northing - 10000000;
+    const m = y / k0;
+    const mu = m / (a * (1 - eccentricitySquared / 4 - 3 * eccentricitySquared ** 2 / 64 - 5 * eccentricitySquared ** 3 / 256));
+    const e1 = (1 - Math.sqrt(1 - eccentricitySquared)) / (1 + Math.sqrt(1 - eccentricitySquared));
+    const footpointLat = mu
+        + (3 * e1 / 2 - 27 * e1 ** 3 / 32) * Math.sin(2 * mu)
+        + (21 * e1 ** 2 / 16 - 55 * e1 ** 4 / 32) * Math.sin(4 * mu)
+        + (151 * e1 ** 3 / 96) * Math.sin(6 * mu)
+        + (1097 * e1 ** 4 / 512) * Math.sin(8 * mu);
+    const sinFootpoint = Math.sin(footpointLat);
+    const cosFootpoint = Math.cos(footpointLat);
+    const tanFootpoint = Math.tan(footpointLat);
+    const n1 = a / Math.sqrt(1 - eccentricitySquared * sinFootpoint ** 2);
+    const t1 = tanFootpoint ** 2;
+    const c1 = eccentricityPrimeSquared * cosFootpoint ** 2;
+    const r1 = a * (1 - eccentricitySquared) / (1 - eccentricitySquared * sinFootpoint ** 2) ** 1.5;
+    const d = x / (n1 * k0);
+
+    const latRad = footpointLat - (n1 * tanFootpoint / r1) * (
+        d ** 2 / 2
+        - (5 + 3 * t1 + 10 * c1 - 4 * c1 ** 2 - 9 * eccentricityPrimeSquared) * d ** 4 / 24
+        + (61 + 90 * t1 + 298 * c1 + 45 * t1 ** 2 - 252 * eccentricityPrimeSquared - 3 * c1 ** 2) * d ** 6 / 720
+    );
+    const lonRad = (
+        d
+        - (1 + 2 * t1 + c1) * d ** 3 / 6
+        + (5 - 2 * c1 + 28 * t1 - 3 * c1 ** 2 + 8 * eccentricityPrimeSquared + 24 * t1 ** 2) * d ** 5 / 120
+    ) / cosFootpoint;
+    const centralMeridian = ((zone - 1) * 6 - 180 + 3) * Math.PI / 180;
+    const lng = (centralMeridian + lonRad) * 180 / Math.PI;
+    const lat = latRad * 180 / Math.PI;
+    return Number.isFinite(lng) && Number.isFinite(lat) ? [lng, lat] : null;
+}
+
+function projectedTextToWgs84Bounds(value: string | undefined | null, projection: { zone: number; northern: boolean } | null): LngLatBoundsTuple | null {
+    if (!value || !projection) return null;
+    const projectedCoordinates = coordinatePairsFromGeometryText(value);
+    if (projectedCoordinates.length === 0) return null;
+
+    const coordinates = projectedCoordinates
+        .map(([x, y]) => utmToLngLat(x, y, projection.zone, projection.northern))
+        .filter((coordinate): coordinate is [number, number] => Boolean(coordinate));
+    if (coordinates.length === 0) return null;
+
+    let minLng = coordinates[0][0];
+    let minLat = coordinates[0][1];
+    let maxLng = minLng;
+    let maxLat = minLat;
+    for (const [lng, lat] of coordinates) {
+        minLng = Math.min(minLng, lng);
+        minLat = Math.min(minLat, lat);
+        maxLng = Math.max(maxLng, lng);
+        maxLat = Math.max(maxLat, lat);
+    }
+
+    const bounds: LngLatBoundsTuple = [[minLng, minLat], [maxLng, maxLat]];
+    return isValidLngLatBounds(bounds) ? bounds : null;
+}
+
 // Helper: Extract Geometry (BBox to Polygon or Centroid? GBL usually expects BBox as Polygon)
 export function getViewerGeometry(resource: Resource): string | undefined {
     const boundsToGeoJson = ([[w, s], [e, n]]: [[number, number], [number, number]]): string => JSON.stringify({
@@ -199,12 +349,15 @@ export function getViewerGeometry(resource: Resource): string | undefined {
             [w, n]
         ]]
     });
+    const projection = utmZoneFromResource(resource);
 
     const parseEnvelope = (str: string): string | null => {
         const bounds = envelopeToBounds(str);
         if (bounds) {
             return boundsToGeoJson(bounds);
         }
+        const projectedBounds = projectedTextToWgs84Bounds(str, projection);
+        if (projectedBounds) return boundsToGeoJson(projectedBounds);
         return null;
     };
 
@@ -214,12 +367,16 @@ export function getViewerGeometry(resource: Resource): string | undefined {
         try {
             JSON.parse(resource.locn_geometry);
             if (geoJsonToBounds(resource.locn_geometry)) return resource.locn_geometry;
+            const projectedBounds = projectedTextToWgs84Bounds(resource.locn_geometry, projection);
+            if (projectedBounds) return boundsToGeoJson(projectedBounds);
         } catch {
             // Not native JSON. Is it ENVELOPE?
             const parsed = parseEnvelope(resource.locn_geometry);
             if (parsed) return parsed;
             const wktBounds = wktToBounds(resource.locn_geometry);
             if (wktBounds) return boundsToGeoJson(wktBounds);
+            const projectedBounds = projectedTextToWgs84Bounds(resource.locn_geometry, projection);
+            if (projectedBounds) return boundsToGeoJson(projectedBounds);
         }
     }
 

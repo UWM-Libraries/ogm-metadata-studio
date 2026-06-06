@@ -7,6 +7,7 @@ import { IiifImageViewer } from './viewers/IiifImageViewer';
 import { AttributePreviewTable } from './viewers/AttributePreviewTable';
 import type { SelectableGeoJsonFeature } from './viewers/geospatialFeature';
 import { normalizeTextExtractionAnnotations, type TextExtractionAnnotation } from './viewers/textExtractionOverlay';
+import { useResourcePreviewAssets } from './resource/useResourcePreviewAssets';
 
 function localAiEnrichmentsOverrideEndpoint(resourceId: string | undefined): string | undefined {
     if (!resourceId || typeof window === "undefined") return undefined;
@@ -39,7 +40,9 @@ interface ResourceViewerProps {
     distributions?: Distribution[];
 }
 
-export const ResourceViewer: React.FC<ResourceViewerProps> = ({ resource, distributions = [] }) => {
+const EMPTY_DISTRIBUTIONS: Distribution[] = [];
+
+export const ResourceViewer: React.FC<ResourceViewerProps> = ({ resource, distributions = EMPTY_DISTRIBUTIONS }) => {
     const config = useMemo<ViewerConfig | null>(() => {
         try {
             const detected = detectViewerConfig(resource, distributions);
@@ -49,6 +52,11 @@ export const ResourceViewer: React.FC<ResourceViewerProps> = ({ resource, distri
             return null;
         }
     }, [distributions, resource]);
+    const fallbackAssets = useResourcePreviewAssets(resource, distributions, {
+        loadThumbnail: !config,
+        loadStaticMap: !config,
+        staticMapSize: { width: 960, height: 540 },
+    });
     const configuredExtractionEndpoint = config?.protocol === "iiif_image" ? config.textExtractionEndpoint : undefined;
     const extractionFallbackEndpoint = config?.protocol === "iiif_image" ? config.textExtractionFallbackEndpoint : undefined;
     const localExtractionOverrideEndpoint = configuredExtractionEndpoint || extractionFallbackEndpoint
@@ -145,7 +153,45 @@ export const ResourceViewer: React.FC<ResourceViewerProps> = ({ resource, distri
         };
     }, [extractionEndpointSignature, extractionEndpoints]);
 
-    if (!config) return null;
+    if (!config) {
+        const { thumbnailUrl, staticMapUrl, isLoadingThumbnail, isLoadingStaticMap } = fallbackAssets;
+        const primaryPreviewUrl = thumbnailUrl || staticMapUrl;
+        const formatLabel = resource.dct_format_s || resource.gbl_resourceType_sm?.[0] || "Resource";
+        const isLoading = isLoadingThumbnail || isLoadingStaticMap;
+
+        return (
+            <section className="ogm-resource-viewer overflow-hidden bg-[#111111] text-[#ffffff]">
+                <div className="border-b-2 border-[#f6d94d] bg-[#ffffff] p-4 text-[#141414] dark:bg-[#111111] dark:text-[#ffffff]">
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                        <div>
+                            <div className="ogm-section-label mb-2">Layer Preview</div>
+                            <h2 className="text-lg font-black">Static preview shown</h2>
+                        </div>
+                        <div className="rounded border-2 border-[#f6d94d] bg-[#111111] px-2.5 py-1 text-xs font-black uppercase tracking-normal text-[#f6d94d]">
+                            {formatLabel}
+                        </div>
+                    </div>
+                    <p className="ogm-page-copy mt-2 max-w-3xl">
+                        This resource does not expose a browser-renderable layer, so the page is using stored preview imagery.
+                    </p>
+                </div>
+
+                <div className="relative flex min-h-[360px] items-center justify-center bg-[#050812] p-4">
+                    {primaryPreviewUrl ? (
+                        <img
+                            src={primaryPreviewUrl}
+                            alt={`Preview for ${resource.dct_title_s}`}
+                            className="max-h-[520px] w-full max-w-full object-contain"
+                        />
+                    ) : (
+                        <div className="flex min-h-[320px] w-full items-center justify-center border-2 border-dashed border-[#f6d94d]/35 p-6 text-center text-sm font-semibold text-[#ffffff]/70">
+                            {isLoading ? "Loading preview..." : "No visual preview available"}
+                        </div>
+                    )}
+                </div>
+            </section>
+        );
+    }
 
     const { protocol, endpoint, geometry, attributeTableEndpoint } = config;
 

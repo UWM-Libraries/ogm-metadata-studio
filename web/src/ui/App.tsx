@@ -444,7 +444,6 @@ export const App: React.FC = () => {
         <span className="ogm-bg-accent ogm-bg-accent-left-blue" />
         <span className="ogm-bg-accent ogm-bg-accent-left-red" />
         <span className="ogm-bg-accent ogm-bg-accent-left-yellow" />
-        <img className="ogm-bg-official-logo" src={logoUrl} alt="" />
       </div>
       <header className="border-t-[8px] border-t-[#111111] border-b-2 border-b-[#1e1e1e] bg-[#ffffff]/95 px-4 py-3 flex flex-wrap items-center justify-between gap-3 backdrop-blur-sm sticky top-0 z-50 dark:border-b-[#f6d94d] dark:bg-[#111111]/95">
         <div className="flex items-center gap-4 flex-1 min-w-[18rem]">
@@ -659,7 +658,6 @@ export const App: React.FC = () => {
             </div>
           </main>
           <footer className="ogm-footer" aria-labelledby="ogm-footer-title">
-            <div className="ogm-footer-blue-panel" aria-hidden="true" />
             <div className="ogm-footer-inner">
               <div className="ogm-footer-brand">
                 <h2 id="ogm-footer-title" className="ogm-footer-title">OpenGeoMetadata Studio</h2>
