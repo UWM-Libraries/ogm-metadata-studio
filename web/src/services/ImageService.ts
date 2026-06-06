@@ -157,7 +157,7 @@ export class ImageService {
         const iiifUrls = this.findUrls(refs, ["http://iiif.io/api/image", "https://iiif.io/api/image"]);
         for (const url of iiifUrls) {
             // ContentDM checks
-            if (url.includes("contentdm.oclc.org")) {
+            if (this.urlHostIs(url, "contentdm.oclc.org")) {
                 // Pattern: /digital/iiif/collection/id
                 const match1 = url.match(/\/digital\/iiif\/([^/]+)\/(\d+)/);
                 if (match1) {
@@ -190,7 +190,7 @@ export class ImageService {
 
         if (manifestUrl) {
             // Special ContentDM Manifest Optimization
-            if (manifestUrl.includes("contentdm.oclc.org") && manifestUrl.includes("/iiif/")) {
+            if (this.urlHostIs(manifestUrl, "contentdm.oclc.org") && manifestUrl.includes("/iiif/")) {
                 const match = manifestUrl.match(/\/iiif\/([^/]+)\//);
                 if (match) {
                     return `https://cdm16022.contentdm.oclc.org/iiif/2/${match[1]}/full/200,/0/default.jpg`;
@@ -521,7 +521,7 @@ export class ImageService {
             if (url.endsWith("/info.json")) {
                 return url.replace("/info.json", "/full/200,/0/default.jpg");
             }
-            if (url.includes("stacks.stanford.edu") && (url.includes("/full/!") || url.includes("/full/400,"))) {
+            if (this.urlHostIs(url, "stacks.stanford.edu") && (url.includes("/full/!") || url.includes("/full/400,"))) {
                 return url;
             }
             if (url.includes("/full/")) {
@@ -596,6 +596,16 @@ export class ImageService {
             return new URL(this.normalizeArtifactUrl(url), this.browserBaseUrl()).pathname;
         } catch {
             return String(url || "").split("?", 1)[0];
+        }
+    }
+
+    private urlHostIs(url: string, allowedHost: string): boolean {
+        try {
+            const hostname = new URL(this.normalizeArtifactUrl(url), this.browserBaseUrl()).hostname.toLowerCase();
+            const normalizedAllowedHost = allowedHost.toLowerCase();
+            return hostname === normalizedAllowedHost || hostname.endsWith(`.${normalizedAllowedHost}`);
+        } catch {
+            return false;
         }
     }
 

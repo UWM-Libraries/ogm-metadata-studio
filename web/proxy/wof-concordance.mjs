@@ -127,6 +127,16 @@ function withoutUndefined(value) {
   return entries.length > 0 ? Object.fromEntries(entries) : undefined;
 }
 
+function urlHostIs(value, allowedHost) {
+  try {
+    const hostname = new URL(String(value || "")).hostname.toLowerCase();
+    const normalizedAllowedHost = String(allowedHost || "").toLowerCase();
+    return hostname === normalizedAllowedHost || hostname.endsWith(`.${normalizedAllowedHost}`);
+  } catch {
+    return false;
+  }
+}
+
 function gazetteerMatchKey(match) {
   return `${String(match?.provider || match?.authority || "").toLowerCase()}:${String(match?.authorityId || "")}`;
 }
@@ -162,7 +172,7 @@ function geocodingLooksWof(geocoding) {
   if (!geocoding || typeof geocoding !== "object") return false;
   return (Array.isArray(geocoding.candidates) ? geocoding.candidates : []).some((candidate) => {
     if (!candidate || typeof candidate !== "object") return false;
-    return candidate.wofId || String(candidate.uri || "").includes("whosonfirst.org");
+    return candidate.wofId || urlHostIs(candidate.uri, "whosonfirst.org");
   });
 }
 
