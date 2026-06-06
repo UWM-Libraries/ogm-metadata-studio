@@ -70,6 +70,34 @@ describe('Small UI Components', () => {
             fireEvent.click(facetRemoves[0]);
             expect(onRemoveFacet).toHaveBeenCalled();
         });
+
+        it('renders open-ended year ranges', () => {
+            const { rerender } = render(
+                <ActiveFilterBar
+                    query=""
+                    facets={{}}
+                    yearRange="1950,"
+                    onRemoveQuery={vi.fn()}
+                    onRemoveFacet={vi.fn()}
+                    onClearAll={vi.fn()}
+                />
+            );
+
+            expect(screen.getByText('Year: 1950+')).toBeDefined();
+
+            rerender(
+                <ActiveFilterBar
+                    query=""
+                    facets={{}}
+                    yearRange=",1950"
+                    onRemoveQuery={vi.fn()}
+                    onRemoveFacet={vi.fn()}
+                    onClearAll={vi.fn()}
+                />
+            );
+
+            expect(screen.getByText('Year: Up to 1950')).toBeDefined();
+        });
     });
 
     describe('AutosuggestInput', () => {

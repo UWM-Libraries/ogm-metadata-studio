@@ -5,6 +5,7 @@ import { Resource } from '../aardvark/model';
 import { OPENFREEMAP_BRIGHT_STYLE } from '../config/mapStyles';
 import { queryResourceById } from '../duckdb/duckdbClient';
 import { textToLngLatBounds, type LngLatBoundsTuple } from './viewers/maplibreBounds';
+import { compactAttributionControl } from './viewers/maplibreControls';
 
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 
@@ -28,8 +29,10 @@ const AdminStaticMap: React.FC<{ bounds: LngLatBoundsTuple }> = ({ bounds }) => 
             scrollZoom: false,
             dragPan: false,
             doubleClickZoom: false,
+            attributionControl: false,
         });
         mapRef.current = map;
+        map.addControl(compactAttributionControl(), 'bottom-right');
         map.on('load', () => {
             const [[minX, minY], [maxX, maxY]] = bounds;
             map.fitBounds(bounds, { padding: 20 });

@@ -40,7 +40,6 @@ vi.mock('./resource/SimilarResourcesCarousel', () => ({ SimilarResourcesCarousel
 vi.mock('./resource/ResourceHeader', () => ({
     ResourceHeader: ({ onDelete }: any) => <button onClick={() => onDelete('1')}>Delete Resource</button>
 }));
-vi.mock('./resource/ResourceDistributions', () => ({ ResourceDistributions: () => <div>Resource Distributions</div> }));
 
 const mockResource = {
     id: '1',

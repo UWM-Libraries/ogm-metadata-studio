@@ -13,7 +13,7 @@ import { ResourceThumbnail } from "./shared/ResourceThumbnail";
 
 import { ActiveFilterBar } from "./ActiveFilterBar";
 import { MapFacet } from "./MapFacet";
-import { TimelineFacet } from "./TimelineFacet";
+import { TimelineFacet, type SelectedYearRange } from "./TimelineFacet";
 import { ErrorBoundary } from "./ErrorBoundary";
 import { FacetModal } from "./FacetModal";
 import { displayAardvarkValue } from "../utils/aardvarkDisplay";
@@ -74,10 +74,14 @@ export const Dashboard: React.FC<DashboardProps> = ({ onEdit, onSelect }) => {
         return undefined;
     }, [state.bbox]);
 
-    const currentYearRange = useMemo<[number, number] | undefined>(() => {
+    const currentYearRange = useMemo<SelectedYearRange | undefined>(() => {
         if (!state.yearRange) return undefined;
-        const p = state.yearRange.split(",").map(Number);
-        if (p.length === 2 && !isNaN(p[0]) && !isNaN(p[1])) return [p[0], p[1]];
+        const [startRaw = "", endRaw = ""] = state.yearRange.split(",", 2);
+        const start = startRaw.trim() ? Number(startRaw) : null;
+        const end = endRaw.trim() ? Number(endRaw) : null;
+        if ((start == null || Number.isFinite(start)) && (end == null || Number.isFinite(end)) && (start != null || end != null)) {
+            return { start, end };
+        }
         return undefined;
     }, [state.yearRange]);
 
@@ -139,7 +143,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ onEdit, onSelect }) => {
                         range={currentYearRange}
                         onChange={(r) => setState(prev => ({
                             ...prev,
-                            yearRange: r ? `${r[0]},${r[1]}` : undefined,
+                            yearRange: r && (r.start != null || r.end != null) ? `${r.start ?? ""},${r.end ?? ""}` : undefined,
                             page: 1
                         }))}
                     />

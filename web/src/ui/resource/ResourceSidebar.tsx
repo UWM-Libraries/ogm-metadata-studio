@@ -4,11 +4,15 @@ import 'maplibre-gl/dist/maplibre-gl.css';
 import { Distribution, Resource } from '../../aardvark/model';
 import { OPENFREEMAP_BRIGHT_STYLE } from '../../config/mapStyles';
 import { CopyButton } from './CopyButton';
-import { textToLngLatBounds, type LngLatBoundsTuple } from '../viewers/maplibreBounds';
+import { geoJsonToBounds, textToLngLatBounds, type LngLatBoundsTuple } from '../viewers/maplibreBounds';
+import { compactAttributionControl } from '../viewers/maplibreControls';
+import { getViewerGeometry } from './viewerConfig';
+import { useResourcePreviewAssets } from './useResourcePreviewAssets';
 import {
     displayUrl,
     downloadableDistributions,
     distributionsFromReferences,
+    isDownloadableDistribution,
     relationLabel,
     shortRelationKey,
     uniqueSortedDistributions,
@@ -27,7 +31,17 @@ export const ResourceSidebar: React.FC<ResourceSidebarProps> = ({ resource, dist
     const mapRef = useRef<maplibregl.Map | null>(null);
 
     // Parse Bounds for Mini Map (lat,lng for display; MapLibre uses [lng, lat])
-    const bounds = useMemo<LngLatBoundsTuple | null>(() => textToLngLatBounds(resource.dcat_bbox || undefined), [resource.dcat_bbox]);
+    const bounds = useMemo<LngLatBoundsTuple | null>(() => {
+        const geometry = getViewerGeometry(resource);
+        return geoJsonToBounds(geometry)
+            || textToLngLatBounds(resource.dcat_bbox || undefined)
+            || textToLngLatBounds(resource.locn_geometry || undefined);
+    }, [resource]);
+    const { staticMapUrl, isLoadingStaticMap } = useResourcePreviewAssets(resource, distributions, {
+        loadThumbnail: false,
+        loadStaticMap: !bounds,
+        staticMapSize: { width: 384, height: 256 },
+    });
 
     useLayoutEffect(() => {
         if (mapRef.current) {
@@ -44,8 +58,10 @@ export const ResourceSidebar: React.FC<ResourceSidebarProps> = ({ resource, dist
             scrollZoom: false,
             dragPan: false,
             doubleClickZoom: false,
+            attributionControl: false,
         });
         mapRef.current = map;
+        map.addControl(compactAttributionControl(), 'bottom-right');
         map.on('load', () => {
             const [[minX, minY], [maxX, maxY]] = bounds;
             map.fitBounds(bounds, { padding: 20 });
@@ -84,6 +100,7 @@ export const ResourceSidebar: React.FC<ResourceSidebarProps> = ({ resource, dist
     }, [distributions, resource]);
 
     const downloadItems = useMemo(() => downloadableDistributions(resourceDistributions), [resourceDistributions]);
+    const relatedItems = useMemo(() => resourceDistributions.filter((distribution) => !isDownloadableDistribution(distribution)), [resourceDistributions]);
 
     const citationText = useMemo(() => {
         const parts = [];
@@ -102,11 +119,63 @@ export const ResourceSidebar: React.FC<ResourceSidebarProps> = ({ resource, dist
                 <div className="ogm-media-frame relative z-0 h-64 border-0">
                     {bounds ? (
                         <div ref={containerRef} className="h-full w-full" />
+                    ) : staticMapUrl ? (
+                        <img
+                            src={staticMapUrl}
+                            alt={`Location map for ${resource.dct_title_s}`}
+                            className="h-full w-full object-cover"
+                        />
+                    ) : isLoadingStaticMap ? (
+                        <div className="h-full flex items-center justify-center text-slate-400 text-sm">Loading map...</div>
                     ) : (
                         <div className="h-full flex items-center justify-center text-slate-400 text-sm">No map extent available</div>
                     )}
                 </div>
             </div>
+
+            {relatedItems.length > 0 && (
+                <div className="ogm-page-card">
+                    <div className="flex items-center justify-between border-b-2 border-[#111111] p-3 text-sm font-black dark:border-[#f6d94d]">
+                        <span>Related Distributions</span>
+                        <span className="ogm-count-badge">
+                            {relatedItems.length} link{relatedItems.length === 1 ? "" : "s"}
+                        </span>
+                    </div>
+                    <div className="p-4">
+                        <ul className="divide-y divide-[#111111]/15 dark:divide-[#f6d94d]/20">
+                            {relatedItems.map((distribution) => {
+                                const label = relationLabel(distribution);
+                                return (
+                                    <li key={`${distribution.relation_key}-${distribution.url}`} className="py-3 first:pt-0 last:pb-0">
+                                        <div className="flex items-start gap-3">
+                                            <div className="min-w-0 flex-1">
+                                                <div className="text-sm font-black text-[#111111] dark:text-[#ffffff]">{label}</div>
+                                                <code className="ogm-tag mt-1 inline-block max-w-full truncate px-1.5 py-0.5 text-xs">
+                                                    {shortRelationKey(distribution.relation_key)}
+                                                </code>
+                                                <div
+                                                    className="ogm-page-copy mt-1 truncate text-xs"
+                                                    title={distribution.url}
+                                                >
+                                                    {displayUrl(distribution.url)}
+                                                </div>
+                                            </div>
+                                            <a
+                                                href={distribution.url}
+                                                target="_blank"
+                                                rel="noopener noreferrer"
+                                                className="ogm-secondary-button shrink-0 px-2.5 py-1.5 text-xs"
+                                            >
+                                                Open
+                                            </a>
+                                        </div>
+                                    </li>
+                                );
+                            })}
+                        </ul>
+                    </div>
+                </div>
+            )}
 
             <div className="ogm-page-card">
                 <div className="flex items-center justify-between border-b-2 border-[#111111] p-3 text-sm font-black dark:border-[#f6d94d]">

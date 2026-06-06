@@ -29,6 +29,7 @@ vi.mock('maplibre-gl', () => ({
                 isStyleLoaded: () => true,
             };
         },
+        AttributionControl: vi.fn(function AttributionControl() { }),
     },
 }));
 

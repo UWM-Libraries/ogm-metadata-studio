@@ -28,6 +28,7 @@ vi.mock('maplibre-gl', () => {
                 };
             },
             LngLatBounds,
+            AttributionControl: function AttributionControl() { },
             Popup: function Popup() {
                 return {
                     setLngLat: () => this,

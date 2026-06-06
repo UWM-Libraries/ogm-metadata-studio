@@ -135,4 +135,40 @@ describe('useResourceSearch', () => {
             expect(result.current.state.page).toBe(2);
         });
     });
+
+    it('applies open-ended year ranges as numeric filters', async () => {
+        vi.mocked(duckdbClient.facetedSearch).mockResolvedValue({
+            results: [],
+            facets: {},
+            total: 0
+        });
+
+        const { result } = renderHook(() => useResourceSearch(stableConfig));
+
+        await waitFor(() => expect(result.current.loading).toBe(false));
+
+        act(() => {
+            result.current.setState(prev => ({ ...prev, yearRange: '1950,' }));
+        });
+
+        await waitFor(() => {
+            expect(duckdbClient.facetedSearch).toHaveBeenLastCalledWith(expect.objectContaining({
+                filters: expect.objectContaining({
+                    gbl_indexYear_im: { gte: 1950, lte: undefined }
+                })
+            }));
+        });
+
+        act(() => {
+            result.current.setState(prev => ({ ...prev, yearRange: ',1950' }));
+        });
+
+        await waitFor(() => {
+            expect(duckdbClient.facetedSearch).toHaveBeenLastCalledWith(expect.objectContaining({
+                filters: expect.objectContaining({
+                    gbl_indexYear_im: { gte: undefined, lte: 1950 }
+                })
+            }));
+        });
+    });
 });

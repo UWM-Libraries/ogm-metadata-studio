@@ -855,6 +855,23 @@ export async function getSearchNeighbors(req: FacetedSearchRequest, currentId: s
     }
 }
 
+function parseYearRangeFilter(value: string | undefined): { gte?: number; lte?: number } | undefined {
+    if (!value) return undefined;
+    const [startRaw = "", endRaw = ""] = value.split(",", 2);
+    const start = startRaw.trim() ? Number(startRaw) : undefined;
+    const end = endRaw.trim() ? Number(endRaw) : undefined;
+
+    if ((start !== undefined && !Number.isFinite(start)) || (end !== undefined && !Number.isFinite(end))) {
+        return undefined;
+    }
+
+    if (start === undefined && end === undefined) return undefined;
+    if (start !== undefined && end !== undefined && start > end) {
+        return { gte: end, lte: start };
+    }
+    return { gte: start, lte: end };
+}
+
 export async function getFacetValues(req: FacetValueRequest): Promise<FacetValueResult> {
     const ctx = await getDuckDbContext();
     if (!ctx) return { values: [], total: 0 };
@@ -866,11 +883,9 @@ export async function getFacetValues(req: FacetValueRequest): Promise<FacetValue
     const fQuery = req.facetQuery ? req.facetQuery.replace(/'/g, "''").toLowerCase() : "";
 
     const filters = { ...req.filters };
-    if (req.yearRange) {
-        const parts = req.yearRange.split(",").map(Number);
-        if (parts.length === 2) {
-            filters['gbl_indexYear_im'] = { ...filters['gbl_indexYear_im'], gte: parts[0], lte: parts[1] };
-        }
+    const parsedYearRange = parseYearRangeFilter(req.yearRange);
+    if (parsedYearRange) {
+        filters['gbl_indexYear_im'] = { ...filters['gbl_indexYear_im'], ...parsedYearRange };
     }
 
     const dummyReq: FacetedSearchRequest = { q: req.q, filters, bbox: req.bbox };

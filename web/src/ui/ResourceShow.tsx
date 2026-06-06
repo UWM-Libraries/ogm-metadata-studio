@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Distribution, Resource } from '../aardvark/model';
 import { queryResourceById, querySimilarResources, getSearchNeighbors, FacetedSearchRequest, queryDistributionsForResource } from '../duckdb/duckdbClient';
 import { waitForDuckDbRestore } from '../duckdb/dbInit';
@@ -7,8 +7,8 @@ import { SimilarResourcesCarousel } from './resource/SimilarResourcesCarousel';
 import { ResourceSidebar } from './resource/ResourceSidebar';
 import { ResourceMetadata } from './resource/ResourceMetadata';
 import { ResourceHeader } from './resource/ResourceHeader';
-import { ResourceDistributions } from './resource/ResourceDistributions';
 import { distributionsFromReferences } from './resource/distributionLinks';
+import { detectViewerConfig } from './resource/viewerConfig';
 
 import { databaseService } from '../services/DatabaseService';
 import { useToast } from './shared/ToastContext';
@@ -161,6 +161,17 @@ export const ResourceShow: React.FC<ResourceShowProps> = ({ id, onBack }) => {
         }
     };
 
+    const hasBrowserRenderableViewer = useMemo(() => {
+        if (!resource) return false;
+        try {
+            const config = detectViewerConfig(resource, distributions);
+            return Boolean(config && typeof config.endpoint === "string");
+        } catch (error) {
+            console.warn("ResourceShow: Failed to detect viewer config", error);
+            return false;
+        }
+    }, [distributions, resource]);
+
     if (loading) {
         return <div className="ogm-page-card m-6 p-8 text-center text-[#5a5547] dark:text-[#ffffff]/80">{recoveryMessage || "Loading resource..."}</div>;
     }
@@ -171,7 +182,7 @@ export const ResourceShow: React.FC<ResourceShowProps> = ({ id, onBack }) => {
 
     return (
         <div className="ogm-resource-page h-full min-h-0 overflow-auto">
-            <div className="mx-auto flex w-full max-w-7xl flex-col gap-6 p-6">
+            <div className="flex w-full max-w-none flex-col gap-4 p-3 sm:gap-5 sm:p-4 lg:gap-6 lg:p-6">
                 <ResourceHeader
                     resource={resource}
                     pagination={pagination}
@@ -179,14 +190,24 @@ export const ResourceShow: React.FC<ResourceShowProps> = ({ id, onBack }) => {
                     onDelete={handleDelete}
                 />
 
-                <ResourceViewer resource={resource} distributions={distributions} />
+                {hasBrowserRenderableViewer ? (
+                    <>
+                        <ResourceViewer resource={resource} distributions={distributions} />
 
-                <ResourceDistributions distributions={distributions} />
-
-                <div className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1fr)_24rem]">
-                    <ResourceMetadata resource={resource} />
-                    <ResourceSidebar resource={resource} distributions={distributions} />
-                </div>
+                        <div className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1fr)_24rem]">
+                            <ResourceMetadata resource={resource} />
+                            <ResourceSidebar resource={resource} distributions={distributions} />
+                        </div>
+                    </>
+                ) : (
+                    <div className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1fr)_24rem]">
+                        <div className="flex min-w-0 flex-col gap-6">
+                            <ResourceViewer resource={resource} distributions={distributions} />
+                            <ResourceMetadata resource={resource} />
+                        </div>
+                        <ResourceSidebar resource={resource} distributions={distributions} />
+                    </div>
+                )}
 
                 {similarResources.length > 0 && (
                     <SimilarResourcesCarousel items={similarResources} />

@@ -1,11 +1,12 @@
 import React, { useCallback, useLayoutEffect, useRef, useState } from 'react';
 import maplibregl from 'maplibre-gl';
-import { PMTiles, Protocol } from 'pmtiles';
+import { PMTiles, Protocol, type Header } from 'pmtiles';
 import 'maplibre-gl/dist/maplibre-gl.css';
-import { bboxToBounds, geoJsonToBounds, getBoundsFromGeometry, intersectLngLatBbox, type LngLatBbox } from './maplibreBounds';
+import { bboxToBounds, geoJsonToBounds, getBoundsFromGeometry, intersectLngLatBbox, isValidLngLatBounds, type LngLatBbox, type LngLatBoundsTuple } from './maplibreBounds';
 import { OPENFREEMAP_BRIGHT_STYLE } from '../../config/mapStyles';
 import { cogInfoArtifactUrl, cogPreviewArtifactUrl, proxiedArtifactUrl } from './artifactProxy';
 import type { GeoJsonGeometry, SelectableGeoJsonFeature } from './geospatialFeature';
+import { compactAttributionControl } from './maplibreControls';
 
 const MAP_STYLE = OPENFREEMAP_BRIGHT_STYLE;
 const PMTILES_SOURCE_ID = 'pmtiles-overlay';
@@ -366,6 +367,16 @@ function vectorLayerIdsFromMetadata(metadata: unknown): string[] {
     return [];
 }
 
+function boundsFromPmtilesHeader(header: Header): LngLatBoundsTuple | null {
+    const bounds: LngLatBoundsTuple = [[header.minLon, header.minLat], [header.maxLon, header.maxLat]];
+    if (!isValidLngLatBounds(bounds)) return null;
+
+    const [west, south] = bounds[0];
+    const [east, north] = bounds[1];
+    if (east - west > 350 && north - south > 160) return null;
+    return bounds;
+}
+
 function removePmtilesLayers(map: maplibregl.Map) {
     const layers = map.getStyle()?.layers || [];
     for (const layer of [...layers].reverse()) {
@@ -596,14 +607,16 @@ function addPmtilesLayer(map: maplibregl.Map, url: string, opacity: number, setE
     let canceled = false;
     let cleanupIdentify: (() => void) | null = null;
 
-    archive.getMetadata()
-        .then((metadata) => {
+    Promise.all([archive.getHeader(), archive.getMetadata()])
+        .then(([header, metadata]) => {
             if (canceled) return;
             const sourceLayerIds = vectorLayerIdsFromMetadata(metadata);
             if (sourceLayerIds.length === 0) {
                 setError('PMTiles metadata did not list any vector layers.');
                 return;
             }
+            const headerBounds = boundsFromPmtilesHeader(header);
+            if (headerBounds) map.fitBounds(headerBounds, { padding: 40, maxZoom: 16, duration: 0 });
 
             removePmtilesLayers(map);
             map.addSource(PMTILES_SOURCE_ID, {
@@ -859,9 +872,11 @@ export const MapLibreResourceViewer: React.FC<MapLibreResourceViewerProps> = ({
             style: MAP_STYLE,
             center,
             zoom: 2,
+            attributionControl: false,
         });
         mapRef.current = map;
 
+        map.addControl(compactAttributionControl(), 'bottom-right');
         map.addControl(new maplibregl.FullscreenControl());
 
         map.on('load', () => {

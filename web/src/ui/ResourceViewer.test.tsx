@@ -2,12 +2,17 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 import { ResourceViewer } from './ResourceViewer';
 import { detectViewerConfig } from './resource/viewerConfig';
+import { useResourcePreviewAssets } from './resource/useResourcePreviewAssets';
 import { Resource } from '../aardvark/model';
 import React from 'react';
 import type { SelectableGeoJsonFeature } from './viewers/geospatialFeature';
 
 vi.mock('./resource/viewerConfig', () => ({
     detectViewerConfig: vi.fn(),
+}));
+
+vi.mock('./resource/useResourcePreviewAssets', () => ({
+    useResourcePreviewAssets: vi.fn(),
 }));
 
 vi.mock('./viewers/CloverViewer', () => ({
@@ -55,12 +60,23 @@ describe('ResourceViewer', () => {
 
     beforeEach(() => {
         vi.mocked(detectViewerConfig).mockReturnValue(null);
+        vi.mocked(useResourcePreviewAssets).mockReturnValue({
+            thumbnailUrl: 'http://localhost/thumbnail.jpg',
+            staticMapUrl: 'blob:http://localhost/static-map',
+            isLoadingThumbnail: false,
+            isLoadingStaticMap: false,
+        });
         vi.unstubAllGlobals();
     });
 
-    it('renders nothing if no config found', () => {
-        const { container } = render(<ResourceViewer resource={mockResource} />);
-        expect(container).toBeEmptyDOMElement();
+    it('renders stored preview imagery if no browser-renderable config is found', () => {
+        render(<ResourceViewer resource={{ ...mockResource, dct_format_s: 'MrSID' } as Resource} />);
+
+        expect(screen.getByText('Static preview shown')).toBeInTheDocument();
+        expect(screen.getByText('MrSID')).toBeInTheDocument();
+        expect(screen.getByRole('img', { name: 'Preview for Test Resource' })).toHaveAttribute('src', 'http://localhost/thumbnail.jpg');
+        expect(screen.queryByText('Geography')).not.toBeInTheDocument();
+        expect(screen.queryByRole('img', { name: 'Geographic context for Test Resource' })).not.toBeInTheDocument();
     });
 
     it('renders Clover viewer for IIIF manifest', async () => {

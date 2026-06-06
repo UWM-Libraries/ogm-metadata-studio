@@ -3,6 +3,7 @@ import maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import { Resource } from '../aardvark/model';
 import { OPENFREEMAP_BRIGHT_STYLE } from '../config/mapStyles';
+import { compactAttributionControl } from './viewers/maplibreControls';
 import { textToLngLatBounds } from './viewers/maplibreBounds';
 
 const MAP_STYLE = OPENFREEMAP_BRIGHT_STYLE;
@@ -75,8 +76,10 @@ export const ResultsMapView: React.FC<ResultsMapViewProps> = ({
             style: MAP_STYLE,
             center: [0, 0],
             zoom: 2,
+            attributionControl: false,
         });
         mapRef.current = map;
+        map.addControl(compactAttributionControl(), 'bottom-right');
 
         map.on('load', () => {
             map.addSource('bboxes', {

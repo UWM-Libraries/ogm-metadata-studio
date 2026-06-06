@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { detectViewerConfig, getViewerGeometry, formatCentroid, getCentroidFromGeometry } from './viewerConfig';
 import { Resource } from '../../aardvark/model';
+import { geoJsonToBounds } from '../viewers/maplibreBounds';
 
 describe('viewerConfig', () => {
     describe('detectViewerConfig', () => {
@@ -367,6 +368,25 @@ describe('viewerConfig', () => {
                 dcat_bbox: 'ENVELOPE(692906.124,696416.156,3984670.74,3981529.584)',
             };
             expect(getViewerGeometry(resource)).toBeUndefined();
+        });
+
+        it('reprojects UTM Zone 11N geometry when the resource carries a CRS hint', () => {
+            const resource = {
+                ...base,
+                dct_description_sm: ['Coordinate reference system information is supplied as NAD 1983 UTM Zone 11N.'],
+                locn_geometry: 'POLYGON((238379.23443976537 4654130.999994, 770421.3750486401 4654130.999994, 770421.3750486401 3874070.9999999385, 238379.23443976537 3874070.9999999385, 238379.23443976537 4654130.999994))',
+                dcat_bbox: 'ENVELOPE(238379.23443976537,770421.3750486401,4654130.999994,3874070.9999999385)',
+            };
+
+            const bounds = geoJsonToBounds(getViewerGeometry(resource));
+
+            expect(bounds).not.toBeNull();
+            expect(bounds![0][0]).toBeGreaterThan(-121);
+            expect(bounds![0][0]).toBeLessThan(-116);
+            expect(bounds![0][1]).toBeGreaterThan(34);
+            expect(bounds![1][0]).toBeGreaterThan(-116);
+            expect(bounds![1][0]).toBeLessThan(-112);
+            expect(bounds![1][1]).toBeLessThan(43);
         });
     });
 

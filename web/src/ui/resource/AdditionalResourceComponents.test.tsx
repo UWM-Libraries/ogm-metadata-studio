@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { render, screen, fireEvent, within } from '@testing-library/react';
 import { ResourceMetadata } from './ResourceMetadata';
 import { SimilarResourcesCarousel } from './SimilarResourcesCarousel';
 import { Resource } from '../../aardvark/model';
@@ -13,6 +13,7 @@ describe('Resource Components Coverage', () => {
             dct_description_sm: ['Description'], // Not facetable
             dct_language_sm: ['eng'],
             gbl_resourceClass_sm: ['Map'], // Facetable
+            dct_identifier_sm: ['https://example.com/record'],
             dct_issued_s: '2020',
             thumbnail: 'blob:http://localhost/thumbnail',
             extra: { hidden: true },
@@ -27,10 +28,13 @@ describe('Resource Components Coverage', () => {
             // Description appears twice (label and value), checked later
 
             // Facetable should be links
-            const creatorLink = screen.getByText('Creator 1').closest('a');
+            const linkedMetadata = screen.getByLabelText('Linked metadata');
+            const creatorLink = within(linkedMetadata).getByText('Creator 1').closest('a');
             expect(creatorLink).toHaveAttribute('href', '/?include_filters[dct_creator_sm][]=Creator%201');
-            expect(screen.getByText('English')).toBeDefined();
+            expect(within(linkedMetadata).getByText('English')).toBeDefined();
             expect(screen.queryByText('eng')).toBeNull();
+            expect(within(linkedMetadata).getByRole('link', { name: 'https://example.com/record' })).toHaveAttribute('href', 'https://example.com/record');
+            expect(within(linkedMetadata).queryByText('Description')).toBeNull();
 
             // Non-facetable should be text (Label 'Description' and value 'Description')
             const descElements = screen.getAllByText('Description');

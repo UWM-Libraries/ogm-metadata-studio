@@ -16,7 +16,7 @@ export interface SearchState {
     facets: Record<string, string[]>;
     sort: string;
     bbox: string | undefined; // "minX,minY,maxX,maxY"
-    yearRange: string | undefined; // "min,max"
+    yearRange: string | undefined; // "min,max" with either side optional
     view: 'list' | 'gallery' | 'map';
 }
 
@@ -29,6 +29,23 @@ const DEFAULT_STATE: SearchState = {
     yearRange: undefined,
     view: 'list'
 };
+
+function parseYearRange(value: string | undefined): { gte?: number; lte?: number } | undefined {
+    if (!value) return undefined;
+    const [startRaw = "", endRaw = ""] = value.split(",", 2);
+    const start = startRaw.trim() ? Number(startRaw) : undefined;
+    const end = endRaw.trim() ? Number(endRaw) : undefined;
+
+    if ((start !== undefined && !Number.isFinite(start)) || (end !== undefined && !Number.isFinite(end))) {
+        return undefined;
+    }
+
+    if (start === undefined && end === undefined) return undefined;
+    if (start !== undefined && end !== undefined && start > end) {
+        return { gte: end, lte: start };
+    }
+    return { gte: start, lte: end };
+}
 
 export function useResourceSearch(facetsConfig: FacetConfig[], pageSize: number = 20) {
     const [resources, setResources] = useState<Resource[]>([]);
@@ -129,11 +146,9 @@ export function useResourceSearch(facetsConfig: FacetConfig[], pageSize: number 
                 }
             }
         }
-        if (state.yearRange) {
-            const parts = state.yearRange.split(",").map(Number);
-            if (parts.length === 2 && !isNaN(parts[0]) && !isNaN(parts[1])) {
-                filters['gbl_indexYear_im'] = { ...filters['gbl_indexYear_im'], gte: parts[0], lte: parts[1] };
-            }
+        const parsedYearRange = parseYearRange(state.yearRange);
+        if (parsedYearRange) {
+            filters['gbl_indexYear_im'] = { ...filters['gbl_indexYear_im'], ...parsedYearRange };
         }
         return filters;
     }, [state.facets, state.yearRange]);

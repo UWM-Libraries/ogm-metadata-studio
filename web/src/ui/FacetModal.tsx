@@ -13,7 +13,7 @@ interface FacetModalProps {
     q?: string;
     filters?: Record<string, any>;
     bbox?: string; // "minX,minY,maxX,maxY"
-    yearRange?: string; // "min,max"
+    yearRange?: string; // "min,max" with either side optional
 
     // Selection
     selectedValues: string[];

@@ -6,6 +6,7 @@ import { DUCKDB_RESTORED_EVENT } from "../duckdb/dbInit";
 import { databaseService } from "../services/DatabaseService";
 import { zoomToResolution } from "../utils/h3Resolution";
 import { OPENFREEMAP_BRIGHT_STYLE } from "../config/mapStyles";
+import { compactAttributionControl } from "./viewers/maplibreControls";
 
 const MAP_STYLE = OPENFREEMAP_BRIGHT_STYLE;
 
@@ -262,8 +263,10 @@ export const MapFacet: React.FC<MapFacetProps> = ({ bbox, onChange, q = "", filt
             style: MAP_STYLE,
             center: [-96, 37.8],
             zoom: 3,
+            attributionControl: false,
         });
         mapRef.current = map;
+        map.addControl(compactAttributionControl(), 'bottom-right');
         let disposed = false;
         map.on("load", () => {
             if (disposed) return;
