@@ -413,6 +413,20 @@ describe('ImageService', () => {
         } as any]);
         expect(await contentDmManifest.getThumbnailUrl()).toBe('https://cdm16022.contentdm.oclc.org/iiif/2/p16022coll1/full/200,/0/default.jpg');
 
+        const fakeContentDmDigital = new ImageService(mockResource, [{
+            resource_id: 'test-1',
+            relation_key: 'iiif',
+            url: 'https://evil.test/contentdm.oclc.org/digital/iiif/p16022coll1/42',
+        } as any]);
+        expect(await fakeContentDmDigital.getThumbnailUrl()).toBe('https://evil.test/contentdm.oclc.org/digital/iiif/p16022coll1/42/full/200,/0/default.jpg');
+
+        const fakeContentDmManifest = new ImageService(mockResource, [{
+            resource_id: 'test-1',
+            relation_key: 'https://iiif.io/api/presentation#manifest',
+            url: 'https://evil.test/contentdm.oclc.org/iiif/p16022coll1/manifest',
+        } as any]) as any;
+        expect(fakeContentDmManifest.getThumbnailSourceUrl()).toBe('https://evil.test/contentdm.oclc.org/iiif/p16022coll1/manifest');
+
         const esri = new ImageService(mockResource, [{
             resource_id: 'test-1',
             relation_key: 'urn:x-esri:serviceType:ArcGIS#DynamicMapLayer',
@@ -473,6 +487,7 @@ describe('ImageService', () => {
         expect(service.extractThumbnailFromManifest({ get thumbnail() { throw new Error('bad manifest'); } })).toBeNull();
         expect(service.standardizeIiifUrl('https://iiif.test/image/full/800,/0/default.jpg')).toBe('https://iiif.test/image/full/200,/0/default.jpg');
         expect(service.standardizeIiifUrl('https://stacks.stanford.edu/image/full/!400,400/0/default.jpg')).toBe('https://stacks.stanford.edu/image/full/!400,400/0/default.jpg');
+        expect(service.standardizeIiifUrl('https://evil.test/stacks.stanford.edu/image/full/!400,400/0/default.jpg')).toBe('https://evil.test/stacks.stanford.edu/image/full/200,/0/default.jpg');
     });
 
     it('parses preview bounding boxes from WKT, GeoJSON, CSV, ENVELOPE, and invalid values', () => {

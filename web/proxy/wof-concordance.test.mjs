@@ -143,6 +143,46 @@ describe("WOF concordance layer", () => {
     expect(result.extension.textUnsupportedPlacenames).toBe(1);
   });
 
+  it("keeps non-WOF geocoding when the WOF hostname only appears in the URI path", () => {
+    writeIndex([
+      {
+        wofId: "9001",
+        name: "Future Park",
+        normalizedNames: [{ value: "Future Park", normalized: "future park", source: "wof:name" }],
+        placetype: "venue",
+        country: "US",
+        region: "WA",
+        hierarchyLabels: ["Seattle", "King County", "Washington"],
+        isCurrent: true,
+      },
+    ]);
+
+    const result = buildWofConcordanceLayer({
+      placenames: [{
+        id: "place-0001",
+        name: "Future Park",
+        normalizedName: "Future Park",
+        type: "park",
+        confidence: 0.95,
+        status: "candidate",
+        gazetteerMatches: [{ provider: "whosonfirst", authorityId: "9001", name: "Future Park", status: "matched" }],
+        geocoding: {
+          matchType: "exact_contextual",
+          candidates: [{ name: "Future Park", uri: "https://example.test/redirect/whosonfirst.org/id/9001/" }],
+        },
+      }],
+      textGroups: [],
+      textSegments: [text("Seattle")],
+      resource: { dct_spatial_sm: ["Seattle", "King County", "Washington"] },
+    });
+
+    expect(result.placenames[0].gazetteerMatches).toBeUndefined();
+    expect(result.placenames[0].geocoding).toEqual({
+      matchType: "exact_contextual",
+      candidates: [{ name: "Future Park", uri: "https://example.test/redirect/whosonfirst.org/id/9001/" }],
+    });
+  });
+
   it("keeps close same-name candidates ambiguous when context cannot separate them", () => {
     writeIndex([
       { wofId: "3001", name: "Union", normalizedNames: [{ value: "Union", normalized: "union", source: "wof:name" }], placetype: "locality", country: "US", region: "WA" },

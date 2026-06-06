@@ -357,6 +357,43 @@ describe("enrichment DuckDB persistence", () => {
         expect(sql).toContain("model failed");
     });
 
+    it("creates IDs from secure bytes or monotonic fallback when randomUUID is unavailable", async () => {
+        const getRandomValues = vi.fn((bytes: Uint8Array) => {
+            bytes.forEach((_value, index) => {
+                bytes[index] = index;
+            });
+            return bytes;
+        });
+
+        try {
+            vi.stubGlobal("crypto", { getRandomValues });
+            useConn(makeConn());
+            await expect(createEnrichmentBatch({
+                definitionId: "definition-1",
+                storageProfileId: "storage-1",
+                name: "Batch",
+                totalCount: 1,
+                autoCreateThreshold: 0.9,
+                batchDefaults: { provider: "Provider" },
+            })).resolves.toBe("batch-000102030405060708090a0b0c0d0e0f");
+            expect(getRandomValues).toHaveBeenCalledTimes(1);
+
+            vi.stubGlobal("crypto", undefined);
+            vi.spyOn(Date, "now").mockReturnValue(123456);
+            useConn(makeConn());
+            await expect(createEnrichmentBatch({
+                definitionId: "definition-1",
+                storageProfileId: "storage-1",
+                name: "Batch",
+                totalCount: 1,
+                autoCreateThreshold: 0.9,
+                batchDefaults: { provider: "Provider" },
+            })).resolves.toMatch(/^batch-123456-\d+$/);
+        } finally {
+            vi.unstubAllGlobals();
+        }
+    });
+
     it("creates, publishes, and updates Aardvark drafts", async () => {
         const resourceJson = { ...buildAardvarkDraftFromExtraction({
             runId: "run-1",

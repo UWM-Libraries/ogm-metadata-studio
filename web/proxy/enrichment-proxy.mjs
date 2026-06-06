@@ -130,6 +130,19 @@ function safeJsonStringify(value, space) {
   }, space);
 }
 
+function safeResponseBody(value) {
+  if (value instanceof Error) {
+    return { error: "Internal server error" };
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => safeResponseBody(item));
+  }
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value)
+    .filter(([key]) => !["stack", "stackTrace", "stacktrace"].includes(String(key).toLowerCase()))
+    .map(([key, item]) => [key, safeResponseBody(item)]));
+}
+
 function cleanMetadataIdPrefix(value) {
   const cleaned = String(value || "")
     .trim()
@@ -374,13 +387,24 @@ function send(res, status, body) {
     "Access-Control-Allow-Methods": "GET,HEAD,PUT,POST,OPTIONS",
     "Access-Control-Expose-Headers": "Accept-Ranges, Content-Length, Content-Range, Content-Type, ETag, Last-Modified",
   });
-  res.end(safeJsonStringify(body));
+  res.end(safeJsonStringify(safeResponseBody(body)));
+}
+
+function publicErrorResponse(error) {
+  const status = Number(error?.status || 500);
+  const publicStatus = Number.isInteger(status) && status >= 400 && status < 600 ? status : 500;
+  if (publicStatus >= 500) {
+    return { status: publicStatus, body: { error: "Internal server error" } };
+  }
+  const publicMessage = error instanceof HttpError ? error.publicMessage : "Request failed";
+  return { status: publicStatus, body: { error: publicMessage } };
 }
 
 class HttpError extends Error {
   constructor(status, message) {
     super(message);
     this.status = status;
+    this.publicMessage = message || "Request failed";
   }
 }
 
@@ -613,11 +637,12 @@ function tagValues(xml, tag) {
 
 function decodeXml(value) {
   return String(value)
-    .replace(/&amp;/g, "&")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, "\"")
-    .replace(/&#39;/g, "'");
+    .replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&");
 }
 
 function encodeXmlText(value) {
@@ -7219,7 +7244,7 @@ async function callArchivalSupplementWriter(modelProfile, request, context) {
 }
 
 function markdownCell(value) {
-  return String(value || "").replace(/\|/g, "\\|").replace(/\s+/g, " ").trim();
+  return String(value || "").replace(/\\/g, "\\\\").replace(/\|/g, "\\|").replace(/\s+/g, " ").trim();
 }
 
 function renderArchivalSupplementMarkdown(supplement) {
@@ -9627,8 +9652,8 @@ async function route(req, res) {
 const server = http.createServer((req, res) => {
   route(req, res).catch((error) => {
     console.error(error);
-    const status = Number(error?.status || 500);
-    send(res, Number.isInteger(status) && status >= 400 && status < 600 ? status : 500, { error: error.message || String(error) });
+    const response = publicErrorResponse(error);
+    send(res, response.status, response.body);
   });
 });
 
@@ -9648,12 +9673,16 @@ export {
   buildAardvarkForUpload,
   consolidateOcrTextEntries,
   cogPreviewRenderOptions,
+  decodeXml,
   deriveMapLabelPlacenames,
   effectiveBatchDefaults,
   generatedAardvarkResourceId,
+  markdownCell,
   normalizeAardvarkFormat,
   normalizeAardvarkResource,
+  publicErrorResponse,
   rasterThumbnailOutsizeArgs,
+  safeResponseBody,
   selectTextReconciliationTiles,
   shouldPromoteRasterPackageToImageUpload,
 };

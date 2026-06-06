@@ -249,11 +249,23 @@ function nowIso(): string {
     return new Date().toISOString();
 }
 
+let fallbackIdCounter = 0;
+
+function randomIdSuffix(): string {
+    const globalCrypto = globalThis.crypto;
+    if (typeof globalCrypto?.randomUUID === "function") {
+        return globalCrypto.randomUUID();
+    }
+    if (typeof globalCrypto?.getRandomValues === "function") {
+        const bytes = globalCrypto.getRandomValues(new Uint8Array(16));
+        return Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("");
+    }
+    fallbackIdCounter += 1;
+    return `${Date.now()}-${fallbackIdCounter}`;
+}
+
 function newId(prefix: string): string {
-    const uuid = typeof crypto !== "undefined" && "randomUUID" in crypto
-        ? crypto.randomUUID()
-        : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    return `${prefix}-${uuid}`;
+    return `${prefix}-${randomIdSuffix()}`;
 }
 
 function cleanMetadataIdPrefix(value: unknown): string {
@@ -266,10 +278,7 @@ function cleanMetadataIdPrefix(value: unknown): string {
 }
 
 function newAardvarkResourceId(batchDefaults: Record<string, any>): string {
-    const uuid = typeof crypto !== "undefined" && "randomUUID" in crypto
-        ? crypto.randomUUID()
-        : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    return `${cleanMetadataIdPrefix(batchDefaults.metadataIdPrefix)}-${uuid}`;
+    return `${cleanMetadataIdPrefix(batchDefaults.metadataIdPrefix)}-${randomIdSuffix()}`;
 }
 
 function decimalCoordinate(value: number): string {
