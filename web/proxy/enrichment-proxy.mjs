@@ -132,7 +132,7 @@ function safeJsonStringify(value, space) {
 
 function safeResponseBody(value) {
   if (value instanceof Error) {
-    return { error: value.message || "Internal server error" };
+    return { error: "Internal server error" };
   }
   if (Array.isArray(value)) {
     return value.map((item) => safeResponseBody(item));
@@ -396,13 +396,15 @@ function publicErrorResponse(error) {
   if (publicStatus >= 500) {
     return { status: publicStatus, body: { error: "Internal server error" } };
   }
-  return { status: publicStatus, body: { error: error?.message || "Request failed" } };
+  const publicMessage = error instanceof HttpError ? error.publicMessage : "Request failed";
+  return { status: publicStatus, body: { error: publicMessage } };
 }
 
 class HttpError extends Error {
   constructor(status, message) {
     super(message);
     this.status = status;
+    this.publicMessage = message || "Request failed";
   }
 }
 

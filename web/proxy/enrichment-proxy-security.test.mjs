@@ -27,7 +27,7 @@ describe("proxy security helpers", () => {
       nested: { keep: "yes" },
       items: [{ value: 1 }],
     });
-    expect(safeResponseBody(new Error("boom"))).toEqual({ error: "boom" });
+    expect(safeResponseBody(new Error("secret path failed"))).toEqual({ error: "Internal server error" });
   });
 
   it("uses generic public messages for unexpected server errors", () => {
@@ -37,7 +37,7 @@ describe("proxy security helpers", () => {
     });
     expect(publicErrorResponse(Object.assign(new Error("Invalid metadata"), { status: 400 }))).toEqual({
       status: 400,
-      body: { error: "Invalid metadata" },
+      body: { error: "Request failed" },
     });
   });
 });
