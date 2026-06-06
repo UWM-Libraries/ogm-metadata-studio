@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { renderHook, act, waitFor } from '@testing-library/react';
 import { useResourceSearch } from './useResourceSearch';
 import * as duckdbClient from '../duckdb/duckdbClient';
@@ -28,7 +28,7 @@ vi.mock('./useUrlState', () => ({
                 const str = params.toString();
                 window.history.replaceState({}, '', str ? '?' + str : '/');
             }
-        }, [state]);
+        }, [state, config]);
 
         return [state, setState];
     }

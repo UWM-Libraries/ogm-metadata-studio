@@ -566,7 +566,6 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
                 ? "Extraction Entries"
                 : "Overlay Entries";
 
-    /* eslint-disable react-hooks/set-state-in-effect */
     useEffect(() => {
         const signature = `${normalizedInfoUrl}:${textAnnotations.length}:${hasWofAnnotations ? "wof" : "no-wof"}:${hasOsmAnnotations ? "osm" : "no-osm"}:${hasGeoNamesAnnotations ? "geonames" : "no-geonames"}:${hasOgmAnnotations ? "ogm" : "no-ogm"}:${hasCandidateAnnotations ? "candidate" : "no-candidate"}:${hasExtractionAnnotations ? "ocr" : "no-ocr"}`;
         if (annotationDefaultsRef.current === signature) return;
@@ -600,7 +599,6 @@ export const IiifImageViewer: React.FC<IiifImageViewerProps> = ({
             return next.size === current.size ? current : next;
         });
     }, [selectedAnnotationSectionSignature]);
-    /* eslint-enable react-hooks/set-state-in-effect */
 
     useEffect(() => {
         const handleFullscreenChange = () => {

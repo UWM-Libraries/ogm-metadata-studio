@@ -3,9 +3,6 @@ import * as queries from './queries';
 import * as dbInit from './dbInit';
 import { latLngToCell } from 'h3-js';
 
-// Mock types
-const mockToArray = vi.fn();
-const mockGet = vi.fn();
 const mockConn = {
     query: vi.fn(),
     prepare: vi.fn()

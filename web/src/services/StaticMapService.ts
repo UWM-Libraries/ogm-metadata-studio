@@ -93,7 +93,6 @@ export class StaticMapService {
             return await new Promise<Blob | null>((resolve) => {
                 let settled = false;
                 let didFitBounds = false;
-                let timeout: number;
 
                 const cleanup = (blob: Blob | null) => {
                     if (settled) return;
@@ -117,7 +116,7 @@ export class StaticMapService {
                     }
                 };
 
-                timeout = window.setTimeout(() => {
+                const timeout = window.setTimeout(() => {
                     if (didFitBounds && map?.loaded?.()) {
                         void capture();
                     } else {
