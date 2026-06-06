@@ -7,6 +7,11 @@ import { GithubImport } from './GithubImport';
 import * as duckdb from '../duckdb/duckdbClient';
 import * as githubScannerHook from '../hooks/useGithubScanner';
 
+const githubImportMocks = vi.hoisted(() => ({
+    fetchPublicJson: vi.fn(),
+    gbl1ToAardvark: vi.fn((json: any) => ({ ...json, id: json.id || 'converted-id' })),
+}));
+
 vi.mock('maplibre-gl', () => ({
     default: {
         Map: function Map() {
@@ -47,6 +52,18 @@ vi.mock('../duckdb/duckdbClient', () => ({
 
 vi.mock('../hooks/useGithubScanner', () => ({
     useGithubScanner: vi.fn()
+}));
+
+vi.mock('../services/GithubService', () => ({
+    GithubService: vi.fn(function GithubService() {
+        return {
+            fetchPublicJson: githubImportMocks.fetchPublicJson,
+        };
+    }),
+}));
+
+vi.mock('../aardvark/gbl1_to_aardvark', () => ({
+    gbl1ToAardvark: githubImportMocks.gbl1ToAardvark,
 }));
 
 vi.mock('./import/ScanForm', () => ({
@@ -168,6 +185,10 @@ describe('Missing Components Coverage', () => {
 
     describe('GithubImport', () => {
         it('renders and handles import interaction', async () => {
+            vi.stubGlobal('alert', vi.fn());
+            githubImportMocks.fetchPublicJson.mockResolvedValue({ id: 'resource-1', dct_title_s: 'Reno' });
+            vi.mocked(duckdb.importJsonData).mockResolvedValue(1);
+            vi.mocked(duckdb.saveDb).mockResolvedValue(undefined);
             vi.mocked(githubScannerHook.useGithubScanner).mockReturnValue({
                 repoUrl: '', setRepoUrl: vi.fn(),
                 branch: '', setBranch: vi.fn(),
@@ -191,9 +212,48 @@ describe('Missing Components Coverage', () => {
             // Trigger import
             fireEvent.click(screen.getByText('Start Import'));
 
-            // Logic inside handleImport uses GithubService.
-            // We need to ensure it doesn't crash.
-            // Ideally we mock GithubService.
+            await waitFor(() => {
+                expect(githubImportMocks.fetchPublicJson).toHaveBeenCalledWith({ owner: 'o', repo: 'r', branch: '' }, 'test.json');
+                expect(duckdb.importJsonData).toHaveBeenCalledWith([expect.objectContaining({ id: 'resource-1' })], { skipSave: true });
+                expect(duckdb.saveDb).toHaveBeenCalled();
+                expect(window.alert).toHaveBeenCalledWith('Import Complete! Imported 1 files. Failed 0.');
+            });
+        });
+
+        it('falls back to per-file import and logs GitHub import failures', async () => {
+            vi.stubGlobal('alert', vi.fn());
+            githubImportMocks.fetchPublicJson
+                .mockResolvedValueOnce(JSON.stringify({ id: 'gbl1-record' }))
+                .mockRejectedValueOnce(new Error('fetch failed'))
+                .mockResolvedValueOnce({ dct_title_s: 'Missing ID' });
+            vi.mocked(duckdb.importJsonData)
+                .mockRejectedValueOnce(new Error('batch failed'))
+                .mockResolvedValueOnce(1)
+                .mockResolvedValueOnce(0);
+            vi.mocked(duckdb.saveDb).mockResolvedValue(undefined);
+            vi.mocked(githubScannerHook.useGithubScanner).mockReturnValue({
+                repoUrl: 'https://github.com/o/r', setRepoUrl: vi.fn(),
+                branch: 'main', setBranch: vi.fn(),
+                token: 'token', setToken: vi.fn(),
+                isScanning: false, scanError: null,
+                foundFiles: [
+                    { path: 'one.json', sha: '1' },
+                    { path: 'two.json', sha: '2' },
+                    { path: 'three.json', sha: '3' },
+                ],
+                schemaMode: 'gbl1',
+                scan: vi.fn(),
+                parseRepoUrl: () => ({ owner: 'o', repo: 'r' })
+            });
+
+            render(<GithubImport />);
+            fireEvent.click(screen.getByText('Start Import'));
+
+            await waitFor(() => {
+                expect(githubImportMocks.gbl1ToAardvark).toHaveBeenCalledWith({ id: 'gbl1-record' });
+                expect(duckdb.importJsonData).toHaveBeenCalledTimes(3);
+                expect(window.alert).toHaveBeenCalledWith('Import Complete! Imported 1 files. Failed 2.');
+            });
         });
     });
 });

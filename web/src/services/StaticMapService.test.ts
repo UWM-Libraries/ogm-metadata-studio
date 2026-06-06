@@ -172,4 +172,106 @@ describe('StaticMapService', () => {
         // But bbox should still draw
         expect(mockContext.rect).toHaveBeenCalled();
     });
+
+    it('parses WKT, GeoJSON, points, and invalid geometry text through bbox helpers', () => {
+        const svc = new StaticMapService({ id: '1', dct_title_s: 'T' } as Resource) as any;
+
+        expect(svc.parseGeometryText('POLYGON((-10 40, -9 40, -9 41, -10 40))')).toEqual({
+            minLng: -10,
+            minLat: 40,
+            maxLng: -9,
+            maxLat: 41,
+        });
+        expect(svc.parseGeometryText('MULTIPOLYGON(((-10 40, -9 40, -9 41, -10 40)))')).toEqual({
+            minLng: -10,
+            minLat: 40,
+            maxLng: -9,
+            maxLat: 41,
+        });
+        expect(svc.parseGeometryText(JSON.stringify({
+            type: 'FeatureCollection',
+            features: [
+                { type: 'Feature', geometry: { type: 'Point', coordinates: [-115, 39] } },
+                { type: 'Feature', geometry: { type: 'LineString', coordinates: [[-114, 40], [-113, 41]] } },
+            ],
+        }))).toEqual({ minLng: -115, minLat: 39, maxLng: -113, maxLat: 41 });
+        expect(svc.parseGeometryText(JSON.stringify({ type: 'Point', coordinates: [-114.5, 39.5] }))).toEqual({
+            minLng: -114.54,
+            minLat: 39.46,
+            maxLng: -114.46,
+            maxLat: 39.54,
+        });
+        expect(svc.parseGeometryText('not geometry')).toBeNull();
+        expect(svc.parseGeometryText('ENVELOPE(-200, 10, 20, -20)')).toBeNull();
+        expect(svc.parsePoint('39.5,-114.5')).toEqual({ lat: 39.5, lng: -114.5 });
+        expect(svc.parsePoint({ latitude: 39.5, longitude: -114.5 })).toEqual({ lat: 39.5, lng: -114.5 });
+        expect(svc.parsePoint({ coordinates: [-114.5, 39.5] })).toEqual({ lat: 39.5, lng: -114.5 });
+        expect(svc.parsePoint('bad')).toBeNull();
+    });
+
+    it('extracts AI enrichment extents from resource-like, placename, and gazetteer payloads', () => {
+        const svc = new StaticMapService({ id: '1', dct_title_s: 'T' } as Resource) as any;
+
+        expect(svc.extractBBoxFromEnrichment({ map_bbox_estimate: { bbox: [-120, 35, -119, 36] } })).toEqual({
+            minLng: -120,
+            minLat: 35,
+            maxLng: -119,
+            maxLat: 36,
+        });
+        expect(svc.extractBBoxFromEnrichment({ mapExtent: { west: -120, south: 35, east: -119, north: 36, confidence: 0 } })).toBeNull();
+        expect(svc.extractBBoxFromEnrichment({ resource: { dcat_bbox: '-120,35,-119,36' } })).toEqual({
+            minLng: -120,
+            minLat: 35,
+            maxLng: -119,
+            maxLat: 36,
+        });
+        expect(svc.extractBBoxFromEnrichment({
+            placenames: [{
+                gazetteerMatches: [{ bounds: [-118, 37, -117, 38] }],
+            }],
+        })).toEqual({ minLng: -118, minLat: 37, maxLng: -117, maxLat: 38 });
+        expect(svc.extractBBoxFromEnrichment({
+            placeCandidates: [{
+                extensions: { canonicalGazetteer: { projectedCoordinates: [-116.5, 39.5] } },
+            }],
+        })).toEqual({ minLng: -116.54, minLat: 39.46, maxLng: -116.46, maxLat: 39.54 });
+        expect(svc.extractBBoxFromEnrichment(null)).toBeNull();
+    });
+
+    it('extracts reference URLs from string, object, array, and nested values', () => {
+        const refs = {
+            'ai-enrichments': [
+                'https://example.test/a.json',
+                { url: 'https://example.test/b.json' },
+                { nested: [{ '@id': 'https://example.test/c.json' }] },
+            ],
+            ignored: 'https://example.test/ignored.json',
+        };
+        const svc = new StaticMapService({
+            id: '1',
+            dct_title_s: 'T',
+            dct_references_s: JSON.stringify(refs),
+        } as Resource) as any;
+
+        expect(svc.getReferenceUrls(new Set(['ai-enrichments']))).toEqual([
+            'https://example.test/a.json',
+            'https://example.test/b.json',
+            'https://example.test/c.json',
+        ]);
+        expect(svc.parseResourceReferences()).toEqual(refs);
+        expect(new (StaticMapService as any)({ id: '2', dct_title_s: 'T', dct_references_s: '{bad' }).parseResourceReferences()).toBeNull();
+        expect(svc.extractUrls({ id: 'https://example.test/id.json' })).toEqual(['https://example.test/id.json']);
+    });
+
+    it('fetches JSON references defensively', async () => {
+        const svc = new StaticMapService({ id: '1', dct_title_s: 'T' } as Resource) as any;
+        (global.fetch as any)
+            .mockResolvedValueOnce({ ok: true, json: async () => ({ ok: true }) })
+            .mockResolvedValueOnce({ ok: false })
+            .mockRejectedValueOnce(new Error('offline'));
+
+        await expect(svc.fetchJson('https://example.test/ok.json')).resolves.toEqual({ ok: true });
+        await expect(svc.fetchJson('https://example.test/missing.json')).resolves.toBeNull();
+        await expect(svc.fetchJson('https://example.test/offline.json')).resolves.toBeNull();
+    });
 });

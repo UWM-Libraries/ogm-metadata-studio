@@ -397,4 +397,151 @@ describe('ImageService', () => {
 
         expect(url).toBe('http://proxy.test/api/artifacts/pmtiles-preview?url=https%3A%2F%2Fs3.amazonaws.com%2Fogm-metadata-studio%2Fuploads%2Fgeodata-1%2Fderivatives%2Ffootprints.pmtiles&width=512&height=512&v=pmtiles-thumb-v2');
     });
+
+    it('handles ContentDM, Esri, TMS, direct image, and manifest-source URL variants', async () => {
+        const contentDmDigital = new ImageService(mockResource, [{
+            resource_id: 'test-1',
+            relation_key: 'iiif',
+            url: 'https://contentdm.oclc.org/digital/iiif/p16022coll1/42',
+        } as any]);
+        expect(await contentDmDigital.getThumbnailUrl()).toBe('https://cdm16022.contentdm.oclc.org/iiif/2/p16022coll1:42/full/200,/0/default.jpg');
+
+        const contentDmManifest = new ImageService(mockResource, [{
+            resource_id: 'test-1',
+            relation_key: 'https://iiif.io/api/presentation#manifest',
+            url: 'https://contentdm.oclc.org/iiif/p16022coll1/manifest',
+        } as any]);
+        expect(await contentDmManifest.getThumbnailUrl()).toBe('https://cdm16022.contentdm.oclc.org/iiif/2/p16022coll1/full/200,/0/default.jpg');
+
+        const esri = new ImageService(mockResource, [{
+            resource_id: 'test-1',
+            relation_key: 'urn:x-esri:serviceType:ArcGIS#DynamicMapLayer',
+            url: 'https://server.test/arcgis/rest/services/maps/MapServer',
+        } as any]);
+        expect(await esri.getThumbnailUrl()).toBe('https://server.test/arcgis/rest/services/maps/MapServer/info/thumbnail/thumbnail.png');
+
+        const tms = new ImageService(mockResource, [{
+            resource_id: 'test-1',
+            relation_key: 'http://www.opengis.net/def/serviceType/ogc/tms',
+            url: 'https://tiles.test/tms',
+        } as any]);
+        expect(await tms.getThumbnailUrl()).toBe('https://tiles.test/tms/reflect?format=application/vnd.google-earth.kml+xml');
+
+        const direct = new ImageService(mockResource, [{
+            resource_id: 'test-1',
+            relation_key: 'https://schema.org/downloadUrl',
+            url: 'https://cdn.test/thumb.webp?size=small',
+        } as any]);
+        expect(await direct.getThumbnailUrl()).toBe('https://cdn.test/thumb.webp?size=small');
+
+        mockFetch.mockResolvedValueOnce({ ok: false });
+        const heuristicManifest = new ImageService({
+            ...mockResource,
+            dct_references_s: JSON.stringify({
+                'https://schema.org/url': 'https://library.test/object/123/iiif/manifest.json',
+            }),
+        }, []);
+        expect(await heuristicManifest.getThumbnailUrl()).toBeNull();
+        expect(mockFetch).toHaveBeenCalledWith('https://library.test/object/123/iiif/manifest.json', expect.objectContaining({ signal: expect.any(AbortSignal) }));
+    });
+
+    it('extracts thumbnails from IIIF v2, IIIF v3, and malformed manifest variants', () => {
+        const service = new ImageService(mockResource, []) as any;
+
+        expect(service.extractThumbnailFromManifest({
+            sequences: [{
+                canvases: [{
+                    images: [{ resource: { service: { '@id': 'https://iiif.test/image' } } }],
+                }],
+            }],
+        })).toBe('https://iiif.test/image/full/400,/0/default.jpg');
+        expect(service.extractThumbnailFromManifest({
+            items: [{
+                thumbnail: [{ id: 'https://iiif.test/thumb.jpg' }],
+            }],
+        })).toBe('https://iiif.test/thumb.jpg');
+        expect(service.extractThumbnailFromManifest({
+            items: [{
+                items: [{ items: [{ body: { service: ['https://iiif.test/body-service'] } }] }],
+            }],
+        })).toBe('https://iiif.test/body-service/full/400,/0/default.jpg');
+        expect(service.extractThumbnailFromManifest({
+            items: [{
+                items: [{ items: [{ body: { id: 'https://iiif.test/body.jpg' } }] }],
+            }],
+        })).toBe('https://iiif.test/body.jpg');
+        expect(service.extractThumbnailFromManifest({ get thumbnail() { throw new Error('bad manifest'); } })).toBeNull();
+        expect(service.standardizeIiifUrl('https://iiif.test/image/full/800,/0/default.jpg')).toBe('https://iiif.test/image/full/200,/0/default.jpg');
+        expect(service.standardizeIiifUrl('https://stacks.stanford.edu/image/full/!400,400/0/default.jpg')).toBe('https://stacks.stanford.edu/image/full/!400,400/0/default.jpg');
+    });
+
+    it('parses preview bounding boxes from WKT, GeoJSON, CSV, ENVELOPE, and invalid values', () => {
+        const service = new ImageService(mockResource, []) as any;
+
+        expect(service.parseBBoxText('ENVELOPE(-120,-119,40,39)')).toEqual({ west: -120, south: 39, east: -119, north: 40 });
+        expect(service.parseBBoxText('-120,39,-119,40')).toEqual({ west: -120, south: 39, east: -119, north: 40 });
+        expect(service.parseBBoxText('POLYGON((-120 39, -119 39, -119 40, -120 39))')).toEqual({ west: -120, south: 39, east: -119, north: 40 });
+        expect(service.parseBBoxText(JSON.stringify({
+            type: 'Feature',
+            geometry: { type: 'LineString', coordinates: [[-120, 39], [-119, 40]] },
+        }))).toEqual({ west: -120, south: 39, east: -119, north: 40 });
+        expect(service.parseBBoxText(JSON.stringify({
+            type: 'FeatureCollection',
+            features: [{ geometry: { coordinates: [[[-118, 37], [-117, 38]]] } }],
+        }))).toEqual({ west: -118, south: 37, east: -117, north: 38 });
+        expect(service.parseBBoxText('ENVELOPE(-200,-119,40,39)')).toBeNull();
+        expect(service.parseBBoxText('bad')).toBeNull();
+    });
+
+    it('normalizes artifact URLs, proxy endpoints, reference items, and candidate classifiers', () => {
+        vi.stubEnv('VITE_ENRICHMENT_PROXY_URL', 'http://proxy.test/base/');
+        const res = {
+            ...mockResource,
+            dct_format_s: 'Vector package GeoTIFF',
+            dct_references_s: JSON.stringify({
+                download: [
+                    { url: 'data.test/file.tif', label: 'GeoTIFF download' },
+                    { '@id': 'https://data.test/file.pmtiles', label: 'Vector tile package' },
+                    { nested: { id: 'https://data.test/roads.geojson', label: 'GeoJSON' } },
+                    { url: 'https://data.test/roads.zip', label: 'Shapefile ZIP' },
+                ],
+            }),
+        };
+        const service = new ImageService(res, [{ resource_id: 'test-1', relation_key: 'download', url: 'https://data.test/file.tif', label: 'Duplicate' }]) as any;
+
+        expect(service.normalizeArtifactUrl('//cdn.test/a.tif')).toBe('https://cdn.test/a.tif');
+        expect(service.normalizeArtifactUrl('cdn.test/a.tif')).toBe('https://cdn.test/a.tif');
+        expect(service.proxyArtifactEndpoint('/api/artifacts/proxy', 'cdn.test/a.tif')).toBe('http://proxy.test/api/artifacts/proxy?url=https%3A%2F%2Fcdn.test%2Fa.tif');
+        expect(service.getReferenceItems().map((item: any) => item.url)).toEqual([
+            'https://data.test/file.tif',
+            'data.test/file.tif',
+            'https://data.test/file.pmtiles',
+            'https://data.test/roads.geojson',
+            'https://data.test/roads.zip',
+        ]);
+        expect(service.getGeoTiffCandidateUrls()).toContain('data.test/file.tif');
+        expect(service.getPmtilesCandidateUrls()).toContain('https://data.test/file.pmtiles');
+        expect(service.getGeoJsonCandidateUrls()).toContain('https://data.test/roads.geojson');
+        expect(service.getVectorPackageCandidateUrls()).toContain('https://data.test/roads.zip');
+        expect(service.isManifestUrl('https://example.test/dataset_manifest.json')).toBe(false);
+    });
+
+    it('fetches manifests and COG info defensively', async () => {
+        vi.stubEnv('VITE_ENRICHMENT_PROXY_URL', 'http://proxy.test');
+        const service = new ImageService(mockResource, []) as any;
+        mockFetch
+            .mockResolvedValueOnce({ ok: true, json: async () => ({ manifest: true }) })
+            .mockResolvedValueOnce({ ok: false })
+            .mockRejectedValueOnce(new Error('manifest offline'))
+            .mockResolvedValueOnce({ ok: true, json: async () => ({ bbox: [-120, 39, -119, 40] }) })
+            .mockResolvedValueOnce({ ok: true, json: async () => ({ bbox: [-200, 39, -119, 40] }) })
+            .mockRejectedValueOnce(new Error('cog offline'));
+
+        await expect(service.fetchManifest('https://example.test/manifest.json')).resolves.toEqual({ manifest: true });
+        await expect(service.fetchManifest('https://example.test/missing.json')).resolves.toBeNull();
+        await expect(service.fetchManifest('https://example.test/offline.json')).resolves.toBeNull();
+        await expect(service.fetchCogInfoBBox('https://data.test/map.tif')).resolves.toEqual({ west: -120, south: 39, east: -119, north: 40 });
+        await expect(service.fetchCogInfoBBox('https://data.test/bad.tif')).resolves.toBeNull();
+        await expect(service.fetchCogInfoBBox('https://data.test/offline.tif')).resolves.toBeNull();
+    });
 });

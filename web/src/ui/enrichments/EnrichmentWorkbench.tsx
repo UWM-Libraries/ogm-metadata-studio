@@ -37,7 +37,7 @@ type Panel = "upload" | "config" | "inventory";
 type BusyOperation = "" | "upload" | "regenerate" | "refresh" | "wof";
 type EnrichmentPhase = "starting" | "requesting" | "storing" | "completed" | "failed";
 type UploadStatus = "queued" | "hashing" | "processing" | "publishing" | "completed" | "cached" | "failed";
-type UploadKind = "image" | "geospatial";
+export type UploadKind = "image" | "geospatial";
 
 const STREAMING_GEOSPATIAL_THRESHOLD_BYTES = 512 * 1024 * 1024;
 
@@ -65,7 +65,7 @@ interface EnrichmentProgress {
     milestones: EnrichmentMilestone[];
 }
 
-interface UploadItem {
+export interface UploadItem {
     id: string;
     kind: UploadKind;
     file: File;
@@ -99,7 +99,7 @@ interface UploadItem {
     milestones?: EnrichmentMilestone[];
 }
 
-interface MetadataUploadItem {
+export interface MetadataUploadItem {
     id: string;
     file: File;
     name: string;
@@ -107,14 +107,14 @@ interface MetadataUploadItem {
     size: number;
 }
 
-interface FolderScanSummaryItem {
+export interface FolderScanSummaryItem {
     name: string;
     kind: "file" | "directory";
     fileCount: number;
     size: number;
 }
 
-interface FolderScanSummary {
+export interface FolderScanSummary {
     rootName: string;
     totalFiles: number;
     imageCount: number;
@@ -124,7 +124,7 @@ interface FolderScanSummary {
     topLevelItems: FolderScanSummaryItem[];
 }
 
-const blankStorageProfile = (): ProxyStorageProfile => ({
+export const blankStorageProfile = (): ProxyStorageProfile => ({
     id: `s3-${crypto.randomUUID()}`,
     name: "New S3 profile",
     endpoint: "https://s3.amazonaws.com",
@@ -140,7 +140,7 @@ const blankStorageProfile = (): ProxyStorageProfile => ({
     sessionTokenEnv: "",
 });
 
-const blankModelProfile = (): ProxyModelProfile => ({
+export const blankModelProfile = (): ProxyModelProfile => ({
     id: `openai-${crypto.randomUUID()}`,
     name: "OpenAI profile",
     provider: "openai",
@@ -149,7 +149,7 @@ const blankModelProfile = (): ProxyModelProfile => ({
     modelParams: {},
 });
 
-const blankGeminiModelProfile = (): ProxyModelProfile => ({
+export const blankGeminiModelProfile = (): ProxyModelProfile => ({
     id: `gemini-${crypto.randomUUID()}`,
     name: "Gemini label extraction",
     provider: "gemini",
@@ -158,7 +158,7 @@ const blankGeminiModelProfile = (): ProxyModelProfile => ({
     modelParams: {},
 });
 
-const blankKimiModelProfile = (): ProxyModelProfile => ({
+export const blankKimiModelProfile = (): ProxyModelProfile => ({
     id: `kimi-${crypto.randomUUID()}`,
     name: "Kimi K2.6 cached map-agent swarm",
     provider: "kimi",
@@ -167,7 +167,7 @@ const blankKimiModelProfile = (): ProxyModelProfile => ({
     modelParams: { thinking: { type: "disabled" } },
 });
 
-const blankOpenAIReconciliationProfile = (): ProxyModelProfile => ({
+export const blankOpenAIReconciliationProfile = (): ProxyModelProfile => ({
     id: `openai-reconcile-${crypto.randomUUID()}`,
     name: "OpenAI mini label reconciliation",
     provider: "openai",
@@ -176,7 +176,7 @@ const blankOpenAIReconciliationProfile = (): ProxyModelProfile => ({
     modelParams: {},
 });
 
-const blankVisionProfile = (): ProxyVisionProfile => ({
+export const blankVisionProfile = (): ProxyVisionProfile => ({
     id: `vision-${crypto.randomUUID()}`,
     name: "Google Cloud Vision",
     provider: "google_cloud_vision",
@@ -186,7 +186,7 @@ const blankVisionProfile = (): ProxyVisionProfile => ({
     languageHints: [],
 });
 
-const defaultTextReconciliationProfileId = (profiles: ProxyModelProfile[]) => (
+export const defaultTextReconciliationProfileId = (profiles: ProxyModelProfile[]) => (
     profiles.find((profile) => (profile.provider || "openai") === "openai" && /mini|nano|reconciliation/i.test(`${profile.name} ${profile.defaultModel}`))?.id
     || profiles.find((profile) => profile.provider === "gemini")?.id
     || profiles.find((profile) => profile.provider === "kimi")?.id
@@ -211,7 +211,7 @@ const defaultBatchDefaults = {
     themes: [],
 };
 
-function cleanMetadataIdPrefix(value: unknown): string {
+export function cleanMetadataIdPrefix(value: unknown): string {
     const cleaned = String(value || "")
         .trim()
         .toLowerCase()
@@ -220,7 +220,7 @@ function cleanMetadataIdPrefix(value: unknown): string {
     return cleaned || "unr";
 }
 
-function defaultBatchDefaultsPayload(storageProfile?: ProxyStorageProfile) {
+export function defaultBatchDefaultsPayload(storageProfile?: ProxyStorageProfile) {
     return {
         ...defaultBatchDefaults,
         provider: storageProfile?.metadataProvider || defaultBatchDefaults.provider,
@@ -232,7 +232,7 @@ function defaultBatchDefaultsPayload(storageProfile?: ProxyStorageProfile) {
     };
 }
 
-function parseJsonField<T>(text: string, fallback: T): T {
+export function parseJsonField<T>(text: string, fallback: T): T {
     try {
         return JSON.parse(text) as T;
     } catch {
@@ -240,27 +240,27 @@ function parseJsonField<T>(text: string, fallback: T): T {
     }
 }
 
-function pretty(value: unknown): string {
+export function pretty(value: unknown): string {
     return safeJsonStringify(value, 2);
 }
 
-function profileSummary(profile: ProxyStorageProfile): string {
+export function profileSummary(profile: ProxyStorageProfile): string {
     return [profile.bucket, (profile.prefixes ?? []).filter(Boolean).join(", ")].filter(Boolean).join(" / ") || "Not configured";
 }
 
-function normalizeModelParams(model: string, params: Record<string, unknown> = {}): Record<string, unknown> {
+export function normalizeModelParams(model: string, params: Record<string, unknown> = {}): Record<string, unknown> {
     const next = { ...params };
     if (/^gpt-5/i.test(model)) delete next.temperature;
     return next;
 }
 
-function formatElapsed(totalSeconds: number): string {
+export function formatElapsed(totalSeconds: number): string {
     const minutes = Math.floor(totalSeconds / 60);
     const seconds = totalSeconds % 60;
     return minutes > 0 ? `${minutes}m ${seconds.toString().padStart(2, "0")}s` : `${seconds}s`;
 }
 
-function formatBytes(value: number): string {
+export function formatBytes(value: number): string {
     if (!Number.isFinite(value) || value <= 0) return "";
     const units = ["B", "KB", "MB", "GB"];
     let size = value;
@@ -272,7 +272,7 @@ function formatBytes(value: number): string {
     return `${size >= 10 || unit === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[unit]}`;
 }
 
-function base64FromArrayBuffer(buffer: ArrayBuffer): string {
+export function base64FromArrayBuffer(buffer: ArrayBuffer): string {
     const bytes = new Uint8Array(buffer);
     const chunkSize = 0x8000;
     let binary = "";
@@ -282,53 +282,53 @@ function base64FromArrayBuffer(buffer: ArrayBuffer): string {
     return btoa(binary);
 }
 
-async function checksumArrayBuffer(buffer: ArrayBuffer): Promise<string> {
+export async function checksumArrayBuffer(buffer: ArrayBuffer): Promise<string> {
     const digest = await crypto.subtle.digest("SHA-256", buffer);
     return Array.from(new Uint8Array(digest)).map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-function isImageUpload(file: File): boolean {
+export function isImageUpload(file: File): boolean {
     return file.type.startsWith("image/") || /\.(jpe?g|png|webp|tiff?|jp2|j2k)$/i.test(file.name);
 }
 
-function isZipUpload(file: File): boolean {
+export function isZipUpload(file: File): boolean {
     return /\.zip$/i.test(file.name) || file.type === "application/zip" || file.type === "application/x-zip-compressed";
 }
 
-function isIgnoredArchiveEntryName(name: string): boolean {
+export function isIgnoredArchiveEntryName(name: string): boolean {
     const normalized = name.replace(/\\/g, "/");
     const parts = normalized.split("/");
     const basename = parts[parts.length - 1] || "";
     return parts.includes("__MACOSX") || basename === ".DS_Store" || basename === "Thumbs.db" || basename.startsWith("._");
 }
 
-function isShapefileSidecar(file: File): boolean {
+export function isShapefileSidecar(file: File): boolean {
     return /\.(shp|shx|dbf|prj|cpg|sbn|sbx|qix)$/i.test(file.name) || /\.shp\.xml$/i.test(file.name);
 }
 
-function isGeospatialRasterSource(file: File): boolean {
+export function isGeospatialRasterSource(file: File): boolean {
     return /\.(tiff?|sid|img|jp2|j2k)$/i.test(file.name);
 }
 
-function isGeospatialRasterSidecar(file: File): boolean {
+export function isGeospatialRasterSidecar(file: File): boolean {
     return /\.(tfw|tifw|jgw|j2w|sdw|wld|prj|aux|ovr|rrd|met)$/i.test(file.name)
         || /\.(tif|tiff|sid|img|jp2|j2k|aux)\.xml$/i.test(file.name)
         || /\.(tif|tiff|sid|img|jp2|j2k)\.aux\.xml$/i.test(file.name);
 }
 
-function isMetadataUpload(file: File): boolean {
+export function isMetadataUpload(file: File): boolean {
     return file.type.includes("xml") || file.type.startsWith("text/") || /\.(txt|xml|fgdc|iso|met)$/i.test(file.name);
 }
 
-function isMetadataEntryName(name: string): boolean {
+export function isMetadataEntryName(name: string): boolean {
     return /\.(txt|xml|fgdc|iso|met)$/i.test(name);
 }
 
-function metadataContentTypeForName(name: string): string {
+export function metadataContentTypeForName(name: string): string {
     return /\.(xml|fgdc|iso)$/i.test(name) ? "application/xml" : "text/plain";
 }
 
-function stripKnownRasterExtension(name: string): string {
+export function stripKnownRasterExtension(name: string): string {
     return name
         .replace(/\.(tif|tiff|sid|img|jp2|j2k)\.aux\.xml$/i, "")
         .replace(/\.(tif|tiff|sid|img|jp2|j2k|aux)\.xml$/i, "")
@@ -336,14 +336,14 @@ function stripKnownRasterExtension(name: string): string {
         .replace(/\.(tiff?|sid|img|jp2|j2k)$/i, "");
 }
 
-function shapefileGroupKey(file: File): string {
+export function shapefileGroupKey(file: File): string {
     const pathName = relativePathForFile(file);
     const directory = pathName.includes("/") ? pathName.slice(0, pathName.lastIndexOf("/") + 1) : "";
     const base = basenameFromPath(pathName).replace(/\.shp\.xml$/i, "").replace(/\.(shp|shx|dbf|prj|cpg|sbn|sbx|qix)$/i, "");
     return `${directory}${base}`.toLowerCase();
 }
 
-function geospatialPackageNameFromGroup(files: File[]): string {
+export function geospatialPackageNameFromGroup(files: File[]): string {
     const shp = files.find((file) => /\.shp$/i.test(file.name));
     const base = basenameFromPath(relativePathForFile((shp || files[0])))
         .replace(/\.shp$/i, "")
@@ -351,7 +351,7 @@ function geospatialPackageNameFromGroup(files: File[]): string {
     return `${base}.zip`;
 }
 
-function groupShapefileSidecars(files: File[]): File[][] {
+export function groupShapefileSidecars(files: File[]): File[][] {
     const grouped = new Map<string, File[]>();
     for (const file of files) {
         const key = shapefileGroupKey(file);
@@ -360,19 +360,19 @@ function groupShapefileSidecars(files: File[]): File[][] {
     return Array.from(grouped.values()).filter((group) => group.some((file) => /\.shp$/i.test(file.name)));
 }
 
-function rasterGroupKey(file: File): string {
+export function rasterGroupKey(file: File): string {
     const pathName = relativePathForFile(file);
     const directory = pathName.includes("/") ? pathName.slice(0, pathName.lastIndexOf("/") + 1) : "";
     return `${directory}${stripKnownRasterExtension(basenameFromPath(pathName))}`.toLowerCase();
 }
 
-function geospatialRasterPackageNameFromGroup(files: File[]): string {
+export function geospatialRasterPackageNameFromGroup(files: File[]): string {
     const source = files.find(isGeospatialRasterSource) || files[0];
     const base = stripKnownRasterExtension(basenameFromPath(relativePathForFile(source))) || "geospatial_raster";
     return `${base}.zip`;
 }
 
-function groupGeospatialRasterFiles(files: File[]): File[][] {
+export function groupGeospatialRasterFiles(files: File[]): File[][] {
     const grouped = new Map<string, File[]>();
     for (const file of files) {
         const key = rasterGroupKey(file);
@@ -386,7 +386,7 @@ function groupGeospatialRasterFiles(files: File[]): File[][] {
     });
 }
 
-function archiveHasGeospatialDataset(entryNames: string[]): boolean {
+export function archiveHasGeospatialDataset(entryNames: string[]): boolean {
     if (entryNames.some((name) => /\.shp$/i.test(name) && !/\.shp\.xml$/i.test(name))) return true;
 
     const grouped = new Map<string, string[]>();
@@ -405,7 +405,7 @@ function archiveHasGeospatialDataset(entryNames: string[]): boolean {
     });
 }
 
-async function metadataFilesFromZip(file: File, zip: JSZip): Promise<File[]> {
+export async function metadataFilesFromZip(file: File, zip: JSZip): Promise<File[]> {
     const files: File[] = [];
     const zipPath = relativePathForFile(file);
     const entries = Object.values(zip.files)
@@ -421,7 +421,7 @@ async function metadataFilesFromZip(file: File, zip: JSZip): Promise<File[]> {
     return files;
 }
 
-async function classifyZipUploads(zipFiles: File[]): Promise<{
+export async function classifyZipUploads(zipFiles: File[]): Promise<{
     geospatialZipPackages: File[];
     metadataFiles: File[];
     unsupportedZipCount: number;
@@ -455,7 +455,7 @@ async function classifyZipUploads(zipFiles: File[]): Promise<{
     return { geospatialZipPackages, metadataFiles, unsupportedZipCount };
 }
 
-function fileStemForMetadataMatch(name: string): string {
+export function fileStemForMetadataMatch(name: string): string {
     return basenameFromPath(name)
         .replace(/\.(jpe?g|png|webp|tiff?|jp2|j2k)\.(txt|xml|fgdc|iso|met)$/i, "")
         .replace(/\.(txt|xml|fgdc|iso|met)$/i, "")
@@ -463,22 +463,22 @@ function fileStemForMetadataMatch(name: string): string {
         .replace(/\.[^.]+$/, "");
 }
 
-function normalizedBaseName(name: string): string {
+export function normalizedBaseName(name: string): string {
     return fileStemForMetadataMatch(name).toLowerCase().replace(/[^a-z0-9]+/g, "");
 }
 
-function normalizedPathStem(name: string): string {
+export function normalizedPathStem(name: string): string {
     const normalized = String(name || "").replace(/\\/g, "/");
     const directory = normalized.includes("/") ? normalized.slice(0, normalized.lastIndexOf("/") + 1) : "";
     return `${directory}${fileStemForMetadataMatch(name)}`.toLowerCase().replace(/[^a-z0-9/]+/g, "");
 }
 
-function isIgnoredFilesystemFile(file: File): boolean {
+export function isIgnoredFilesystemFile(file: File): boolean {
     const name = basenameFromPath(relativePathForFile(file));
     return name === ".DS_Store" || name === "Thumbs.db" || name.startsWith("._");
 }
 
-function commonRootSegment(files: File[]): string {
+export function commonRootSegment(files: File[]): string {
     const firstSegments = files
         .map((file) => relativePathForFile(file).split("/").filter(Boolean))
         .filter((parts) => parts.length > 1)
@@ -488,25 +488,25 @@ function commonRootSegment(files: File[]): string {
     return firstSegments.every((segment) => segment === first) ? first : "";
 }
 
-function topLevelPartsForPath(pathName: string, rootName: string): string[] {
+export function topLevelPartsForPath(pathName: string, rootName: string): string[] {
     const parts = String(pathName || "").replace(/\\/g, "/").split("/").filter(Boolean);
     if (rootName && parts[0] === rootName) return parts.slice(1);
     return parts;
 }
 
-function normalizedPackageNameForDedupe(name: string): string {
+export function normalizedPackageNameForDedupe(name: string): string {
     return basenameFromPath(name)
         .replace(/\.zip$/i, "")
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, "");
 }
 
-function zipPackageDedupeKey(file: File, rootName: string): string {
+export function zipPackageDedupeKey(file: File, rootName: string): string {
     const parts = topLevelPartsForPath(relativePathForFile(file), rootName);
     return normalizedPackageNameForDedupe(parts[parts.length - 1] || file.name);
 }
 
-function expandedGeospatialGroupDedupeKey(files: File[], rootName: string): string {
+export function expandedGeospatialGroupDedupeKey(files: File[], rootName: string): string {
     const primary = files.find(isGeospatialRasterSource) || files.find((file) => /\.shp$/i.test(file.name)) || files[0];
     const parts = topLevelPartsForPath(relativePathForFile(primary), rootName);
     const packageName = parts.length > 1
@@ -515,12 +515,12 @@ function expandedGeospatialGroupDedupeKey(files: File[], rootName: string): stri
     return normalizedPackageNameForDedupe(packageName);
 }
 
-function imageDirectoryKey(file: File, rootName: string): string {
+export function imageDirectoryKey(file: File, rootName: string): string {
     const parts = topLevelPartsForPath(relativePathForFile(file), rootName);
     return parts.length > 1 ? parts.slice(0, -1).join("/").toLowerCase() : "";
 }
 
-function imageFamilyStemForDerivativeDedupe(file: File): string {
+export function imageFamilyStemForDerivativeDedupe(file: File): string {
     return basenameFromPath(relativePathForFile(file))
         .replace(/\.(jpe?g|png|webp|tiff?|jp2|j2k)$/i, "")
         .replace(/[_-]\d+$/i, "")
@@ -528,19 +528,19 @@ function imageFamilyStemForDerivativeDedupe(file: File): string {
         .replace(/[^a-z0-9]+/g, "");
 }
 
-function isLikelyAccessDerivativeImage(file: File): boolean {
+export function isLikelyAccessDerivativeImage(file: File): boolean {
     return /\.(jpe?g)$/i.test(file.name);
 }
 
-function isPreferredSourceImage(file: File): boolean {
+export function isPreferredSourceImage(file: File): boolean {
     return /\.(tiff?|jp2|j2k)$/i.test(file.name);
 }
 
-function derivativeImageDedupeKey(file: File, rootName: string): string {
+export function derivativeImageDedupeKey(file: File, rootName: string): string {
     return `${imageDirectoryKey(file, rootName)}:${imageFamilyStemForDerivativeDedupe(file)}`;
 }
 
-function buildFolderScanSummary(
+export function buildFolderScanSummary(
     files: File[],
     counts: Pick<FolderScanSummary, "imageCount" | "geospatialCount" | "metadataCount" | "ignoredCount">,
 ): FolderScanSummary | null {
@@ -570,16 +570,16 @@ function buildFolderScanSummary(
     };
 }
 
-function resourcePageHref(resourceId: string | undefined): string {
+export function resourcePageHref(resourceId: string | undefined): string {
     return resourceId ? withBasePath(`/resources/${encodeURIComponent(resourceId)}`) : "";
 }
 
-function metadataSourceGroupName(item: MetadataUploadItem, rootName: string): string {
+export function metadataSourceGroupName(item: MetadataUploadItem, rootName: string): string {
     const parts = topLevelPartsForPath(item.sourcePath || item.name, rootName);
     return parts[0] || item.name;
 }
 
-async function readMetadataPayload(file: File) {
+export async function readMetadataPayload(file: File) {
     return {
         name: file.name,
         type: file.type || (file.name.toLowerCase().endsWith(".xml") ? "application/xml" : "text/plain"),
@@ -588,7 +588,7 @@ async function readMetadataPayload(file: File) {
     };
 }
 
-async function buildGeospatialPackageBuffer(item: UploadItem): Promise<{ buffer: ArrayBuffer; fileName: string; sourceFileCount: number }> {
+export async function buildGeospatialPackageBuffer(item: UploadItem): Promise<{ buffer: ArrayBuffer; fileName: string; sourceFileCount: number }> {
     const files = item.files && item.files.length > 0 ? item.files : [item.file];
     if (files.length === 1 && isZipUpload(files[0])) {
         return {
@@ -610,17 +610,17 @@ async function buildGeospatialPackageBuffer(item: UploadItem): Promise<{ buffer:
     };
 }
 
-function shouldStreamGeospatialItem(item: UploadItem): boolean {
+export function shouldStreamGeospatialItem(item: UploadItem): boolean {
     return item.kind === "geospatial"
         && item.size >= STREAMING_GEOSPATIAL_THRESHOLD_BYTES
         && Boolean(item.files && item.files.length > 1);
 }
 
-function milestoneTime(date = new Date()): string {
+export function milestoneTime(date = new Date()): string {
     return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" });
 }
 
-function formatDateTime(value?: string | null): string {
+export function formatDateTime(value?: string | null): string {
     if (!value) return "not synced yet";
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) return String(value);
@@ -632,7 +632,7 @@ function formatDateTime(value?: string | null): string {
     });
 }
 
-async function withTimeout<T>(promise: Promise<T>, label: string, timeoutMs: number): Promise<T> {
+export async function withTimeout<T>(promise: Promise<T>, label: string, timeoutMs: number): Promise<T> {
     let timeoutId: number | undefined;
     try {
         return await Promise.race([

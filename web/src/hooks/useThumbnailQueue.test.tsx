@@ -49,6 +49,8 @@ describe("useThumbnailQueue", () => {
         mocks.thumbnailCandidates = [];
         mocks.getThumbnail.mockResolvedValue(null);
         mocks.getDistributionsForResource.mockResolvedValue([]);
+        mocks.upsertThumbnail.mockResolvedValue(undefined);
+        vi.stubGlobal("URL", { createObjectURL: vi.fn(() => "blob:thumbnail") });
     });
 
     afterEach(() => {
@@ -72,5 +74,50 @@ describe("useThumbnailQueue", () => {
         });
         expect(mocks.upsertThumbnail).not.toHaveBeenCalled();
         expect(screen.getByTestId("thumbnail")).toHaveTextContent(mocks.thumbnailCandidates[0]);
+    });
+
+    it("uses cached thumbnails and does not fetch distributions or candidates", async () => {
+        mocks.getThumbnail.mockResolvedValueOnce("cached-thumbnail");
+
+        render(<Harness />);
+
+        await waitFor(() => {
+            expect(screen.getByTestId("thumbnail")).toHaveTextContent("cached-thumbnail");
+        });
+        expect(mocks.getDistributionsForResource).not.toHaveBeenCalled();
+        expect(mocks.upsertThumbnail).not.toHaveBeenCalled();
+    });
+
+    it("persists the first fetchable generated thumbnail candidate", async () => {
+        mocks.thumbnailCandidates = ["https://example.test/thumb.jpg"];
+        vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+            ok: true,
+            blob: vi.fn().mockResolvedValue(new Blob(["image"])),
+        }));
+
+        render(<Harness />);
+
+        await waitFor(() => {
+            expect(screen.getByTestId("thumbnail")).toHaveTextContent("blob:thumbnail");
+        });
+        expect(mocks.getDistributionsForResource).toHaveBeenCalledWith("resource-1");
+        expect(mocks.upsertThumbnail).toHaveBeenCalledWith("resource-1", expect.any(Blob));
+    });
+
+    it("marks resources as checked when no candidate exists or thumbnail loading fails", async () => {
+        const ErrorHarness = () => {
+            const { thumbnails, register } = useThumbnailQueue();
+            useEffect(() => {
+                register("error-resource", { ...resource, id: "error-resource" });
+            }, [register]);
+            return <div data-testid="error-thumbnail">{String(thumbnails["error-resource"])}</div>;
+        };
+        mocks.getThumbnail.mockRejectedValueOnce(new Error("cache failed"));
+
+        render(<ErrorHarness />);
+
+        await waitFor(() => {
+            expect(screen.getByTestId("error-thumbnail")).toHaveTextContent("null");
+        });
     });
 });

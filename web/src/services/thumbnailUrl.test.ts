@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { displayThumbnailUrl, inferredUploadedThumbnailUrl } from "./thumbnailUrl";
+import {
+    displayThumbnailUrl,
+    explicitThumbnailUrl,
+    inferredUploadedThumbnailUrl,
+    isGeneratedStudioThumbnailUrl,
+    proxiedStudioThumbnailUrl,
+} from "./thumbnailUrl";
 import type { Resource } from "../aardvark/model";
 
 const resource = (overrides: Partial<Resource>): Resource => ({
@@ -93,5 +99,53 @@ describe("thumbnailUrl", () => {
             ...r,
             thumbnail: "https://s3.amazonaws.com/ogm-metadata-studio/uploads/geodata-f8279ca9012a19eb/thumbnail/thumbnail.jpg",
         }, {})).toBe(proxied);
+    });
+
+    it("recognizes generated Studio thumbnail URLs and ignores non-generated URLs", () => {
+        expect(isGeneratedStudioThumbnailUrl("https://example.test/uploads/id/thumbnail/thumbnail.webp")).toBe(true);
+        expect(isGeneratedStudioThumbnailUrl("not a url")).toBe(false);
+        expect(isGeneratedStudioThumbnailUrl("https://example.test/uploads/id/original/source.zip")).toBe(false);
+        expect(proxiedStudioThumbnailUrl(null)).toBeNull();
+        expect(proxiedStudioThumbnailUrl("https://example.test/not-generated.jpg")).toBeNull();
+    });
+
+    it("reads explicit thumbnail references from strings, arrays, and objects", () => {
+        expect(explicitThumbnailUrl(resource({
+            dct_references_s: JSON.stringify({
+                "http://schema.org/thumbnailUrl": [
+                    { label: "bad" },
+                    { url: "https://example.test/thumb-object.jpg" },
+                ],
+            }),
+        }))).toBe("https://example.test/thumb-object.jpg");
+
+        expect(explicitThumbnailUrl(resource({
+            dct_references_s: JSON.stringify({
+                "https://schema.org/thumbnailUrl": "https://example.test/thumb-string.jpg",
+            }),
+        }))).toBe("https://example.test/thumb-string.jpg");
+
+        expect(explicitThumbnailUrl(resource({ thumbnail: "blob:http://localhost/not-persisted" }))).toBeNull();
+        expect(explicitThumbnailUrl(resource({ dct_references_s: "{bad json" }))).toBeNull();
+    });
+
+    it("infers uploaded thumbnails from encoded ids and nested reference identifiers", () => {
+        const encoded = resource({
+            id: "id with spaces",
+            dct_references_s: JSON.stringify({
+                download: {
+                    nested: {
+                        "@id": "https://files.test/uploads/id%20with%20spaces/original/source.zip",
+                    },
+                },
+            }),
+        });
+
+        expect(inferredUploadedThumbnailUrl(encoded)).toBe("https://files.test/uploads/id%20with%20spaces/thumbnail/thumbnail.jpg");
+        expect(inferredUploadedThumbnailUrl(resource({ id: "" }))).toBeNull();
+        expect(inferredUploadedThumbnailUrl(resource({
+            dct_source_sm: ["ftp://files.test/uploads/geodata-f8279ca9012a19eb/original/source.zip"],
+            dct_references_s: "{bad json",
+        }))).toBeNull();
     });
 });
