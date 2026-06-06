@@ -14,7 +14,7 @@ import {
 } from "./map-text-evidence.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DEFAULT_INDEX_PATH = path.resolve(__dirname, "../.cache/gazetteers/canonical/seattle/canonical_places.ndjson");
+const DEFAULT_INDEX_PATH = path.resolve(__dirname, "../.cache/gazetteers/canonical/nevada/canonical_places.ndjson");
 const DEFAULT_MATCH_THRESHOLD = 0.8;
 const DEFAULT_AMBIGUOUS_THRESHOLD = 0.68;
 const DEFAULT_CANDIDATE_LIMIT = 6;

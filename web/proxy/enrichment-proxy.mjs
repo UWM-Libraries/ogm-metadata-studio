@@ -5453,6 +5453,7 @@ function buildAiEnrichmentsForImage(args) {
     archivalSupplement,
     metadataSourceUrls = [],
     derivativeSummaries = [],
+    skipInitialConcordance = false,
   } = args;
   const createdAt = safeDateTime(archivalSupplement?.processingDate) || safeDateTime(resource?.gbl_mdModified_dt) || new Date().toISOString();
   const extraction = extractionResult?.parsedResponse || {};
@@ -5556,12 +5557,16 @@ function buildAiEnrichmentsForImage(args) {
   const metadataSequence = (visionAugmentationCall || geminiLabelExtractionCall || openAIReconciliationCall || kimiSwarmCall) ? 3 : 2;
   const mapExtent = mapExtentForAiEnrichments(extraction, extractionCallId);
   const basePlacenames = derivedPlacenamesForAiEnrichments(extraction, resource, textSegments, extractionCallId, "call-openai-aardvark-metadata-writer");
-  const skipConcordance = AI_ENRICHMENTS_CONCORDANCE_PLACENAME_LIMIT > 0
-    && basePlacenames.length > AI_ENRICHMENTS_CONCORDANCE_PLACENAME_LIMIT;
+  const skipConcordance = skipInitialConcordance || (
+    AI_ENRICHMENTS_CONCORDANCE_PLACENAME_LIMIT > 0
+    && basePlacenames.length > AI_ENRICHMENTS_CONCORDANCE_PLACENAME_LIMIT
+  );
   const skippedConcordanceExtension = skipConcordance
     ? {
       status: "skipped",
-      reason: `Skipped concordance during AI Enrichments assembly because ${basePlacenames.length} placename candidates exceeds AI_ENRICHMENTS_CONCORDANCE_PLACENAME_LIMIT=${AI_ENRICHMENTS_CONCORDANCE_PLACENAME_LIMIT}. Text extraction should be reviewed before gazetteer matching at this scale.`,
+      reason: skipInitialConcordance
+        ? "Skipped initial concordance during AI Enrichments backfill; the explicit refresh pass will rebuild gazetteer matches conservatively."
+        : `Skipped concordance during AI Enrichments assembly because ${basePlacenames.length} placename candidates exceeds AI_ENRICHMENTS_CONCORDANCE_PLACENAME_LIMIT=${AI_ENRICHMENTS_CONCORDANCE_PLACENAME_LIMIT}. Text extraction should be reviewed before gazetteer matching at this scale.`,
       placenameCount: basePlacenames.length,
       limit: AI_ENRICHMENTS_CONCORDANCE_PLACENAME_LIMIT,
     }
@@ -8856,6 +8861,7 @@ async function refreshWofConcordanceForS3Resource(config, body) {
       archivalSupplement,
       metadataSourceUrls: Array.isArray(requested.metadataSourceUrls) ? requested.metadataSourceUrls : [],
       derivativeSummaries: [],
+      skipInitialConcordance: true,
     });
   }
 
@@ -8893,6 +8899,7 @@ async function refreshWofConcordanceForS3Resource(config, body) {
     wofConcordance: refreshed.wofConcordance,
     osmConcordance: refreshed.osmConcordance,
     geonamesConcordance: refreshed.geonamesConcordance,
+    canonicalConcordance: refreshed.canonicalConcordance,
     removedSupplementalPlacenameCount: refreshed.removedSupplementalPlacenameCount,
     aardvarkJson: resource,
     distributions: distributionsFromResource(resource),

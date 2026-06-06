@@ -41,7 +41,7 @@ VITE_ENRICHMENT_PROXY_URL=http://localhost:8787
 # Optional local GeoNames concordance:
 # ENRICHMENT_PROXY_GEONAMES_INDEX_PATH=./.cache/gazetteers/geonames/index.ndjson
 # Optional local canonical OGM gazetteer:
-# ENRICHMENT_PROXY_CANONICAL_GAZETTEER_PATH=./.cache/gazetteers/canonical/seattle/canonical_places.ndjson
+# ENRICHMENT_PROXY_CANONICAL_GAZETTEER_PATH=./.cache/gazetteers/canonical/nevada/canonical_places.ndjson
 # Optional: disable OpenAI vision augmentation after Google Vision OCR:
 # OPENAI_VISION_AUGMENT_OCR_ENABLED=false
 
@@ -116,36 +116,36 @@ curl -L --fail --continue-at - \
 bunzip2 -k ./.cache/gazetteers/wof/sources/whosonfirst-data-admin-us-latest.db.bz2
 bunzip2 -k ./.cache/gazetteers/wof/sources/whosonfirst-data-admin-xy-latest.db.bz2
 git clone --depth 1 \
-  https://github.com/whosonfirst-data/whosonfirst-data-venue-us-wa.git \
-  ./.cache/gazetteers/wof/sources/whosonfirst-data-venue-us-wa
+  https://github.com/whosonfirst-data/whosonfirst-data-venue-us-nv.git \
+  ./.cache/gazetteers/wof/sources/whosonfirst-data-venue-us-nv
 ```
 
-Build a WA-wide reference index when you want broad local development coverage:
+Build a Nevada-wide reference index when you want broad local development coverage:
 
 ```bash
 cd web
 npm run build:wof-index -- /path/to/whosonfirst-data-admin-us-latest.db \
   /path/to/whosonfirst-data-admin-xy-latest.db \
-  --geojson-root /path/to/whosonfirst-data-venue-us-wa \
+  --geojson-root /path/to/whosonfirst-data-venue-us-nv \
   --country US \
   --include-blank-country \
-  --bbox=-125,45,-116,50 \
-  --output ./.cache/gazetteers/wof/index-us-wa.ndjson \
-  --label wof-us-wa
+  --bbox=-120.006,35.001,-114.039,42.002 \
+  --output ./.cache/gazetteers/wof/index-us-nv.ndjson \
+  --label wof-us-nv
 ```
 
-For the Seattle proof map, point the proxy at a smaller Seattle runtime index. This keeps the full source cache available while avoiding a very large in-memory fuzzy index:
+For Nevada map work, point the proxy at the Nevada runtime index:
 
 ```bash
 cd web
 npm run build:wof-index -- ./.cache/gazetteers/wof/sources/whosonfirst-data-admin-us-latest.db \
   ./.cache/gazetteers/wof/sources/whosonfirst-data-admin-xy-latest.db \
-  --geojson-root ./.cache/gazetteers/wof/sources/whosonfirst-data-venue-us-wa \
+  --geojson-root ./.cache/gazetteers/wof/sources/whosonfirst-data-venue-us-nv \
   --country US \
   --include-blank-country \
-  --bbox=-122.46,47.48,-122.22,47.75 \
+  --bbox=-120.006,35.001,-114.039,42.002 \
   --output ./.cache/gazetteers/wof/index.ndjson \
-  --label wof-seattle
+  --label wof-nevada
 ```
 
 At runtime, the matcher uses existing `derivedPlacenames[]`, `textGroups[]`, and selected high-confidence `extractedMapText[]` evidence. The AI Enrichments build pins Aardvark spatial terms before model-extracted visual placenames so broad map context, such as Seattle, establishes the concordance boundary before dense map-body labels are considered. A gazetteer match is only selected when the placename is backed by map-extracted text: referenced OCR ids/indices, an exact text group or OCR segment, or a conservative adjacent OCR phrase. Metadata-only spatial coverage terms can remain as review candidates, but a refresh removes WOF/OSM/GeoNames/OGM matches from them until matching map text exists. If `mapExtent`, `dcat_bbox`, or `locn_geometry` is available, WOF first creates a padded spatial candidate pool from that approximate digitized-map boundary before exact or fuzzy string matching. After administrative WOF matches, it chooses the strongest WOF bbox as a local concordance boundary, such as the WOF locality bbox for `Seattle (Wash.)`. Supplemental matching reconciles OCR/text-group labels against records inside that boundary; it no longer manufactures labels by scanning boundary records for loose OCR token occurrences. WOF non-English aliases are retained on candidates but are not default English OCR search keys. It stores selected WOF hits in `gazetteerMatches[]` with WOF ids, URIs, coordinates, and reviewable candidates; ambiguous and unmatched text-backed labels keep candidates/status in `geocoding` and `extensions.wofConcordance` rather than forcing a false match.
@@ -154,22 +154,23 @@ At runtime, the matcher uses existing `derivedPlacenames[]`, `textGroups[]`, and
 
 The proxy can also run a local OpenStreetMap fallback after WOF. It never calls OSM or Nominatim at runtime; the matcher reads `./.cache/gazetteers/osm/index.ndjson` when present. This is useful for features absent from WOF but present in OSM, such as `Meadow Point`, where OSM carries `natural=cape`, GNIS, and Wikidata tags. The local OSM lane also handles named roads from `highway=*`, including street-abbreviation cleanup such as `W. Lander St.` -> `West Lander Street`.
 
-Build a Seattle-scoped index from Overpass into the ignored local cache:
+Build a Nevada-scoped index from Overpass into the ignored local cache. Use tiled fetches for statewide runs so a single large Overpass request does not time out. Named highways are excluded by default for statewide feature matching; add `--include-highways` for a street-level workflow.
 
 ```bash
 cd web
 npm run build:osm-index -- \
-  --bbox=-122.46,47.48,-122.22,47.75 \
+  --bbox=-120.006,35.001,-114.039,42.002 \
+  --bbox-grid=4x4 \
   --output ./.cache/gazetteers/osm/index.ndjson \
-  --source ./.cache/gazetteers/osm/sources/seattle-overpass.json \
-  --label osm-seattle \
+  --source ./.cache/gazetteers/osm/sources/nevada-overpass.json \
+  --label osm-nevada \
   --refresh
 ```
 
 The index is NDJSON with a metadata line followed by compact OSM records:
 
 ```json
-{"type":"metadata","label":"osm-seattle","recordCount":1234}
+{"type":"metadata","label":"osm-nevada","recordCount":1234}
 {"osmType":"node","osmId":"13436471476","name":"Meadow Point","category":"natural","type":"cape","bbox":[-122.4060444,47.6934167,-122.4059444,47.6935167],"centroid":{"lon":-122.4059944,"lat":47.6934667},"tags":{"gnis:feature_id":"1506604","natural":"cape","wikidata":"Q137714531"}}
 ```
 
@@ -179,22 +180,22 @@ OSM fills text-backed derived placenames WOF has not already matched and also re
 
 GeoNames runs after WOF and OSM. It can attach direct overlaps from WOF `gn:id` concordances and match unclaimed text-backed derived placenames. Runtime matching never calls the GeoNames web service, and refresh does not persist GeoNames-only supplemental placenames discovered by scanning OCR text.
 
-Build a Seattle-scoped GeoNames index from the GeoNames US dump:
+Build a Nevada-scoped GeoNames index from the GeoNames US dump:
 
 ```bash
 cd web
 npm run build:geonames-index -- \
   --source ./.cache/gazetteers/geonames/sources/US.zip \
   --output ./.cache/gazetteers/geonames/index.ndjson \
-  --bbox=-122.435956,47.495514,-122.236044,47.734165 \
-  --label geonames-seattle \
+  --bbox=-120.006,35.001,-114.039,42.002 \
+  --label geonames-nevada \
   --refresh
 ```
 
 The index is NDJSON with a metadata line followed by compact GeoNames records:
 
 ```json
-{"type":"metadata","label":"geonames-seattle","recordCount":1234}
+{"type":"metadata","label":"geonames-nevada","recordCount":1234}
 {"geonameId":"5809844","name":"Seattle","featureClass":"P","featureCode":"PPLA2","country":"US","admin1":"WA","centroid":{"lon":-122.3321,"lat":47.6062}}
 ```
 
@@ -206,22 +207,23 @@ The gazetteer refresh is idempotent and conservative: previously generated suppl
 
 ## Canonical Source Snapshots
 
-GNIS and Wikidata currently enrich the canonical gazetteer rather than running as separate runtime matchers. Build them into compact Seattle snapshots before rebuilding the canonical index:
+GNIS and Wikidata currently enrich the canonical gazetteer rather than running as separate runtime matchers. Build them into compact Nevada snapshots before rebuilding the canonical index:
 
 ```bash
 cd web
 npm run build:gnis-index -- \
-  --source ./.cache/gazetteers/gnis/sources/DomesticNames_WA_Text.zip \
+  --source ./.cache/gazetteers/gnis/sources/DomesticNames_NV_Text.zip \
   --output ./.cache/gazetteers/gnis/index.ndjson \
-  --bbox=-122.46,47.48,-122.22,47.75 \
-  --label gnis-seattle \
+  --bbox=-120.006,35.001,-114.039,42.002 \
+  --label gnis-nevada \
   --refresh
 
 npm run build:wikidata-index -- \
-  --source ./.cache/gazetteers/wikidata/sources/seattle-wikidata.json \
+  --source ./.cache/gazetteers/wikidata/sources/nevada-wikidata.json \
   --output ./.cache/gazetteers/wikidata/index.ndjson \
-  --bbox=-122.46,47.48,-122.22,47.75 \
-  --label wikidata-seattle \
+  --bbox=-120.006,35.001,-114.039,42.002 \
+  --label wikidata-nevada \
+  --no-aliases \
   --refresh
 ```
 
@@ -229,23 +231,23 @@ The GNIS builder accepts `.zip`, `.txt`, `.psv`, or `.csv` exports and filters t
 
 ## Canonical Gazetteer Pilot
 
-The WOF, OSM, and GeoNames matchers are still runtime peer layers. The Seattle canonical gazetteer pilot is the migration target for web-scale entity resolution: it clusters WOF, OSM, GeoNames, GNIS, Wikidata, and later local-source records into OGM place candidates and writes explicit source records plus concordance edges for review.
+The WOF, OSM, and GeoNames matchers are still runtime peer layers. The Nevada canonical gazetteer pilot is the migration target for web-scale entity resolution: it clusters WOF, OSM, GeoNames, GNIS, Wikidata, and later local-source records into OGM place candidates and writes explicit source records plus concordance edges for review.
 
-After building any compact Seattle source indexes above, run:
+After building any compact Nevada source indexes above, run:
 
 ```bash
 cd web
 npm run build:canonical-gazetteer -- \
-  --bbox=-122.46,47.48,-122.22,47.75 \
-  --output-dir ./.cache/gazetteers/canonical/seattle \
-  --label canonical-seattle
+  --bbox=-120.006,35.001,-114.039,42.002 \
+  --output-dir ./.cache/gazetteers/canonical/nevada \
+  --label canonical-nevada
 ```
 
 By default the builder reads `./.cache/gazetteers/wof/index.ndjson`, `./.cache/gazetteers/osm/index.ndjson`, `./.cache/gazetteers/geonames/index.ndjson`, `./.cache/gazetteers/gnis/index.ndjson`, and `./.cache/gazetteers/wikidata/index.ndjson` when those files exist. Use `--no-gnis`, `--no-wikidata`, `--gnis=PATH`, or `--wikidata=PATH` when comparing source mixes.
 
 The output files are `metadata.json`, `source_records.ndjson`, `concordance_edges.ndjson`, and `canonical_places.ndjson`. See [Web-Scale Gazetteer Plan](gazetteer.md) for the data model, Seattle source plan, and scale path.
 
-When `canonical_places.ndjson` is present at `./.cache/gazetteers/canonical/seattle/canonical_places.ndjson`, both new AI Enrichments builds and refresh runs execute an OGM canonical pass after WOF, OSM, and GeoNames. The canonical pass attaches `ogmPlaceId` to matched placenames, stores an OGM peer match in `gazetteerMatches[]`, persists projected OCR coordinates for review, and uses OCR `approxBbox` plus map extent to distinguish same-name candidates by projected label position.
+When `canonical_places.ndjson` is present at `./.cache/gazetteers/canonical/nevada/canonical_places.ndjson`, both new AI Enrichments builds and refresh runs execute an OGM canonical pass after WOF, OSM, and GeoNames. The canonical pass attaches `ogmPlaceId` to matched placenames, stores an OGM peer match in `gazetteerMatches[]`, persists projected OCR coordinates for review, and uses OCR `approxBbox` plus map extent to distinguish same-name candidates by projected label position.
 
 Run the Seattle gold evaluation harness with:
 
@@ -259,7 +261,7 @@ Run the canonical cluster audit after rebuilding the Seattle index:
 ```bash
 cd web
 npm run audit:canonical-gazetteer -- \
-  --index=./.cache/gazetteers/canonical/seattle/canonical_places.ndjson \
+  --index=./.cache/gazetteers/canonical/nevada/canonical_places.ndjson \
   --output=/tmp/ogm-canonical-audit.json
 ```
 

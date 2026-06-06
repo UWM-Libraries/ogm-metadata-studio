@@ -9,6 +9,8 @@ const LOCAL_GAZETTEER_SUPPLEMENTAL_REASON_PREFIXES = [
   "Local OSM concordance selected",
   "Local GeoNames concordance selected",
 ];
+const LOCAL_GAZETTEER_PROVIDERS = new Set(["whosonfirst", "wof", "openstreetmap", "osm", "geonames", "gn", "geoname", "ogm"]);
+const DEFAULT_REFRESH_CONCORDANCE_PLACENAME_LIMIT = 120;
 
 function withoutUndefined(value) {
   if (Array.isArray(value)) {
@@ -43,6 +45,53 @@ export function isGeneratedWofSupplementalPlacename(place) {
 
 function basePlacenamesForRefresh(placenames) {
   return (Array.isArray(placenames) ? placenames : []).filter((place) => !isGeneratedWofSupplementalPlacename(place));
+}
+
+function envNumber(name, fallback) {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) ? value : fallback;
+}
+
+function hasUsableMapExtent(mapExtent) {
+  const west = Number(mapExtent?.west);
+  const south = Number(mapExtent?.south);
+  const east = Number(mapExtent?.east);
+  const north = Number(mapExtent?.north);
+  return [west, south, east, north].every(Number.isFinite)
+    && east > west
+    && north > south
+    && Number(mapExtent?.confidence || 0) > 0;
+}
+
+function hasUsableResourceScope(resource) {
+  return Boolean(String(resource?.dcat_bbox || resource?.locn_geometry || "").trim());
+}
+
+function withoutLocalGazetteerConcordance(place) {
+  const next = { ...(place || {}) };
+  const authority = normalizedProvider(next.authority);
+  if (LOCAL_GAZETTEER_PROVIDERS.has(authority)) {
+    delete next.authority;
+    delete next.authorityId;
+    delete next.uri;
+  }
+  if (Array.isArray(next.gazetteerMatches)) {
+    const matches = next.gazetteerMatches.filter((match) => !LOCAL_GAZETTEER_PROVIDERS.has(normalizedProvider(match?.provider || match?.authority)));
+    if (matches.length > 0) next.gazetteerMatches = matches;
+    else delete next.gazetteerMatches;
+  }
+  delete next.ogmPlaceId;
+  delete next.geocoding;
+  if (next.extensions && typeof next.extensions === "object") {
+    const extensions = { ...next.extensions };
+    delete extensions.wofConcordance;
+    delete extensions.osmConcordance;
+    delete extensions.geonamesConcordance;
+    delete extensions.canonicalConcordance;
+    if (Object.keys(extensions).length > 0) next.extensions = extensions;
+    else delete next.extensions;
+  }
+  return withoutUndefined(next);
 }
 
 function placenameIndexingHint(placenames) {
@@ -263,6 +312,44 @@ export function refreshWofConcordanceInAiEnrichments(aiEnrichments, {
   const textSegments = Array.isArray(aiEnrichments.extractedMapText) ? aiEnrichments.extractedMapText : [];
   const textGroups = Array.isArray(aiEnrichments.textGroups) ? aiEnrichments.textGroups : [];
   const effectiveResource = resource || aiEnrichments.derivedMetadata?.record || {};
+  const refreshPlacenameLimit = Math.max(0, envNumber("ENRICHMENT_PROXY_REFRESH_CONCORDANCE_PLACENAME_LIMIT", DEFAULT_REFRESH_CONCORDANCE_PLACENAME_LIMIT));
+  const hasSpatialScope = hasUsableMapExtent(aiEnrichments.mapExtent) || hasUsableResourceScope(effectiveResource);
+  if (refreshPlacenameLimit > 0 && basePlacenames.length > refreshPlacenameLimit && !hasSpatialScope) {
+    const placenames = basePlacenames.map(withoutLocalGazetteerConcordance);
+    const skippedConcordance = {
+      status: "skipped",
+      reason: `Skipped gazetteer refresh because ${basePlacenames.length} placename candidates exceed ENRICHMENT_PROXY_REFRESH_CONCORDANCE_PLACENAME_LIMIT=${refreshPlacenameLimit} and no usable map extent or resource bbox is available for spatial scoping.`,
+      placenameCount: basePlacenames.length,
+      limit: refreshPlacenameLimit,
+      requiresSpatialScope: true,
+    };
+    return {
+      aiEnrichments: withoutUndefined({
+        ...aiEnrichments,
+        updatedAt: now,
+        derivedPlacenames: placenames,
+        derivedMetadata: refreshDerivedMetadata(aiEnrichments.derivedMetadata, {
+          placenames,
+          resource: effectiveResource,
+          distributions,
+        }),
+        indexingHints: refreshIndexingHints(aiEnrichments.indexingHints, placenames),
+        extensions: optionalObject({
+          ...(aiEnrichments.extensions || {}),
+          wofConcordance: skippedConcordance,
+          osmConcordance: skippedConcordance,
+          geonamesConcordance: skippedConcordance,
+          canonicalGazetteer: skippedConcordance,
+        }),
+      }),
+      wofConcordance: skippedConcordance,
+      osmConcordance: skippedConcordance,
+      geonamesConcordance: skippedConcordance,
+      canonicalConcordance: skippedConcordance,
+      basePlacenameCount: basePlacenames.length,
+      removedSupplementalPlacenameCount: currentPlacenames.length - basePlacenames.length,
+    };
+  }
   const wofConcordance = buildWofConcordanceLayer({
     placenames: basePlacenames,
     textGroups,

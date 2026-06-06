@@ -10,8 +10,8 @@ const DEFAULT_OSM_INDEX = path.resolve(__dirname, "../.cache/gazetteers/osm/inde
 const DEFAULT_GEONAMES_INDEX = path.resolve(__dirname, "../.cache/gazetteers/geonames/index.ndjson");
 const DEFAULT_GNIS_INDEX = path.resolve(__dirname, "../.cache/gazetteers/gnis/index.ndjson");
 const DEFAULT_WIKIDATA_INDEX = path.resolve(__dirname, "../.cache/gazetteers/wikidata/index.ndjson");
-const DEFAULT_OUTPUT_DIR = path.resolve(__dirname, "../.cache/gazetteers/canonical/seattle");
-const DEFAULT_BBOX = [-122.46, 47.48, -122.22, 47.75];
+const DEFAULT_OUTPUT_DIR = path.resolve(__dirname, "../.cache/gazetteers/canonical/nevada");
+const DEFAULT_BBOX = [-120.006, 35.001, -114.039, 42.002];
 const DIRECT_EDGE_SCORE = 0.99;
 const NAME_EDGE_MIN_SCORE = 0.82;
 const NAME_EDGE_MERGE_SCORE = 0.89;
@@ -537,7 +537,7 @@ function loadSourceRecords(sourceInputs, bbox) {
     const { metadata, records } = readCompactIndex(input.path);
     const normalizer = NORMALIZERS[input.authority];
     const normalized = records.map((record) => normalizer(record)).filter(Boolean).filter((record) => inBbox(record, bbox));
-    sourceRecords.push(...normalized);
+    for (const record of normalized) sourceRecords.push(record);
     sourceSnapshots.push({
       authority: input.authority,
       path: input.path,
@@ -968,7 +968,7 @@ function parseBbox(value) {
 
 function parseArgs(argv) {
   const options = {
-    label: "canonical-seattle",
+    label: "canonical-nevada",
     bbox: DEFAULT_BBOX,
     outputDir: DEFAULT_OUTPUT_DIR,
     sourceInputs: [
@@ -1017,14 +1017,14 @@ function parseArgs(argv) {
 }
 
 function printHelp() {
-  console.log(`Build a canonical Seattle gazetteer from compact source indexes.
+  console.log(`Build a canonical Nevada gazetteer from compact source indexes.
 
 Usage:
   npm run build:canonical-gazetteer -- [options]
 
 Options:
-  --output-dir=PATH                Output directory. Defaults to .cache/gazetteers/canonical/seattle.
-  --bbox=west,south,east,north     Bounding box filter. Defaults to Seattle.
+  --output-dir=PATH                Output directory. Defaults to .cache/gazetteers/canonical/nevada.
+  --bbox=west,south,east,north     Bounding box filter. Defaults to Nevada.
   --wof=PATH                       WOF compact index path.
   --osm=PATH                       OSM compact index path.
   --geonames=PATH                  GeoNames compact index path.
@@ -1035,7 +1035,7 @@ Options:
 `);
 }
 
-export function buildCanonicalGazetteerFromSourceRecords({ sourceRecords, sourceSnapshots = [], bbox = DEFAULT_BBOX, label = "canonical-seattle", generatedAt = new Date().toISOString() }) {
+export function buildCanonicalGazetteerFromSourceRecords({ sourceRecords, sourceSnapshots = [], bbox = DEFAULT_BBOX, label = "canonical-nevada", generatedAt = new Date().toISOString() }) {
   const records = sourceRecords.filter((record) => inBbox(record, bbox));
   const recordsByKey = new Map(records.map((record) => [record.sourceKey, record]));
   const directEdges = buildDirectEdges(recordsByKey);

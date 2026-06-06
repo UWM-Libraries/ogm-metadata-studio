@@ -5,22 +5,23 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_OUTPUT = path.resolve(__dirname, "../.cache/gazetteers/osm/index.ndjson");
-const DEFAULT_SOURCE = path.resolve(__dirname, "../.cache/gazetteers/osm/sources/seattle-overpass.json");
+const DEFAULT_SOURCE = path.resolve(__dirname, "../.cache/gazetteers/osm/sources/nevada-overpass.json");
 const DEFAULT_OVERPASS_URL = "https://overpass-api.de/api/interpreter";
-const DEFAULT_BBOX = [-122.46, 47.48, -122.22, 47.75];
-const DEFAULT_LABEL = "osm-seattle";
-const DEFAULT_DISPLAY_SUFFIX = "Seattle, King County, Washington, United States";
+const DEFAULT_BBOX = [-120.006, 35.001, -114.039, 42.002];
+const DEFAULT_LABEL = "osm-nevada";
+const DEFAULT_DISPLAY_SUFFIX = "Nevada, United States";
 const DEFAULT_ADDRESS = {
-  city: "Seattle",
-  county: "King County",
-  state: "Washington",
+  city: "",
+  county: "",
+  state: "Nevada",
   country: "United States",
   country_code: "us",
 };
 
+const HIGHWAY_QUERY = 'way["name"]["highway"~"^(motorway|trunk|primary|secondary|tertiary|unclassified|residential|living_street|service|pedestrian|road)$"]';
+
 const FEATURE_QUERIES = [
   'nwr["name"]["place"~"^(city|town|village|hamlet|suburb|quarter|neighbourhood|neighborhood|locality|island|islet|square)$"]',
-  'way["name"]["highway"~"^(motorway|trunk|primary|secondary|tertiary|unclassified|residential|living_street|service|pedestrian|road)$"]',
   'nwr["name"]["natural"]',
   'nwr["name"]["waterway"]',
   'nwr["name"]["water"]',
@@ -79,15 +80,20 @@ function parseArgs(argv) {
     address: { ...DEFAULT_ADDRESS },
     refresh: false,
     includeAllNamed: false,
+    bboxGrid: null,
+    includeHighways: false,
   };
 
   for (const arg of argv) {
     if (arg === "--refresh") options.refresh = true;
     else if (arg === "--include-all-named") options.includeAllNamed = true;
+    else if (arg === "--include-highways") options.includeHighways = true;
     else if (arg.startsWith("--bbox=")) {
       const bbox = arg.slice("--bbox=".length).split(",").map((item) => Number(item.trim()));
       if (bbox.length !== 4 || bbox.some((item) => !Number.isFinite(item))) throw new Error(`Invalid --bbox: ${arg}`);
       options.bbox = bbox;
+    } else if (arg.startsWith("--bbox-grid=")) {
+      options.bboxGrid = parseGrid(arg.slice("--bbox-grid=".length));
     } else if (arg.startsWith("--output=")) options.output = path.resolve(arg.slice("--output=".length));
     else if (arg.startsWith("--source=")) options.source = path.resolve(arg.slice("--source=".length));
     else if (arg.startsWith("--overpass-url=")) options.overpassUrl = arg.slice("--overpass-url=".length);
@@ -116,14 +122,44 @@ Usage:
   npm run build:osm-index -- [options]
 
 Options:
-  --bbox=west,south,east,north       Bounding box. Defaults to Seattle.
+  --bbox=west,south,east,north       Bounding box. Defaults to Nevada.
   --output=PATH                      NDJSON index path.
   --source=PATH                      Cached Overpass JSON path.
   --refresh                          Fetch Overpass even if --source exists.
+  --bbox-grid=COLSxROWS              Fetch bbox as smaller tiled Overpass requests.
   --include-all-named                Fetch every named OSM element in the bbox.
+  --include-highways                 Include named highway ways.
   --label=LABEL                      Metadata label.
   --display-suffix=TEXT              Display/context suffix for compact records.
 `);
+}
+
+function parseGrid(value) {
+  const match = String(value || "").trim().match(/^(\d+)x(\d+)$/i);
+  if (!match) throw new Error(`Invalid --bbox-grid: ${value}`);
+  const cols = Number(match[1]);
+  const rows = Number(match[2]);
+  if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols < 1 || rows < 1 || cols > 20 || rows > 20) {
+    throw new Error(`Invalid --bbox-grid: ${value}`);
+  }
+  return { cols, rows };
+}
+
+function tileBboxes([west, south, east, north], { cols, rows }) {
+  const width = (east - west) / cols;
+  const height = (north - south) / rows;
+  const tiles = [];
+  for (let row = 0; row < rows; row += 1) {
+    for (let col = 0; col < cols; col += 1) {
+      tiles.push([
+        west + width * col,
+        south + height * row,
+        col === cols - 1 ? east : west + width * (col + 1),
+        row === rows - 1 ? north : south + height * (row + 1),
+      ]);
+    }
+  }
+  return tiles;
 }
 
 function overpassBbox([west, south, east, north]) {
@@ -132,9 +168,10 @@ function overpassBbox([west, south, east, north]) {
 
 function buildQuery(options) {
   const bbox = overpassBbox(options.bbox);
+  const featureQueries = options.includeHighways ? [FEATURE_QUERIES[0], HIGHWAY_QUERY, ...FEATURE_QUERIES.slice(1)] : FEATURE_QUERIES;
   const clauses = options.includeAllNamed
     ? [`nwr["name"](${bbox});`]
-    : FEATURE_QUERIES.map((selector) => `${selector}(${bbox});`);
+    : featureQueries.map((selector) => `${selector}(${bbox});`);
   return `[out:json][timeout:180];
 (
   ${clauses.join("\n  ")}
@@ -157,7 +194,31 @@ async function fetchOverpass(options) {
     const text = await response.text().catch(() => "");
     throw new Error(`Overpass returned ${response.status}: ${text.slice(0, 500)}`);
   }
-  return response.json();
+  const json = await response.json();
+  if (json?.remark && /runtime error|timed out/i.test(String(json.remark))) {
+    throw new Error(`Overpass runtime error: ${String(json.remark).slice(0, 500)}`);
+  }
+  return json;
+}
+
+async function fetchTiledOverpass(options) {
+  const elementsByKey = new Map();
+  const tiles = [];
+  for (const bbox of tileBboxes(options.bbox, options.bboxGrid)) {
+    const tileJson = await fetchOverpass({ ...options, bbox });
+    for (const element of tileJson.elements || []) {
+      elementsByKey.set(`${element.type}/${element.id}`, element);
+    }
+    tiles.push({ bbox, elementCount: Array.isArray(tileJson.elements) ? tileJson.elements.length : 0 });
+    console.log(`Fetched ${tiles.at(-1).elementCount} OSM element(s) for tile ${tiles.length}/${options.bboxGrid.cols * options.bboxGrid.rows}`);
+  }
+  return {
+    version: 0.6,
+    generator: "ogm-metadata-studio tiled Overpass merge",
+    bbox: options.bbox,
+    tiles,
+    elements: Array.from(elementsByKey.values()),
+  };
 }
 
 function normalizeOsmText(value) {
@@ -258,6 +319,7 @@ function compactRecord(element, options) {
   const bbox = boundsForElement(element);
   const centroid = centroidForElement(element, bbox);
   const { category, type } = chooseCategory(tags);
+  if (category === "highway" && !options.includeHighways) return null;
   const compactedTags = compactTags(tags);
   const displayParts = [name, options.displaySuffix].filter(Boolean);
 
@@ -302,7 +364,7 @@ async function main() {
   if (!options.refresh && existsSync(options.source)) {
     overpassJson = JSON.parse(readFileSync(options.source, "utf8"));
   } else {
-    overpassJson = await fetchOverpass(options);
+    overpassJson = options.bboxGrid ? await fetchTiledOverpass(options) : await fetchOverpass(options);
     mkdirSync(path.dirname(options.source), { recursive: true });
     writeFileSync(options.source, `${JSON.stringify(overpassJson)}\n`, "utf8");
   }

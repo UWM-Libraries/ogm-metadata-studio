@@ -4,7 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DEFAULT_INDEX = path.resolve(__dirname, "../.cache/gazetteers/canonical/seattle/canonical_places.ndjson");
+const DEFAULT_INDEX = path.resolve(__dirname, "../.cache/gazetteers/canonical/nevada/canonical_places.ndjson");
 
 function asArray(value) {
   if (Array.isArray(value)) return value;

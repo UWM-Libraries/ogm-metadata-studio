@@ -341,6 +341,13 @@ export interface RefreshWofConcordanceResponse {
         directConcordancePlacenames?: number;
         [key: string]: unknown;
     };
+    canonicalConcordance?: {
+        status?: string;
+        matched?: number;
+        ambiguous?: number;
+        unmatched?: number;
+        [key: string]: unknown;
+    };
     removedSupplementalPlacenameCount?: number;
     aardvarkJson: Record<string, unknown>;
     distributions: Distribution[];
