@@ -98,6 +98,26 @@ describe('Small UI Components', () => {
 
             expect(screen.getByText('Year: Up to 1950')).toBeDefined();
         });
+
+        it('uses explicit field labels, all-years labels, and clear-all callbacks', () => {
+            const onClearAll = vi.fn();
+            render(
+                <ActiveFilterBar
+                    query=""
+                    facets={{ gbl_resourceClass_sm: ['Maps'] }}
+                    yearRange=","
+                    fieldLabels={{ gbl_resourceClass_sm: 'Class' }}
+                    onRemoveQuery={vi.fn()}
+                    onRemoveFacet={vi.fn()}
+                    onClearAll={onClearAll}
+                />
+            );
+
+            expect(screen.getByText('Year: All Years')).toBeDefined();
+            expect(screen.getByText('Class:')).toBeDefined();
+            fireEvent.click(screen.getByText('Clear All'));
+            expect(onClearAll).toHaveBeenCalled();
+        });
     });
 
     describe('AutosuggestInput', () => {

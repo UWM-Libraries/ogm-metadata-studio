@@ -7,6 +7,8 @@ describe('Import Components', () => {
     describe('ScanForm', () => {
         it('renders inputs and interacts', () => {
             const setRepoUrl = vi.fn();
+            const setBranch = vi.fn();
+            const setToken = vi.fn();
             const onScan = vi.fn();
 
             render(
@@ -14,9 +16,9 @@ describe('Import Components', () => {
                     repoUrl="http://test"
                     setRepoUrl={setRepoUrl}
                     branch="main"
-                    setBranch={vi.fn()}
+                    setBranch={setBranch}
                     token=""
-                    setToken={vi.fn()}
+                    setToken={setToken}
                     onScan={onScan}
                     isScanning={false}
                     scanError={null}
@@ -26,6 +28,12 @@ describe('Import Components', () => {
             const input = screen.getByDisplayValue('http://test');
             fireEvent.change(input, { target: { value: 'http://new' } });
             expect(setRepoUrl).toHaveBeenCalledWith('http://new');
+
+            fireEvent.change(screen.getByDisplayValue('main'), { target: { value: 'develop' } });
+            expect(setBranch).toHaveBeenCalledWith('develop');
+
+            fireEvent.change(screen.getByPlaceholderText('github_pat_...'), { target: { value: 'token' } });
+            expect(setToken).toHaveBeenCalledWith('token');
 
             fireEvent.click(screen.getByText('Scan Repository'));
             expect(onScan).toHaveBeenCalled();

@@ -28,6 +28,10 @@ describe('DuckDB Queries', () => {
     beforeEach(() => {
         vi.clearAllMocks();
         (dbInit.getDuckDbContext as any).mockResolvedValue({ conn: mockConn });
+        Object.defineProperty(URL, 'createObjectURL', {
+            configurable: true,
+            value: vi.fn((blob: Blob) => `blob:${blob.type}:${blob.size}`),
+        });
     });
 
     describe('countResources', () => {
@@ -266,6 +270,223 @@ describe('DuckDB Queries', () => {
             expect(res.prevId).toBe('prev');
             expect(res.nextId).toBe('next');
             expect(res.position).toBe(5);
+        });
+
+        it('returns empty navigation when no row or query failure occurs', async () => {
+            mockConn.query.mockResolvedValueOnce({ numRows: 0, get: vi.fn() });
+            await expect(queries.getSearchNeighbors({ sort: [{ field: 'gbl_indexYear_im', dir: 'desc' }] }, "id'1")).resolves.toEqual({ position: 0, total: 0 });
+
+            mockConn.query.mockRejectedValueOnce(new Error('bad window'));
+            await expect(queries.getSearchNeighbors({ bbox: { minX: 0, minY: 0, maxX: 1, maxY: 1 } }, 'id-1')).resolves.toEqual({ position: 0, total: 0 });
+        });
+    });
+
+    describe('guard rails and SQL helpers', () => {
+        it('returns empty defaults when DuckDB is unavailable', async () => {
+            (dbInit.getDuckDbContext as any).mockResolvedValue(null);
+
+            await expect(queries.searchResources()).resolves.toEqual({ resources: [], total: 0 });
+            await expect(queries.getDistinctValues('dct_subject_sm')).resolves.toEqual([]);
+            await expect(queries.executeQuery('SELECT 1')).resolves.toEqual([]);
+            await expect(queries.queryResourceById('r1')).resolves.toBeNull();
+            await expect(queries.countResources()).resolves.toBe(0);
+            await expect(queries.facetedSearch({})).resolves.toEqual({ results: [], facets: {}, total: 0 });
+            await expect(queries.getMapH3({ resolution: 4 })).resolves.toEqual({ hexes: [] });
+            await expect(queries.queryDistributions()).resolves.toEqual({ distributions: [], total: 0 });
+            await expect(queries.getDistributionsForResource('r1')).resolves.toEqual([]);
+            await expect(queries.queryAllDistributions()).resolves.toEqual([]);
+            await expect(queries.hasStaticMap('r1')).resolves.toBe(false);
+            await expect(queries.getStaticMap('r1')).resolves.toBeNull();
+            await expect(queries.getThumbnail('r1')).resolves.toBeNull();
+            await expect(queries.suggest('map')).resolves.toEqual([]);
+            await expect(queries.getFacetValues({ field: 'dct_subject_sm' })).resolves.toEqual({ values: [], total: 0 });
+            await expect(queries.querySimilarResources('r1')).resolves.toEqual([]);
+        });
+
+        it('compiles scalar, multivalue, exclusion, all-value, range, and spatial filters', () => {
+            const { sql } = queries.compileFacetedWhere({
+                q: "O'Hare",
+                bbox: { minX: -90, minY: 40, maxX: -89, maxY: 41 },
+                filters: {
+                    dct_accessRights_s: { any: ['Public'], none: ['Restricted'] },
+                    dct_subject_sm: { any: ["Roads"], all: ['Rail', 'Water'], none: ["O'Malley"] },
+                    gbl_indexYear_im: { gte: 1900, lte: 1950 },
+                },
+            }, null, true);
+
+            expect(sql).toContain("O''Hare");
+            expect(sql).toContain('ST_Intersects');
+            expect(sql).toContain('"dct_accessRights_s" IN');
+            expect(sql).toContain('"dct_accessRights_s" IS NULL OR "dct_accessRights_s" NOT IN');
+            expect(sql).toContain("m.field = 'dct_subject_sm' AND m.val IN ('Roads')");
+            expect(sql).toContain("count(DISTINCT m.val)");
+            expect(sql).toContain("O''Malley");
+            expect(sql).toContain('CAST("gbl_indexYear_im" AS INTEGER) >= 1900');
+            expect(sql).toContain('CAST("gbl_indexYear_im" AS INTEGER) <= 1950');
+
+            const omitted = queries.compileFacetedWhere({
+                filters: {
+                    dct_subject_sm: { any: ['Roads'] },
+                    dcat_theme_sm: { any: ['Transportation'] },
+                },
+            }, 'dct_subject_sm', false).sql;
+            expect(omitted).not.toContain('Roads');
+            expect(omitted).toContain('Transportation');
+        });
+
+        it('normalizes arbitrary query rows and falls back on errors', async () => {
+            mockConn.query
+                .mockResolvedValueOnce({
+                    toArray: () => [
+                        { toJSON: () => ({ a: 1 }) },
+                        { b: 2 },
+                    ],
+                })
+                .mockRejectedValueOnce(new Error('bad sql'));
+
+            await expect(queries.executeQuery('SELECT * FROM t')).resolves.toEqual([{ a: 1 }, { b: 2 }]);
+            await expect(queries.executeQuery('SELECT bad')).resolves.toEqual([]);
+        });
+    });
+
+    describe('distribution and image helpers', () => {
+        it('queries joined distributions with keyword filtering and resource-specific aliases', async () => {
+            mockConn.query
+                .mockResolvedValueOnce({ toArray: () => [{ resource_id: 'r1', relation_key: 'download', url: 'https://x.test', label: 'Download', dct_title_s: 'Roads' }] })
+                .mockResolvedValueOnce({ toArray: () => [{ c: 1 }] })
+                .mockResolvedValueOnce({ toArray: () => [{ resource_id: 'r1', relation_key: 'iiif', url: 'https://iiif.test', label: null }] })
+                .mockResolvedValueOnce({ toArray: () => [{ resource_id: 'r2', relation_key: 'download', url: 'https://file.test', label: 'File' }] });
+
+            const page = await queries.queryDistributions(2, 5, 'url', 'desc', "Road's");
+            expect(page.total).toBe(1);
+            expect(page.distributions[0].dct_title_s).toBe('Roads');
+            expect(mockConn.query.mock.calls[0][0]).toContain("road''s");
+            expect(mockConn.query.mock.calls[0][0]).toContain('LIMIT 5 OFFSET 5');
+
+            await expect(queries.getDistributionsForResource("r'1")).resolves.toEqual([{ resource_id: 'r1', relation_key: 'iiif', url: 'https://iiif.test', label: null }]);
+            expect(mockConn.query.mock.calls[2][0]).toContain("r''1");
+            await expect(queries.queryAllDistributions()).resolves.toEqual([{ resource_id: 'r2', relation_key: 'download', url: 'https://file.test', label: 'File' }]);
+        });
+
+        it('loads static map and thumbnail blobs and handles missing or invalid data', async () => {
+            mockConn.query
+                .mockResolvedValueOnce({ numRows: 1 })
+                .mockResolvedValueOnce({ numRows: 0 })
+                .mockResolvedValueOnce({ numRows: 1, get: () => ({ data: btoa('png') }) })
+                .mockResolvedValueOnce({ numRows: 0, get: vi.fn() })
+                .mockResolvedValueOnce({ numRows: 1, get: () => ({ data: btoa('jpg') }) })
+                .mockResolvedValueOnce({ numRows: 1, get: () => ({ data: 'not-base64-$$' }) })
+                .mockRejectedValueOnce(new Error('missing table'));
+
+            await expect(queries.hasStaticMap('map-1')).resolves.toBe(true);
+            await expect(queries.hasStaticMap('map-2')).resolves.toBe(false);
+            await expect(queries.getStaticMap('map-1')).resolves.toBe('blob:image/png:3');
+            await expect(queries.getStaticMap('map-2')).resolves.toBeNull();
+            await expect(queries.getThumbnail("thumb'1")).resolves.toBe('blob:image/jpeg:3');
+            await expect(queries.getThumbnail('bad')).resolves.toBeNull();
+            await expect(queries.getThumbnail('missing')).resolves.toBeNull();
+            expect(mockConn.query.mock.calls[4][0]).toContain("thumb''1");
+        });
+    });
+
+    describe('facets, H3, suggestions, and similarity', () => {
+        it('builds faceted search facets for scalar and multivalue fields and cleans up global hits', async () => {
+            mockConn.query
+                .mockResolvedValueOnce({})
+                .mockResolvedValueOnce({ toArray: () => [{ id: 'r1' }] })
+                .mockResolvedValueOnce({ toArray: () => [{ c: 1 }] })
+                .mockResolvedValueOnce({ toArray: () => [{ id: 'r1', dct_title_s: 'Title' }] })
+                .mockResolvedValueOnce({ toArray: () => [] })
+                .mockResolvedValueOnce({ toArray: () => [] })
+                .mockResolvedValueOnce({ toArray: () => [] })
+                .mockResolvedValueOnce({ toArray: () => [{ val: '1910', c: 1 }] })
+                .mockRejectedValueOnce(new Error('facet unavailable'))
+                .mockResolvedValueOnce({});
+
+            const res = await queries.facetedSearch({
+                q: 'roads',
+                page: { size: 10, from: 0 },
+                sort: [{ field: 'gbl_indexYear_im', dir: 'desc' }],
+                filters: { dct_subject_sm: { any: ['Roads'] } },
+                facets: [{ field: 'gbl_indexYear_im' }, { field: 'dct_subject_sm' }],
+            });
+
+            expect(res.total).toBe(1);
+            expect(res.facets.gbl_indexYear_im).toEqual([{ value: '1910', count: 1 }]);
+            expect(res.facets.dct_subject_sm).toEqual([]);
+            expect(mockConn.query.mock.calls.some(([sql]) => String(sql).includes('DROP TABLE IF EXISTS global_hits_'))).toBe(true);
+        });
+
+        it('handles facet value sorting, facet query filters, inverted years, and query failures', async () => {
+            mockConn.query
+                .mockResolvedValueOnce({ toArray: () => [{ val: 'Roads', c: 3 }] })
+                .mockResolvedValueOnce({ toArray: () => [{ total: 1 }] })
+                .mockRejectedValueOnce(new Error('bad facet'));
+
+            const res = await queries.getFacetValues({
+                field: 'dct_accessRights_s',
+                facetQuery: "Pub'lic",
+                yearRange: '1950,1900',
+                sort: 'alpha_desc',
+                page: 2,
+                pageSize: 5,
+            });
+
+            expect(res).toEqual({ values: [{ value: 'Roads', count: 3 }], total: 1 });
+            expect(mockConn.query.mock.calls[0][0]).toContain("lower(\"dct_accessRights_s\") LIKE '%pub''lic%'");
+            expect(mockConn.query.mock.calls[0][0]).toContain('ORDER BY val DESC LIMIT 5 OFFSET 5');
+            expect(mockConn.query.mock.calls[0][0]).toContain('>= 1900');
+            expect(mockConn.query.mock.calls[0][0]).toContain('<= 1950');
+
+            await expect(queries.getFacetValues({ field: 'dct_subject_sm', sort: 'count_asc' })).resolves.toEqual({ values: [], total: 0 });
+        });
+
+        it('derives H3 cells from JSON centroids and GeoJSON geometry and tolerates invalid resolutions', async () => {
+            const pointHex = latLngToCell(45, -93, 8);
+            const polygonHex = latLngToCell(45, -93, 8);
+            mockConn.query
+                .mockResolvedValueOnce({
+                    toArray: () => [
+                        { h3: '', centroid: JSON.stringify({ type: 'Point', coordinates: [-93, 45] }), bbox: null, geometry: null, c: 1 },
+                        { h3: '', centroid: null, bbox: null, geometry: JSON.stringify({ type: 'Polygon', coordinates: [[[-94, 44], [-92, 44], [-92, 46], [-94, 44]]] }), c: 2 },
+                        { h3: '', centroid: 'not valid', bbox: 'not valid', geometry: '{"bad"', c: 9 },
+                    ],
+                })
+                .mockRejectedValueOnce(new Error('count failed'));
+
+            const res = await queries.getMapH3({ resolution: 99 });
+            expect(res.hexes).toEqual([{ h3: pointHex, count: 3 }]);
+            expect(polygonHex).toBe(pointHex);
+            await expect(queries.getMapH3({ resolution: Number.NaN })).resolves.toEqual({ hexes: [] });
+        });
+
+        it('returns ordered suggestions and catches suggestion query errors', async () => {
+            mockConn.query
+                .mockResolvedValueOnce({ toArray: () => [{ match: 'Minneapolis', type: 'Place' }, { match: 'Maps', type: 'Subject' }] })
+                .mockRejectedValueOnce(new Error('bad suggest'));
+
+            await expect(queries.suggest("Minne's", 4)).resolves.toEqual([
+                { text: 'Minneapolis', type: 'Place' },
+                { text: 'Maps', type: 'Subject' },
+            ]);
+            expect(mockConn.query.mock.calls[0][0]).toContain("minne''s");
+            await expect(queries.suggest('oops')).resolves.toEqual([]);
+            await expect(queries.suggest('   ')).resolves.toEqual([]);
+        });
+
+        it('fetches similar resources by weighted multivalue overlap and catches failures', async () => {
+            mockConn.query
+                .mockResolvedValueOnce({ toArray: () => [{ id: 'r2' }, { id: 'r3' }] })
+                .mockResolvedValueOnce({ toArray: () => [{ id: 'r2', dct_title_s: 'Two' }, { id: 'r3', dct_title_s: 'Three' }] })
+                .mockResolvedValueOnce({ toArray: () => [] })
+                .mockResolvedValueOnce({ toArray: () => [] })
+                .mockResolvedValueOnce({ toArray: () => [] })
+                .mockRejectedValueOnce(new Error('similarity failed'));
+
+            const res = await queries.querySimilarResources("r'1", 2);
+            expect(res.map((resource) => resource.id)).toEqual(['r2', 'r3']);
+            expect(mockConn.query.mock.calls[0][0]).toContain("r''1");
+            await expect(queries.querySimilarResources('r1')).resolves.toEqual([]);
         });
     });
 });

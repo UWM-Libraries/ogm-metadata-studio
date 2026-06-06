@@ -20,7 +20,7 @@ const HEX_RAMP_COLORS = [
 const HEX_RAMP_THRESHOLDS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
 
 /** Return MapLibre bounds covering all given H3 cells, or null if empty. */
-function boundsOfHexes(hexIndexes: string[]): maplibregl.LngLatBounds | null {
+export function boundsOfHexes(hexIndexes: string[]): maplibregl.LngLatBounds | null {
     if (hexIndexes.length === 0) return null;
     let minLat = 90;
     let maxLat = -90;
@@ -39,7 +39,7 @@ function boundsOfHexes(hexIndexes: string[]): maplibregl.LngLatBounds | null {
     return new maplibregl.LngLatBounds([minLng, minLat], [maxLng, maxLat]);
 }
 
-function hexCenter(h3: string): [number, number] | null {
+export function hexCenter(h3: string): [number, number] | null {
     const boundary = cellToBoundary(h3);
     if (boundary.length === 0) return null;
     let latSum = 0;
@@ -51,7 +51,7 @@ function hexCenter(h3: string): [number, number] | null {
     return [lngSum / boundary.length, latSum / boundary.length];
 }
 
-function weightedCenterOfHexes(hexData: { h3: string; count: number }[]): [number, number] | null {
+export function weightedCenterOfHexes(hexData: { h3: string; count: number }[]): [number, number] | null {
     if (hexData.length === 0) return null;
     let totalWeight = 0;
     let lngSum = 0;
@@ -68,7 +68,7 @@ function weightedCenterOfHexes(hexData: { h3: string; count: number }[]): [numbe
     return [lngSum / totalWeight, latSum / totalWeight];
 }
 
-function dominantCluster(hexData: { h3: string; count: number }[]): { h3: string; count: number }[] {
+export function dominantCluster(hexData: { h3: string; count: number }[]): { h3: string; count: number }[] {
     if (hexData.length <= 1) return hexData;
 
     const byId = new Map(hexData.map((h) => [h.h3, h]));
@@ -115,7 +115,7 @@ function dominantCluster(hexData: { h3: string; count: number }[]): { h3: string
     return best?.hexes ?? hexData;
 }
 
-function dominantClusterView(hexData: { h3: string; count: number }[]): { bounds: maplibregl.LngLatBounds | null; center: [number, number] | null } {
+export function dominantClusterView(hexData: { h3: string; count: number }[]): { bounds: maplibregl.LngLatBounds | null; center: [number, number] | null } {
     const cluster = dominantCluster(hexData);
     return {
         bounds: boundsOfHexes(cluster.map((hex) => hex.h3)),
@@ -123,7 +123,7 @@ function dominantClusterView(hexData: { h3: string; count: number }[]): { bounds
     };
 }
 
-function applyAutoFit(
+export function applyAutoFit(
     map: maplibregl.Map,
     view: { bounds: maplibregl.LngLatBounds; center: [number, number] | null }
 ) {
@@ -136,7 +136,7 @@ function applyAutoFit(
     }
 }
 
-function hexesToFeatureCollection(hexData: { h3: string; count: number }[]) {
+export function hexesToFeatureCollection(hexData: { h3: string; count: number }[]) {
     const maxCount = Math.max(...hexData.map((h) => h.count), 1);
     const features = hexData.map(({ h3, count }) => {
         const vs = cellToBoundary(h3);
@@ -152,12 +152,12 @@ function hexesToFeatureCollection(hexData: { h3: string; count: number }[]) {
     return { type: "FeatureCollection" as const, features };
 }
 
-function removeHexLayer(map: maplibregl.Map) {
+export function removeHexLayer(map: maplibregl.Map) {
     if (map.getLayer(HEX_LAYER_ID)) map.removeLayer(HEX_LAYER_ID);
     if (map.getSource(HEX_SOURCE_ID)) map.removeSource(HEX_SOURCE_ID);
 }
 
-function upsertHexLayer(map: maplibregl.Map, hexData: { h3: string; count: number }[]) {
+export function upsertHexLayer(map: maplibregl.Map, hexData: { h3: string; count: number }[]) {
     const fc = hexesToFeatureCollection(hexData);
     if (map.getSource(HEX_SOURCE_ID)) {
         (map.getSource(HEX_SOURCE_ID) as maplibregl.GeoJSONSource).setData(fc);

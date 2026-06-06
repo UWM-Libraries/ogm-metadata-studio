@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { ImportPage } from './ImportPage';
 import * as duckdb from '../duckdb/duckdbClient';
+import { publishCurrentDataToRepoRoot } from '../publish/publishToRepo';
 
 // Mock dependencies
 vi.mock('../duckdb/duckdbClient', () => ({
@@ -9,7 +10,21 @@ vi.mock('../duckdb/duckdbClient', () => ({
     saveDb: vi.fn(),
     exportDbBlob: vi.fn(),
     importJsonData: vi.fn(),
-    exportAardvarkJsonZip: vi.fn()
+    exportAardvarkJsonZip: vi.fn(),
+    importDuckDbFile: vi.fn()
+}));
+
+vi.mock('../publish/publishToRepo', () => ({
+    publishCurrentDataToRepoRoot: vi.fn(),
+}));
+
+vi.mock('../config/parquetArtifacts', () => ({
+    DEFAULT_RESOURCES_PARQUET: 'resources.parquet',
+    PARQUET_ARTIFACTS: {
+        resources: 'published-resources.parquet',
+        distributions: 'published-distributions.parquet',
+    },
+    usingDefaultResourceStarter: vi.fn(() => false),
 }));
 
 vi.mock('./GithubImport', () => ({
@@ -117,6 +132,74 @@ describe('ImportPage', () => {
             expect(duckdb.exportDbBlob).toHaveBeenCalled();
             expect(screen.getByText(/Database downloaded/)).toBeDefined();
         });
+    });
+
+    it('handles unavailable DuckDB downloads after saving to IndexedDB', async () => {
+        vi.mocked(duckdb.exportDbBlob).mockResolvedValue(null);
+
+        render(<ImportPage />);
+
+        fireEvent.click(screen.getByText('Download records.duckdb'));
+
+        await waitFor(() => {
+            expect(screen.getByText('Browser snapshot saved to IndexedDB. DuckDB file download is not available in this deployment.')).toBeDefined();
+        });
+    });
+
+    it('handles DuckDB restore imports and invokes refresh callbacks', async () => {
+        const onImported = vi.fn();
+        vi.mocked(duckdb.importDuckDbFile).mockResolvedValue({ success: true, message: 'ok', count: 12 } as any);
+        const { container } = render(<ImportPage onImported={onImported} />);
+
+        const input = container.querySelector('input[type="file"]');
+        const file = new File(['duck'], 'records.duckdb');
+        fireEvent.change(input!, { target: { files: [file] } });
+
+        await waitFor(() => {
+            expect(duckdb.importDuckDbFile).toHaveBeenCalledWith(file);
+            expect(screen.getByText('Database restored. Loaded 12 items.')).toBeDefined();
+            expect(onImported).toHaveBeenCalled();
+        });
+    });
+
+    it('chooses a repository folder and publishes generated metadata files', async () => {
+        vi.stubGlobal('alert', vi.fn());
+        const repoHandle = { name: 'metadata-repo' };
+        vi.stubGlobal('showDirectoryPicker', vi.fn().mockResolvedValue(repoHandle));
+        vi.mocked(publishCurrentDataToRepoRoot).mockResolvedValue({
+            resourceCount: 2,
+            distributionCount: 3,
+            publicDirPath: 'web/public',
+            resourceFileName: 'published-resources.parquet',
+            distributionsFileName: 'published-distributions.parquet',
+            duckdbFileName: 'records.duckdb',
+        } as any);
+
+        render(<ImportPage resourceCount={2} />);
+
+        fireEvent.click(screen.getByText('Choose Repo Folder'));
+        await waitFor(() => expect(screen.getByText('Selected: metadata-repo')).toBeDefined());
+
+        fireEvent.click(screen.getByText('Prepare Parquet files for commit'));
+
+        await waitFor(() => {
+            expect(publishCurrentDataToRepoRoot).toHaveBeenCalledWith(repoHandle);
+            expect(screen.getByText(/Publish ready. Wrote 2 records/)).toBeDefined();
+            expect(window.alert).toHaveBeenCalledWith(expect.stringContaining('Publish ready'));
+        });
+    });
+
+    it('reports export and publish setup failures', async () => {
+        vi.mocked(duckdb.exportAardvarkJsonZip).mockRejectedValueOnce(new Error('zip failed'));
+        vi.stubGlobal('showDirectoryPicker', vi.fn().mockRejectedValueOnce(new Error('picker failed')));
+
+        render(<ImportPage resourceCount={2} />);
+
+        fireEvent.click(screen.getByText('Download JSON Zip'));
+        await waitFor(() => expect(screen.getByText('Export failed: zip failed')).toBeDefined());
+
+        fireEvent.click(screen.getByText('Choose Repo Folder'));
+        await waitFor(() => expect(screen.getByText('Publish setup failed: picker failed')).toBeDefined());
     });
 
     it('handles errors during import', async () => {

@@ -6,7 +6,7 @@ function configuredArtifact(envKey: string, fallback: string): string {
     return value || fallback;
 }
 
-function companionDistributionsArtifact(resourcesArtifact: string): string {
+export function companionDistributionsArtifact(resourcesArtifact: string): string {
     const explicit = String((import.meta as any).env?.VITE_RESOURCE_DISTRIBUTIONS_PARQUET ?? "").trim();
     if (explicit) return explicit;
     if (resourcesArtifact === DEFAULT_RESOURCES_PARQUET) return DEFAULT_DISTRIBUTIONS_PARQUET;

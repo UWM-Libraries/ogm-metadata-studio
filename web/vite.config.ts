@@ -78,6 +78,12 @@ export default defineConfig({
       all: true,
       reporter: ['text', 'json', 'html'],
       include: ['src/**/*.ts', 'src/**/*.tsx'],
+      thresholds: {
+        statements: 80,
+        lines: 80,
+        functions: 80,
+        branches: 69,
+      },
       exclude: [
         'src/vite-env.d.ts',
         'src/main.tsx',
@@ -89,6 +95,5 @@ export default defineConfig({
     },
   },
 } as any);
-
 
 

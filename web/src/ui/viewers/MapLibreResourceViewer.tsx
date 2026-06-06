@@ -31,7 +31,7 @@ interface CogInfoResponse {
     bbox?: LngLatBbox;
 }
 
-function buildWmsGetMapUrl(baseUrl: string, layerId: string, bounds: { getSouth: () => number; getWest: () => number; getNorth: () => number; getEast: () => number }, width: number, height: number): string {
+export function buildWmsGetMapUrl(baseUrl: string, layerId: string, bounds: { getSouth: () => number; getWest: () => number; getNorth: () => number; getEast: () => number }, width: number, height: number): string {
     const miny = bounds.getSouth();
     const minx = bounds.getWest();
     const maxy = bounds.getNorth();
@@ -131,7 +131,7 @@ function addXyzLayer(map: maplibregl.Map, url: string, opacity: number): () => v
     };
 }
 
-function mapViewportSize(map: maplibregl.Map): { width: number; height: number } | null {
+export function mapViewportSize(map: maplibregl.Map): { width: number; height: number } | null {
     const raw = (map as unknown as { getSize?: () => { width?: number; height?: number; x?: number; y?: number } }).getSize?.();
     const canvas = map.getCanvas();
     const rect = canvas.getBoundingClientRect();
@@ -147,7 +147,7 @@ function mapViewportSize(map: maplibregl.Map): { width: number; height: number }
     return { width: Math.round(width), height: Math.round(height) };
 }
 
-function isValidCogBbox(value: unknown): value is LngLatBbox {
+export function isValidCogBbox(value: unknown): value is LngLatBbox {
     if (!Array.isArray(value) || value.length !== 4) return false;
     const [west, south, east, north] = value;
     return [west, south, east, north].every((item) => typeof item === 'number' && Number.isFinite(item))
@@ -334,11 +334,11 @@ function ensurePmtilesProtocol(): Protocol {
     return pmtilesProtocol;
 }
 
-function safeLayerIdPart(value: string, index: number): string {
+export function safeLayerIdPart(value: string, index: number): string {
     return (value || `layer-${index}`).replace(/[^a-z0-9_-]+/gi, '-').replace(/^-+|-+$/g, '') || `layer-${index}`;
 }
 
-function vectorLayerIdsFromMetadata(metadata: unknown): string[] {
+export function vectorLayerIdsFromMetadata(metadata: unknown): string[] {
     const value = (metadata && typeof metadata === 'object')
         ? (metadata as { vector_layers?: unknown }).vector_layers
         : undefined;
@@ -367,7 +367,7 @@ function vectorLayerIdsFromMetadata(metadata: unknown): string[] {
     return [];
 }
 
-function boundsFromPmtilesHeader(header: Header): LngLatBoundsTuple | null {
+export function boundsFromPmtilesHeader(header: Header): LngLatBoundsTuple | null {
     const bounds: LngLatBoundsTuple = [[header.minLon, header.minLat], [header.maxLon, header.maxLat]];
     if (!isValidLngLatBounds(bounds)) return null;
 
@@ -387,7 +387,7 @@ function removePmtilesLayers(map: maplibregl.Map) {
     if (map.getSource(PMTILES_SOURCE_ID)) map.removeSource(PMTILES_SOURCE_ID);
 }
 
-function escapeHtml(value: unknown): string {
+export function escapeHtml(value: unknown): string {
     return String(value ?? '')
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
@@ -396,7 +396,7 @@ function escapeHtml(value: unknown): string {
         .replace(/'/g, '&#39;');
 }
 
-function popupHtml(properties: Record<string, unknown>, matchCount: number): string {
+export function popupHtml(properties: Record<string, unknown>, matchCount: number): string {
     const preferred = ['QQNAME', 'FileName', 'SrcImgDate', 'VerDate', 'Band', 'Res', 'UTM', 'ST'];
     const keys = [
         ...preferred.filter((key) => Object.prototype.hasOwnProperty.call(properties, key)),
@@ -416,11 +416,11 @@ function popupHtml(properties: Record<string, unknown>, matchCount: number): str
     `;
 }
 
-function emptyFeatureCollection() {
+export function emptyFeatureCollection() {
     return { type: 'FeatureCollection', features: [] };
 }
 
-function selectedFeatureCollection(feature: SelectableGeoJsonFeature) {
+export function selectedFeatureCollection(feature: SelectableGeoJsonFeature) {
     if (!feature.geometry) return emptyFeatureCollection();
     return {
         type: 'FeatureCollection',
@@ -452,7 +452,7 @@ function collectGeometryCoordinates(geometry: GeoJsonGeometry | null, output: [n
     }
 }
 
-function boundsForFeature(feature: SelectableGeoJsonFeature): [[number, number], [number, number]] | null {
+export function boundsForFeature(feature: SelectableGeoJsonFeature): [[number, number], [number, number]] | null {
     const coordinates: [number, number][] = [];
     collectGeometryCoordinates(feature.geometry, coordinates);
     if (coordinates.length === 0) return null;
@@ -685,7 +685,7 @@ function addEsriTiledLayer(map: maplibregl.Map, url: string, opacity: number): (
     return addXyzLayer(map, tileUrl, opacity);
 }
 
-function buildEsriExportUrl(baseUrl: string, bounds: { getSouth: () => number; getWest: () => number; getNorth: () => number; getEast: () => number }, width: number, height: number, layerIds?: string): string {
+export function buildEsriExportUrl(baseUrl: string, bounds: { getSouth: () => number; getWest: () => number; getNorth: () => number; getEast: () => number }, width: number, height: number, layerIds?: string): string {
     const bbox = `${bounds.getWest()},${bounds.getSouth()},${bounds.getEast()},${bounds.getNorth()}`;
     const params = new URLSearchParams({
         bbox,
