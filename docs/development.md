@@ -17,6 +17,8 @@ This document provides instructions for setting up the development environment, 
     npm run dev
     ```
 
+Google sign-in is configured with `VITE_GOOGLE_CLIENT_ID` and `VITE_GOOGLE_ALLOWED_EMAILS` in `web/.env`. Read-only browsing works without sign-in, but edit, import/export, and enrichment workflows are gated. See [Google Authentication Setup](google-auth-setup.md) for the full setup.
+
 ## Testing
 
 This project uses [Vitest](https://vitest.dev/) for unit testing. The test environment is configured to use `jsdom` for React component testing.

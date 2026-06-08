@@ -31,6 +31,7 @@ describe("AuthContext", () => {
         delete (window as any).google;
         document.querySelectorAll('script[src="https://accounts.google.com/gsi/client"]').forEach((script) => script.remove());
         vi.unstubAllEnvs();
+        vi.stubEnv("VITE_GOOGLE_CLIENT_ID", "");
         vi.restoreAllMocks();
     });
 

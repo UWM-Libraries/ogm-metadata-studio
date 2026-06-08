@@ -14,6 +14,8 @@ npm run proxy
 
 The proxy listens on `http://localhost:8787` by default. The browser uses `VITE_ENRICHMENT_PROXY_URL` if you need a different URL.
 
+For implementation-level details about `web/proxy/enrichment-proxy.mjs`, including endpoint routing, artifact layout, image/geospatial pipelines, configuration, and test seams, see [Enrichment Proxy Module](./enrichment-proxy.md).
+
 The proxy automatically loads environment variables from `web/.env` and `web/.env.local` when it starts. Both files are optional; the app and proxy still boot without them, and individual connection tests will report missing secrets only when a selected profile needs them.
 
 The proxy stores non-secret profile configuration in:
@@ -97,6 +99,54 @@ Use `Persist Gazetteer Matches` after a local gazetteer index or matching logic 
 Inventory sync remains available for staged S3 assets, prompt response review, and draft workflows. Prompt responses and draft provenance are kept in DuckDB/IndexedDB and in `records.duckdb` exports. Aardvark JSON exports remain clean.
 
 For shareable provenance, the project now drafts a companion `ai-enrichments.json` standard alongside `aardvark.json`. The companion document is designed to hold OpenAI/Google Vision prompts and responses, extracted map text, derived placenames, field evidence, and query-time indexing hints while keeping Aardvark focused on reviewed catalog metadata. New image-processing runs write `ai-enrichments.json` beside `aardvark.json` and preserve the exact rendered OpenAI prompts, provider, model, model parameters, request payload with binary image bytes redacted, and raw/parsed provider responses. See [OpenGeoMetadata AI Enrichments](ai-enrichments.md) and the schema at [`schemas/ai-enrichments/schema.json`](../schemas/ai-enrichments/schema.json).
+
+## Enrichment Cost Matrix
+
+Use this matrix when deciding how much AI/OCR work to run for a 1,000-item image batch. These are planning estimates as of 2026-06-06, not invoices. They exclude taxes, S3/object storage, local compute, retries, and provider/account discounts. Check live provider pages before committing a production budget: [OpenAI API pricing](https://openai.com/api/pricing/), [Google Cloud Vision pricing](https://cloud.google.com/vision/pricing), [Gemini Developer API pricing](https://ai.google.dev/pricing), and [Kimi API pricing](https://www.kimi.com/help/kimi-api/api-pricing).
+
+The estimates use these current unit prices:
+
+| Provider/model or service | Input price | Cached input price | Output price | Other price used here |
+| --- | ---: | ---: | ---: | ---: |
+| OpenAI `gpt-5.5` | $5.00 / 1M tokens | $0.50 / 1M tokens | $30.00 / 1M tokens | Long-context sessions cost more; these estimates assume short context. |
+| OpenAI `gpt-5.4-mini` | $0.75 / 1M tokens | $0.075 / 1M tokens | $4.50 / 1M tokens | Used for lower-cost metadata writing or OpenAI label reconciliation. |
+| Gemini 2.5 Flash-Lite | $0.10 / 1M tokens | $0.01 / 1M tokens | $0.40 / 1M tokens | Lowest-cost Gemini lane. |
+| Gemini 2.5 Flash | $0.30 / 1M tokens | $0.03 / 1M tokens | $2.50 / 1M tokens | Balanced Gemini lane. |
+| Gemini 3 Flash Preview | $0.50 / 1M tokens | $0.05 / 1M tokens | $3.00 / 1M tokens | Higher-cost Flash-family estimate. |
+| Kimi `kimi-k2.6` | $0.95 / 1M tokens | $0.16 / 1M tokens | $4.00 / 1M tokens | Response cache hits in Studio avoid the vendor call entirely. |
+| Google Cloud Vision `DOCUMENT_TEXT_DETECTION` | n/a | n/a | n/a | First 1,000 units/month free; after that, $1.50 / 1,000 images through 5M units. |
+
+Formula: `cost = input_tokens / 1,000,000 * input_price + output_tokens / 1,000,000 * output_price`. Google Vision charges per image or PDF page; the table below budgets $1.50 for 1,000 images so it remains conservative after the free monthly block. If this is your first 1,000 Vision units in a month, subtract $1.50.
+
+Assumed work per item:
+
+| Work unit | Token/crop budget used for estimates |
+| --- | --- |
+| Aardvark metadata writer | 12,000 input tokens and 1,500 output tokens. |
+| Bounded OpenAI/Gemini label reconciliation | 4 crops, each with 6,000 input tokens and 1,500 output tokens. |
+| Cached Kimi map-agent swarm | 8 crops, each with 8,000 input tokens and 2,000 output tokens. |
+| Direct high-capacity OpenAI vision extraction | 40,000 image/text input tokens and 5,000 output tokens. |
+| Optional OpenAI vision augmentation | 20,000 image/text input tokens and 2,000 output tokens. |
+| Full-recall Kimi research pass | 12 crops, each with 10,000 input tokens and 3,000 output tokens, plus OpenAI vision augmentation and metadata writing. |
+
+Important crop-control note: if `textExtractionTargetCrops`, `mapLabelReconciliationTargetCrops`, or provider-specific target crop fields are unset or `0`, the proxy selects all generated crop tiles. For cost-bounded batches, set an explicit target crop budget before scaling beyond a sample.
+
+| Workflow and model mix | What runs | Estimated API cost for 1,000 items | Lower-cost model variant | Use when |
+| --- | --- | ---: | ---: | --- |
+| Local refresh only | `Inventory Sync` or `Persist Gazetteer Matches`; local WOF/OSM/GeoNames/OGM concordance over existing `aardvark.json` and `ai-enrichments.json`. | $0.00 | $0.00 | Indexes, matching rules, or DuckDB state changed, but OCR/model evidence is already good. |
+| Cached extraction, metadata rewrite | `Regenerate S3 Aardvark`; existing derivatives and `enrichment_response.json`; one metadata-writing pass. | $105.00 with `gpt-5.5` writer. | $15.75 with `gpt-5.4-mini` writer. | Prompt, normalization, field policy, or companion metadata handling changed. |
+| OCR-first, no label model | Google Vision OCR, local text grouping, local gazetteers, OpenAI metadata writer; label reconciliation off; `OPENAI_VISION_AUGMENT_OCR_ENABLED=false`. | $106.50 with `gpt-5.5` writer. | $17.25 with `gpt-5.4-mini` writer. | Clear scans where OCR captures most title, legend, scale, and map-body labels. |
+| OCR plus Gemini Flash-Lite label reconciliation | Google Vision OCR, 4 crop calls/item to Gemini 2.5 Flash-Lite, metadata writer, local gazetteers. | $111.30 with `gpt-5.5` writer. | $22.05 with `gpt-5.4-mini` writer. | Cheapest OCR-plus-label-recovery lane. |
+| OCR plus Gemini Flash label reconciliation | Google Vision OCR, 4 crop calls/item to Gemini 2.5 Flash, metadata writer, local gazetteers. | $128.70 with `gpt-5.5` writer. | $39.45 with `gpt-5.4-mini` writer. | OCR needs help, but Kimi-style agent claims are not needed. |
+| OCR plus Gemini 3 Flash Preview label reconciliation | Google Vision OCR, 4 crop calls/item to Gemini 3 Flash Preview, metadata writer, local gazetteers. | $136.50 with `gpt-5.5` writer. | $47.25 with `gpt-5.4-mini` writer. | Higher-capability Flash-family reconciliation is worth the extra spend. |
+| OCR plus OpenAI mini label reconciliation | Google Vision OCR, 4 crop calls/item to `gpt-5.4-mini`, metadata writer, local gazetteers. | $151.50 with `gpt-5.5` writer. | $62.25 with `gpt-5.4-mini` writer. | You want OpenAI structured-output behavior for crop reconciliation. |
+| OCR plus Kimi map-agent swarm, first run | Google Vision OCR, 8 Kimi crops/item with no cache hits, metadata writer, local gazetteers. | $231.30 with `gpt-5.5` writer. | $142.05 with `gpt-5.4-mini` writer. | Complex city maps where OCR repair, structured claims, and review packets justify richer work. |
+| OCR plus Kimi map-agent swarm, 50% provider input cache | Same as above, but half of Kimi input tokens bill at cache-hit pricing. | $206.02 with `gpt-5.5` writer. | $116.77 with `gpt-5.4-mini` writer. | Repeatable batches where stable `prompt_cache_key` values are effective. |
+| Kimi rerun with local response-cache hits | Existing Kimi raw responses served from `web/.cache/kimi-agent-swarm/responses`; optional metadata rewrite. | $105.00 if only the `gpt-5.5` writer reruns; $0.00 if only local gazetteers refresh. | $15.75 if only the `gpt-5.4-mini` writer reruns. | Prompt, merge, or gazetteer tuning against the same crop requests. |
+| Direct high-capacity OpenAI vision extraction | OpenAI historical-map extraction over image derivatives plus metadata writer; no Google Vision OCR profile. | $455.00 with `gpt-5.5` extraction and writer. | $365.75 if extraction stays `gpt-5.5` and writer uses `gpt-5.4-mini`. | Small/high-value sets or cases where OCR-first evidence is insufficient. |
+| Full recall / research mode | Google Vision OCR, 12-crop Kimi pass without cache, OpenAI vision augmentation, metadata writer, local gazetteers. | $524.50 with `gpt-5.5` writer. | $435.25 with `gpt-5.4-mini` writer. | Difficult maps where recall matters more than unit cost and human review can adjudicate extra evidence. |
+
+The cheapest reliable operating pattern is staged: run a 20-50 item OCR-first sample, inspect `ai-enrichments.json` and viewer overlays, escalate only the maps that need richer label recovery, and use `Regenerate S3 Aardvark` or `Persist Gazetteer Matches` for later prompt, metadata, and gazetteer changes. On a 1,000-item batch, switching the metadata writer from `gpt-5.5` to `gpt-5.4-mini` saves about $89.25 per writer pass under the assumptions above; avoiding a full direct-vision pass saves roughly $348.50 compared with OCR-first processing.
 
 ## Local WOF Concordance
 
