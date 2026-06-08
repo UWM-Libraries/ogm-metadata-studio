@@ -2,6 +2,8 @@
 
 The application uses DuckDB-WASM as its client-side database. The database is persisted to IndexedDB but runs in-memory during the session.
 
+For the higher-level data-store lifecycle, including published Parquet startup, IndexedDB overlays, local deletes, and publishing back to `web/public/`, see [Data Store Architecture](./data-store.md).
+
 ## Tables
 
 ### `resources`
@@ -82,4 +84,4 @@ Stores cached thumbnail images to prevent repeated fetching.
 
 ## Persistence
 
-The database file `records.duckdb` is saved to the browser's IndexedDB under the store `aardvark-duckdb`. On page load, the application attempts to hydrate DuckDB from this file.
+DuckDB opens an in-memory `records.duckdb` session in the browser. On page load, the app first bootstraps from published Parquet artifacts under `web/public/`, then restores local IndexedDB overlays, delete tombstones, thumbnails, and enrichment state into that in-memory session. Exported `.duckdb` files remain available as backups, but they are no longer the primary startup path. See [Data Store Architecture](./data-store.md) for the full lifecycle.

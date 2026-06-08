@@ -36,6 +36,7 @@ venv/
 records.duckdb
 *.wal
 *.tmp
+data/
 
 # IDEs
 .vscode/

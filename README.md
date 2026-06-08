@@ -49,6 +49,8 @@ Built with **React**, **Vite**, **DuckDB-WASM**, **Google Auth**, and **GitHub R
     ```
     The app will start at `http://localhost:5173`.
 
+Google sign-in is optional for read-only browsing but required for edit, import/export, and enrichment workflows. See [docs/google-auth-setup.md](docs/google-auth-setup.md) for OAuth client setup, allowed email configuration, and troubleshooting.
+
 ## 🧪 Testing
 
 This project maintains a high standard of test coverage using **Vitest**.
