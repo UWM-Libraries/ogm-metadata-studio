@@ -2,6 +2,8 @@
 
 * Added codex folder with a todo list.
 * Ingested some JSON data and already caught a major geometry error in existing AGSL Records.
+* added some local files but ignored them
+* Deleted the root level records.duckdb which only contained one record.
 
 
 

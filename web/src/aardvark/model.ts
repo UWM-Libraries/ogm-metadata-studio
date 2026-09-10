@@ -49,6 +49,7 @@ export interface Resource {
   dct_rights_sm: string[];
   dct_rightsHolder_sm: string[];
   dct_license_sm: string[];
+  gbl_mdModified_dt?: string | null;
 
   // Image Service
   thumbnail?: string;
@@ -329,6 +330,7 @@ function extractAdminFields(raw: AardvarkJson) {
     dct_rightsHolder_sm: (raw["dct_rightsHolder_sm"] as string[] | undefined) ?? [],
     dct_license_sm: (raw["dct_license_sm"] as string[] | undefined) ?? [],
     gbl_suppressed_b: (raw["gbl_suppressed_b"] as boolean | undefined) ?? null,
+    gbl_mdModified_dt: (raw["gbl_mdModified_dt"] as string | undefined) ?? null,
   };
 }
 
@@ -412,6 +414,7 @@ export function resourceToJson(resource: Resource): AardvarkJson {
   if (resource.gbl_suppressed_b !== null && resource.gbl_suppressed_b !== undefined) base["gbl_suppressed_b"] = resource.gbl_suppressed_b;
   if (resource.gbl_fileSize_s) base["gbl_fileSize_s"] = resource.gbl_fileSize_s;
   if (resource.dct_references_s) base["dct_references_s"] = resource.dct_references_s;
+  if (resource.gbl_mdModified_dt) base["gbl_mdModified_dt"] = resource.gbl_mdModified_dt;
 
 
   for (const [k, v] of Object.entries(resource.extra)) {

@@ -58,4 +58,4 @@ records.duckdb
 
 # Coverage
 web/coverage/*
-local/aardvark-json-export.zip
+local/*

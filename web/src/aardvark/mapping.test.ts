@@ -63,6 +63,17 @@ describe('Aardvark Mapping Logic', () => {
             expect(res.gbl_suppressed_b).toBe(true);
         });
 
+        it('rehydrates the metadata modified timestamp', () => {
+            const modified = '2023-10-25T19:46:04.3924796Z';
+            const res = resourceFromRow({
+                id: 'test-modified',
+                dct_title_s: 'Modified record',
+                gbl_mdModified_dt: modified
+            }, []);
+
+            expect(res.gbl_mdModified_dt).toBe(modified);
+        });
+
         it('integrates distributions', () => {
             const row = { id: 'test-3', dct_title_s: 'With Dist' };
             const dists: Distribution[] = [

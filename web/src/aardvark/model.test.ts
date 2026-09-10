@@ -45,4 +45,21 @@ describe('Aardvark Model', () => {
         expect(r2.id).toBe(r.id);
         expect(r2.dct_description_sm).toEqual(r.dct_description_sm);
     });
+
+    it('preserves the canonical metadata modified timestamp', () => {
+        const canonicalJson = {
+            id: 'ark:-77981-gmgs0c4sj3x',
+            dct_title_s: 'Census Blocks Clark County, Wisconsin 2002',
+            dct_accessRights_s: 'Public',
+            gbl_resourceClass_sm: ['Datasets'],
+            gbl_mdVersion_s: 'Aardvark',
+            gbl_mdModified_dt: '2023-10-25T19:46:04.3924796Z'
+        };
+
+        const exportedJson = resourceToJson(resourceFromJson(canonicalJson));
+
+        expect(exportedJson['gbl_mdModified_dt']).toBe(
+            canonicalJson.gbl_mdModified_dt
+        );
+    });
 });

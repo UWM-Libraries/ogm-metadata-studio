@@ -4,12 +4,16 @@
 
 This repository provides Aardvark Metadata Studio, a browser-based environment for importing, reviewing, editing, storing, and exporting OpenGeoMetadata (OGM) Aardvark records.
 
-For the American Geographical Society Library (AGSL) workflow, treat Metadata Studio as the metadata editor and maintained record store. Source-specific acquisition and cleanup may happen elsewhere, including Python scripts, notebooks, or OpenRefine. The intended flow is:
+For the American Geographical Society Library (AGSL) workflow, the canonical metadata is the individual JSON in the `OpenGeoMetadata/edu.uwm` repository. Treat Metadata Studio as an editor and derived working database, not as the authoritative store. Source-specific acquisition and cleanup may happen elsewhere, including Python scripts, notebooks, or OpenRefine. The intended flow is:
 
-1. Acquire or create metadata from source systems.
-2. Transform and validate it into a documented Studio-compatible import format.
-3. Import it into Metadata Studio for review and editing.
-4. Export authoritative OGM Aardvark JSON for GeoBlacklight/Solr ingest.
+1. Load existing canonical JSON from `edu.uwm`, or acquire and prepare new metadata from source systems.
+2. Transform and validate new metadata into a documented Studio-compatible import format.
+3. Import records into Metadata Studio for review and editing.
+4. Export OGM Aardvark JSON as a ZIP.
+5. Reconcile the exported files with a local checkout of `edu.uwm`, review the Git diff, and deliberately commit and push approved changes.
+6. Use the canonical repository metadata for GeoBlacklight/Solr ingest.
+
+Direct publication from Studio to GitHub is not required for the AGSL workflow. Preserve a safe manual Git workflow rather than coupling the application to automatic commits or conflict resolution. The Studio DuckDB/IndexedDB state is derived working state; downloaded DuckDB files are backups, not canonical metadata, and a clean database should be rebuildable from `edu.uwm` JSON.
 
 Keep source acquisition separate from generic Aardvark import, validation, storage, and export behavior. Source-specific adapters must not make the application assume that all records come from one portal or institution.
 
@@ -38,6 +42,8 @@ Preserve genuine multivalued fields as arrays internally. If CSV serializes arra
 
 Do not replace the general-purpose Studio CSV export with an institution-specific worksheet. If an AGSL-specific CSV shape is needed, implement it as an explicitly named export profile while retaining a lossless native interchange format.
 
+Current Studio imports replace an existing record with the same `id`, including its repeatable fields and distributions. Treat this as full-record replacement, not a partial merge. Make that behavior visible and test it carefully because omitted fields may be lost.
+
 ## AGSL and Aardvark conventions
 
 When producing or validating AGSL records:
@@ -62,6 +68,8 @@ AGSL applies some workflow rules that are stricter than the community schema:
 - `gbl_georeferenced_b` may be determined downstream by Blacklight::Allmaps and should not be invented during ordinary metadata import.
 
 When AGSL documentation, upstream documentation, application behavior, or a pinned community JSON Schema disagree, describe the conflict and keep institution-specific enforcement separate from the unmodified community schema. Do not make a compatibility-breaking choice silently.
+
+For AGSL JSON exports, filename generation must be deterministic, cross-platform, and configurable. Do not use a raw identifier containing characters such as `:` as an archive filename. The current AGSL convention is `{ark_name}_BL_Aardvark.json`, but keep the suffix and directory policy configurable so a future schema or repository convention can replace it without changing record IDs.
 
 ## Spatial metadata
 
@@ -89,6 +97,8 @@ Minting and binding are state-changing operations. They must be explicitly enabl
 
 Favor actionable validation messages that identify the affected record and field. Import should not silently ignore malformed serialized references, unsupported types, duplicate IDs, missing identifiers, or invalid spatial values. Provide a validation-only path when practical and summarize records read, accepted, updated, skipped, and invalid.
 
+Do not describe the current application as providing full Aardvark validation. At present, JSON import strictly requires only `id`, supplies permissive defaults for some other fields, and does not validate records against the community JSON Schema or AGSL policy. Invalid legacy records should remain importable for diagnosis and repair, but errors must be visible and publication-ready exports should be validated.
+
 Validate authoritative JSON exports against a pinned community Aardvark JSON Schema in addition to application-level and AGSL policy checks. Schema validation does not replace stricter checks for identifier relationships, canonical reference keys, spatial consistency, or institutional requirements.
 
 Preserve original source values when a mapping is uncertain and surface them for human review. Do not invent missing descriptive metadata.
@@ -102,5 +112,9 @@ For import/export changes, add content-level tests that verify exact headers, fi
 Include focused cases for malformed identifiers, duplicate IDs, missing required values, empty files, invalid serialized JSON, reference aliases and canonical URIs, multiple downloads, geometry/bounding-box discrepancies, and antimeridian envelopes. Use small fixtures and temporary databases; do not overwrite committed metadata or fixture exports as a test side effect.
 
 Treat committed CSV, JSON, Parquet, and DuckDB files as data. Do not rewrite them merely as a side effect of running the application or tests. Before committing a binary database or Parquet change, determine whether its records or schema changed or whether only producer-version metadata changed, and document or discard incidental binary churn as appropriate.
+
+Preserve `gbl_mdModified_dt` during import and export; model-level and database-row round-trip tests cover that preservation. Editing still does not update the timestamp and no timestamp is generated, so treat update timing as unresolved policy. A future policy should avoid timestamp-only churn on unchanged records.
+
+The current JSON ZIP is a full export. A partial or changed-record export may be added later to simplify routine Git review, but do not make the core AGSL workflow depend on that future feature.
 
 Keep credentials and private service configuration outside source code, fixtures, generated exports, logs, and committed database files.
