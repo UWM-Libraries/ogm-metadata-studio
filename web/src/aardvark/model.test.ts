@@ -62,4 +62,26 @@ describe('Aardvark Model', () => {
             canonicalJson.gbl_mdModified_dt
         );
     });
+
+    it('preserves Index Year as an integer array', () => {
+        const canonicalJson = {
+            id: 'ark:-77981-test',
+            dct_title_s: 'Multiple years',
+            dct_accessRights_s: 'Public',
+            gbl_resourceClass_sm: ['Datasets'],
+            gbl_mdVersion_s: 'Aardvark',
+            gbl_indexYear_im: [1999, 2000, 2001]
+        };
+
+        const exportedJson = resourceToJson(resourceFromJson(canonicalJson));
+
+        expect(exportedJson['gbl_indexYear_im']).toEqual([1999, 2000, 2001]);
+    });
+
+    it('rejects invalid Index Year values', () => {
+        expect(() => resourceFromJson({
+            id: 'invalid-year',
+            gbl_indexYear_im: ['2001', 'twenty-two']
+        })).toThrow('Invalid Index Year');
+    });
 });

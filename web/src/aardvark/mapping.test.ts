@@ -74,6 +74,16 @@ describe('Aardvark Mapping Logic', () => {
             expect(res.gbl_mdModified_dt).toBe(modified);
         });
 
+        it('rehydrates legacy comma-separated Index Years as integers', () => {
+            const res = resourceFromRow({
+                id: 'test-years',
+                dct_title_s: 'Multiple years',
+                gbl_indexYear_im: '1999,2000,2001'
+            }, []);
+
+            expect(res.gbl_indexYear_im).toEqual([1999, 2000, 2001]);
+        });
+
         it('integrates distributions', () => {
             const row = { id: 'test-3', dct_title_s: 'With Dist' };
             const dists: Distribution[] = [

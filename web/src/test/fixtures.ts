@@ -23,7 +23,7 @@ export const FIXTURE_POLYGON: AardvarkJson = {
     dct_accessRights_s: "Restricted", // Testing sensitive data
     gbl_mdVersion_s: "Aardvark",
     dcat_bbox: "ENVELOPE(-90.0, -89.0, 43.0, 42.0)",
-    gbl_indexYear_im: 2023,
+    gbl_indexYear_im: [2023],
     dct_references_s: "{\"http://www.opengis.net/def/serviceType/ogc/wms\":\"https://example.com/wms\"}"
 };
 
@@ -37,7 +37,7 @@ export const FIXTURE_SCANNED_MAP: AardvarkJson = {
     dct_accessRights_s: "Public",
     gbl_mdVersion_s: "Aardvark",
     // No bbox to test null handling
-    gbl_indexYear_im: 1900,
+    gbl_indexYear_im: [1900],
     dct_references_s: "{\"http://iiif.io/api/image\":\"https://example.com/iiif/info.json\"}"
 };
 

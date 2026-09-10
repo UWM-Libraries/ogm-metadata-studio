@@ -24,7 +24,7 @@ const FIXTURE_RES: Resource = {
     dct_spatial_sm: ['USA'],
     dcat_bbox: 'ENVELOPE(-100,-80,40,30)',
     dct_references_s: JSON.stringify({ "http://schema.org/downloadUrl": "http://dl.com" }),
-    gbl_indexYear_im: 2020,
+    gbl_indexYear_im: [2020],
     dct_creator_sm: ['Creator A'],
     dct_publisher_sm: ['Publisher B']
 };

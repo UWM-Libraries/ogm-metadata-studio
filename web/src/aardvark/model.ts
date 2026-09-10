@@ -34,7 +34,7 @@ export interface Resource {
   dct_temporal_sm: string[];
   dct_issued_s?: string | null;
   gbl_dateRange_drsim: string[];
-  gbl_indexYear_im?: number | null;
+  gbl_indexYear_im?: number[] | null;
 
   // Spatial
   dct_spatial_sm: string[];
@@ -303,11 +303,28 @@ function extractSubjectFields(raw: AardvarkJson) {
   };
 }
 
+export function normalizeIndexYears(value: unknown): number[] | null {
+  if (value === undefined || value === null || value === "") return null;
+
+  const candidates = Array.isArray(value)
+    ? value
+    : String(value).split(/[|,]/);
+  const years = candidates.map((candidate) => {
+    const text = String(candidate).trim();
+    if (!/^\d{4}$/.test(text)) {
+      throw new Error(`Invalid Index Year: ${JSON.stringify(candidate)}`);
+    }
+    return Number(text);
+  });
+
+  return years.length > 0 ? years : null;
+}
+
 function extractTemporalFields(raw: AardvarkJson) {
   return {
     dct_temporal_sm: (raw["dct_temporal_sm"] as string[] | undefined) ?? [],
     dct_issued_s: (raw["dct_issued_s"] as string | undefined) ?? null,
-    gbl_indexYear_im: (raw["gbl_indexYear_im"] as number | undefined) ?? null,
+    gbl_indexYear_im: normalizeIndexYears(raw["gbl_indexYear_im"]),
     gbl_dateRange_drsim: (raw["gbl_dateRange_drsim"] as string[] | undefined) ?? [],
   };
 }
