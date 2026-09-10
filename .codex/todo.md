@@ -46,6 +46,7 @@ This is a high-level roadmap for adapting Aardvark Metadata Studio to the Americ
 - [ ] Document and test the current full-record replacement behavior for matching IDs, including the effect of omitted fields.
 - [ ] Preview whether an import will create, replace, leave unchanged, or invalidate records.
 - [ ] Verify that CSV and JSON exports preserve supported metadata and types through round trips.
+- [x] Prevent JSON round trips from emitting absent repeatable fields as empty arrays or coercing absent Boolean fields to `false`.
 - [x] Use deterministic, cross-platform JSON filenames instead of placing raw record IDs containing characters such as `:` into archive paths.
 - [x] Add configurable export naming and layout, with `{ark_name}_BL_Aardvark.json` as the current AGSL filename convention and a browser-persisted UI profile selector.
 - [ ] Consider an optional partial or changed-record JSON export to simplify routine Git review; retain a complete export as the baseline workflow.
@@ -73,6 +74,7 @@ This is a high-level roadmap for adapting Aardvark Metadata Studio to the Americ
 ## Reliability, deployment, and stewardship
 
 - [ ] Add representative automated tests for AGSL import, editing, export, and round-trip workflows.
+- [ ] Diagnose and fix the current CARTO API integration bug, document the expected behavior, and add regression coverage for the confirmed failure mode.
 - [ ] Prevent application or test runs from causing incidental changes to committed Parquet, DuckDB, CSV, or JSON data.
 - [ ] Update the README and in-app copy to describe persistence accurately: `edu.uwm` JSON is canonical, edits are working state in browser IndexedDB, downloaded DuckDB files are backups, and publication uses a deliberate manual ZIP-and-Git workflow.
 - [ ] Define a reproducible local and production deployment process.

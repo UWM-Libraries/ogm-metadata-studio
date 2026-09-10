@@ -103,7 +103,7 @@ export function resourceFromRow(
   for (const field of SCALAR_FIELDS) {
     if (field === "dct_references_s") continue;
     const value = row[field];
-    if (value === undefined || value === "") continue;
+    if (value === undefined || value === null || value === "") continue;
     if (field === "gbl_suppressed_b" || field === "gbl_georeferenced_b") {
       const v = String(value).toLowerCase();
       data[field] = v === "1" || v === "true" || v === "yes" || v === "y";
@@ -224,4 +224,3 @@ export function buildDctReferencesS(
   if (Object.keys(refs).length === 0) return undefined;
   return JSON.stringify(refs, Object.keys(refs).sort(), 2);
 }
-

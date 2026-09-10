@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { flattenResource, flattenResourceForDuckDb, resourceFromRow, extractDistributionsFromJson, buildDctReferencesS } from './mapping';
-import { Resource, Distribution } from './model';
+import { Resource, Distribution, resourceToJson } from './model';
 
 describe('Aardvark Mapping Logic', () => {
 
@@ -61,6 +61,28 @@ describe('Aardvark Mapping Logic', () => {
             expect(res.dct_description_sm).toEqual(['One', 'Two']);
             expect(res.gbl_resourceClass_sm).toEqual(['Map']);
             expect(res.gbl_suppressed_b).toBe(true);
+        });
+
+        it('preserves absent booleans as null and explicit false values as false', () => {
+            const absent = resourceFromRow({
+                id: 'test-absent-booleans',
+                dct_title_s: 'Absent booleans',
+                gbl_georeferenced_b: null,
+                gbl_suppressed_b: null
+            }, []);
+            const explicit = resourceFromRow({
+                id: 'test-explicit-booleans',
+                dct_title_s: 'Explicit booleans',
+                gbl_georeferenced_b: 'false',
+                gbl_suppressed_b: 'false'
+            }, []);
+
+            expect(absent.gbl_georeferenced_b).toBeNull();
+            expect(absent.gbl_suppressed_b).toBeNull();
+            expect(explicit.gbl_georeferenced_b).toBe(false);
+            expect(explicit.gbl_suppressed_b).toBe(false);
+            expect(resourceToJson(absent).gbl_georeferenced_b).toBeUndefined();
+            expect(resourceToJson(explicit).gbl_georeferenced_b).toBe(false);
         });
 
         it('rehydrates the metadata modified timestamp', () => {

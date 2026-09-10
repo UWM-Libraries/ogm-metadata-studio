@@ -46,6 +46,22 @@ describe('Aardvark Model', () => {
         expect(r2.dct_description_sm).toEqual(r.dct_description_sm);
     });
 
+    it('omits empty repeatable fields from JSON output', () => {
+        const resource = resourceFromJson({
+            id: 'minimal',
+            dct_title_s: 'Minimal',
+            gbl_resourceClass_sm: ['Dataset'],
+            dct_accessRights_s: 'Public',
+            gbl_mdVersion_s: 'Aardvark'
+        });
+
+        const json = resourceToJson(resource);
+
+        expect(json.gbl_resourceClass_sm).toEqual(['Dataset']);
+        expect(json.dct_description_sm).toBeUndefined();
+        expect(json.dct_relation_sm).toBeUndefined();
+    });
+
     it('preserves the canonical metadata modified timestamp', () => {
         const canonicalJson = {
             id: 'ark:-77981-gmgs0c4sj3x',

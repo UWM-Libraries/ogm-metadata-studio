@@ -413,45 +413,13 @@ export function resourceToJson(resource: Resource): AardvarkJson {
     dct_accessRights_s: resource.dct_accessRights_s,
     gbl_resourceClass_sm: resource.gbl_resourceClass_sm,
     gbl_mdVersion_s: resource.gbl_mdVersion_s,
-
-    // Identification
-    dct_alternative_sm: resource.dct_alternative_sm,
-    dct_description_sm: resource.dct_description_sm,
-    dct_language_sm: resource.dct_language_sm,
-    gbl_displayNote_sm: resource.gbl_displayNote_sm,
-
-    // Credits
-    dct_creator_sm: resource.dct_creator_sm,
-    dct_publisher_sm: resource.dct_publisher_sm,
-
-    // Categories
-    gbl_resourceType_sm: resource.gbl_resourceType_sm,
-    dct_subject_sm: resource.dct_subject_sm,
-    dcat_theme_sm: resource.dcat_theme_sm,
-    dcat_keyword_sm: resource.dcat_keyword_sm,
-
-    // Temporal
-    dct_temporal_sm: resource.dct_temporal_sm,
-    gbl_dateRange_drsim: resource.gbl_dateRange_drsim,
-
-    // Spatial
-    dct_spatial_sm: resource.dct_spatial_sm,
-
-    // Administrative
-    dct_identifier_sm: resource.dct_identifier_sm,
-    dct_rights_sm: resource.dct_rights_sm,
-    dct_rightsHolder_sm: resource.dct_rightsHolder_sm,
-    dct_license_sm: resource.dct_license_sm,
-
-    // Relations
-    pcdm_memberOf_sm: resource.pcdm_memberOf_sm,
-    dct_isPartOf_sm: resource.dct_isPartOf_sm,
-    dct_source_sm: resource.dct_source_sm,
-    dct_isVersionOf_sm: resource.dct_isVersionOf_sm,
-    dct_replaces_sm: resource.dct_replaces_sm,
-    dct_isReplacedBy_sm: resource.dct_isReplacedBy_sm,
-    dct_relation_sm: resource.dct_relation_sm,
   };
+
+  for (const field of REPEATABLE_STRING_FIELDS) {
+    if (field === "gbl_resourceClass_sm") continue;
+    const values = resource[field as keyof Resource];
+    if (Array.isArray(values) && values.length > 0) base[field] = values;
+  }
 
   // Optional Scalars
   if (resource.dct_format_s) base["dct_format_s"] = resource.dct_format_s;
