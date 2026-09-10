@@ -23,6 +23,7 @@ global.URL.revokeObjectURL = vi.fn();
 describe('ImportPage', () => {
     beforeEach(() => {
         vi.clearAllMocks();
+        window.localStorage.clear();
     });
 
     it('renders welcome message when resourceCount is 0', () => {
@@ -102,6 +103,24 @@ describe('ImportPage', () => {
             expect(duckdb.exportAardvarkJsonZip).toHaveBeenCalled();
             expect(screen.getByText('JSON OGM Export downloaded.')).toBeDefined();
         });
+    });
+
+    it('exports with the selected AGSL filename profile', async () => {
+        vi.mocked(duckdb.exportAardvarkJsonZip).mockResolvedValue(new Blob(['zip data']));
+        render(<ImportPage />);
+
+        fireEvent.change(screen.getByLabelText('JSON filename profile'), {
+            target: { value: 'agsl' }
+        });
+        fireEvent.click(screen.getByText('Download JSON Zip'));
+
+        await waitFor(() => {
+            expect(duckdb.exportAardvarkJsonZip).toHaveBeenCalledWith({
+                filenameProfile: 'agsl',
+                includeResourceClassDirectories: false
+            });
+        });
+        expect(window.localStorage.getItem('aardvark-json-filename-profile')).toBe('agsl');
     });
 
     it('handles save DB', async () => {

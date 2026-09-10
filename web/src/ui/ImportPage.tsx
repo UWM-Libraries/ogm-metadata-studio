@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import { importCsv, saveDb, exportDbBlob, importJsonData, exportAardvarkJsonZip } from "../duckdb/duckdbClient";
 import { GithubImport } from "./GithubImport";
+import { JsonExportProfileSelect, useJsonExportProfile } from "./JsonExportProfileSelect";
 
 interface ImportPageProps {
     resourceCount?: number;
@@ -10,11 +11,12 @@ export const ImportPage: React.FC<ImportPageProps> = ({ resourceCount = 0 }) => 
     const [status, setStatus] = useState<string>("");
     const [loading, setLoading] = useState(false);
     const [mode, setMode] = useState<"local" | "github">("local");
+    const jsonExportProfile = useJsonExportProfile();
 
     const handleExportJsonZip = async () => {
         try {
             setLoading(true);
-            const blob = await exportAardvarkJsonZip();
+            const blob = await exportAardvarkJsonZip(jsonExportProfile.options);
             if (blob) {
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement("a");
@@ -195,6 +197,10 @@ export const ImportPage: React.FC<ImportPageProps> = ({ resourceCount = 0 }) => 
                         <p className="text-xs text-slate-500 dark:text-slate-400 mb-4">
                             Download a ZIP of individual Aardvark JSON files, ready for the GBL workflow.
                         </p>
+                        <JsonExportProfileSelect
+                            profile={jsonExportProfile.profile}
+                            onChange={jsonExportProfile.setProfile}
+                        />
                         <button
                             onClick={handleExportJsonZip}
                             disabled={loading}

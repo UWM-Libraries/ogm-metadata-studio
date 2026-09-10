@@ -46,8 +46,8 @@ This is a high-level roadmap for adapting Aardvark Metadata Studio to the Americ
 - [ ] Document and test the current full-record replacement behavior for matching IDs, including the effect of omitted fields.
 - [ ] Preview whether an import will create, replace, leave unchanged, or invalidate records.
 - [ ] Verify that CSV and JSON exports preserve supported metadata and types through round trips.
-- [ ] Use deterministic, cross-platform JSON filenames instead of placing raw record IDs containing characters such as `:` into archive paths.
-- [ ] Add configurable export naming and layout, with `{ark_name}_BL_Aardvark.json` as the current AGSL filename convention.
+- [x] Use deterministic, cross-platform JSON filenames instead of placing raw record IDs containing characters such as `:` into archive paths.
+- [x] Add configurable export naming and layout, with `{ark_name}_BL_Aardvark.json` as the current AGSL filename convention. Add a UI profile selector separately if staff need to switch policies interactively.
 - [ ] Consider an optional partial or changed-record JSON export to simplify routine Git review; retain a complete export as the baseline workflow.
 - [ ] Keep institution-specific worksheet exports distinct from a lossless general-purpose interchange export.
 

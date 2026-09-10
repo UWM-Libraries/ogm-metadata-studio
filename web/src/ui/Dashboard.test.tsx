@@ -97,6 +97,7 @@ describe('Dashboard Component', () => {
 
     beforeEach(() => {
         vi.clearAllMocks();
+        window.localStorage.clear();
 
         (useThumbnailQueue as any).mockReturnValue({
             thumbnails: {},
@@ -151,7 +152,7 @@ describe('Dashboard Component', () => {
 
     it('triggers sort change', () => {
         render(<Dashboard onEdit={mockOnEdit} onSelect={mockOnSelect} />);
-        const select = screen.getByRole('combobox');
+        const select = screen.getByDisplayValue('Relevance');
         fireEvent.change(select, { target: { value: 'year_desc' } });
         expect(mockSetState).toHaveBeenCalled();
     });
@@ -178,6 +179,26 @@ describe('Dashboard Component', () => {
 
         await waitFor(() => {
             expect(databaseService.exportFilteredResults).toHaveBeenCalledWith(expect.anything(), 'json');
+        });
+    });
+
+    it('exports filtered JSON with the selected AGSL filename profile', async () => {
+        (databaseService.exportFilteredResults as any).mockResolvedValue(new Blob(['{}']));
+        global.URL.createObjectURL = vi.fn(() => 'blob:url');
+        global.URL.revokeObjectURL = vi.fn();
+        render(<Dashboard onEdit={mockOnEdit} onSelect={mockOnSelect} />);
+
+        fireEvent.change(screen.getByLabelText('JSON filename profile'), {
+            target: { value: 'agsl' }
+        });
+        fireEvent.click(screen.getByText('JSON'));
+
+        await waitFor(() => {
+            expect(databaseService.exportFilteredResults).toHaveBeenCalledWith(
+                expect.anything(),
+                'json',
+                { filenameProfile: 'agsl', includeResourceClassDirectories: false }
+            );
         });
     });
 

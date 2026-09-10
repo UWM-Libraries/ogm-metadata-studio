@@ -4,6 +4,60 @@ import { queryResources, compileFacetedWhere, fetchResourcesByIds } from "./quer
 import { FacetedSearchRequest } from "./types";
 import JSZip from "jszip";
 
+export type JsonFilenameProfile = "safe" | "agsl";
+
+export interface JsonExportOptions {
+    filenameProfile?: JsonFilenameProfile;
+    filenameSuffix?: string;
+    rootDirectory?: string;
+    includeResourceClassDirectories?: boolean;
+}
+
+const WINDOWS_RESERVED_NAMES = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
+
+function safePathSegment(value: string, fallback: string): string {
+    const safe = value
+        .replace(/[<>:"/\\|?*\u0000-\u001F]/g, "_")
+        .replace(/[. ]+$/g, "")
+        .trim();
+    if (!safe) return fallback;
+    return WINDOWS_RESERVED_NAMES.test(safe) ? `_${safe}` : safe;
+}
+
+function agslArkName(id: string): string {
+    const match = id.trim().match(/^ark:(?:\/|-)?77981(?:\/|-)(.+)$/i);
+    if (!match) {
+        throw new Error(`AGSL filename profile requires an ARK with NAAN 77981; received ${JSON.stringify(id)}`);
+    }
+    return safePathSegment(match[1], "record");
+}
+
+export function jsonFilenameForResource(
+    resource: Pick<Resource, "id">,
+    options: JsonExportOptions = {}
+): string {
+    const profile = options.filenameProfile ?? "safe";
+    const stem = profile === "agsl"
+        ? agslArkName(resource.id)
+        : safePathSegment(resource.id, "record");
+    const defaultSuffix = profile === "agsl" ? "_BL_Aardvark" : "";
+    const suffix = safePathSegment(options.filenameSuffix ?? defaultSuffix, "");
+    return `${stem}${suffix}.json`;
+}
+
+export function jsonPathForResource(
+    resource: Pick<Resource, "id" | "gbl_resourceClass_sm">,
+    options: JsonExportOptions = {}
+): string {
+    const root = safePathSegment(options.rootDirectory ?? "metadata-aardvark", "metadata-aardvark");
+    const includeClass = options.includeResourceClassDirectories ?? true;
+    if (!includeClass) return `${root}/${jsonFilenameForResource(resource, options)}`;
+
+    const resourceClass = resource.gbl_resourceClass_sm?.[0] ?? "Uncategorized";
+    const folder = safePathSegment(resourceClass, "Uncategorized");
+    return `${root}/${folder}/${jsonFilenameForResource(resource, options)}`;
+}
+
 export async function generateParquet(resources: Resource[]): Promise<Uint8Array | null> {
     const ctx = await getDuckDbContext();
     if (!ctx) return null;
@@ -28,23 +82,29 @@ export async function generateParquet(resources: Resource[]): Promise<Uint8Array
     }
 }
 
-export async function zipResources(resources: Resource[], parquetBuffer: Uint8Array | null = null): Promise<Blob> {
+export async function zipResources(
+    resources: Resource[],
+    parquetBuffer: Uint8Array | null = null,
+    options: JsonExportOptions = {}
+): Promise<Blob> {
     const zip = new JSZip();
-    let count = 0;
-    for (const res of resources) {
-        if (!res.id) continue;
-        const json = resourceToJson(res);
+    const archivePaths = new Set<string>();
+    const exportableResources = resources
+        .filter((resource) => !!resource.id)
+        .map((resource) => ({ resource, path: jsonPathForResource(resource, options) }));
 
-        // Determine folder name based on primary Resource Class
-        let folder = "Uncategorized";
-        if (res.gbl_resourceClass_sm && res.gbl_resourceClass_sm.length > 0) {
-            folder = res.gbl_resourceClass_sm[0];
+    for (const { path } of exportableResources) {
+        const collisionKey = path.toLocaleLowerCase("en-US");
+        if (archivePaths.has(collisionKey)) {
+            throw new Error(`JSON export filename collision: ${path}`);
         }
+        archivePaths.add(collisionKey);
+    }
 
-        // Clean folder name to be safe
-        folder = folder.replace(/[^a-zA-Z0-9 _-]/g, "");
-
-        zip.file(`metadata-aardvark/${folder}/${res.id}.json`, JSON.stringify(json, null, 2));
+    let count = 0;
+    for (const { resource: res, path } of exportableResources) {
+        const json = resourceToJson(res);
+        zip.file(path, JSON.stringify(json, null, 2));
         count++;
     }
 
@@ -90,13 +150,17 @@ function csvResources(resources: Resource[]): Blob {
 }
 
 
-export async function exportAardvarkJsonZip(): Promise<Blob | null> {
+export async function exportAardvarkJsonZip(options: JsonExportOptions = {}): Promise<Blob | null> {
     const resources = await queryResources();
     const parquet = await generateParquet(resources);
-    return zipResources(resources, parquet);
+    return zipResources(resources, parquet, options);
 }
 
-export async function exportFilteredResults(req: FacetedSearchRequest, format: 'json' | 'csv'): Promise<Blob | null> {
+export async function exportFilteredResults(
+    req: FacetedSearchRequest,
+    format: 'json' | 'csv',
+    options: JsonExportOptions = {}
+): Promise<Blob | null> {
     const ctx = await getDuckDbContext();
     if (!ctx) return null;
     const { conn } = ctx;
@@ -111,7 +175,7 @@ export async function exportFilteredResults(req: FacetedSearchRequest, format: '
 
     if (format === 'json') {
         const parquet = await generateParquet(resources);
-        return zipResources(resources, parquet);
+        return zipResources(resources, parquet, options);
     } else {
         return csvResources(resources);
     }

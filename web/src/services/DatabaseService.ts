@@ -6,6 +6,7 @@ import * as lifec from "../duckdb/lifecycle";
 import { getDuckDbContext } from "../duckdb/dbInit";
 import { FacetedSearchRequest, FacetedSearchResponse, SearchResult, SuggestResult, FacetValueRequest, FacetValueResult, DistributionResult } from "../duckdb/types";
 import { Resource, Distribution, AardvarkJson } from "../aardvark/model";
+import type { JsonExportOptions } from "../duckdb/export";
 
 export class DatabaseService {
 
@@ -114,12 +115,16 @@ export class DatabaseService {
         return lifec.exportDbBlob();
     }
 
-    async exportAardvarkJsonZip(): Promise<Blob | null> {
-        return exprt.exportAardvarkJsonZip();
+    async exportAardvarkJsonZip(options?: JsonExportOptions): Promise<Blob | null> {
+        return options
+            ? exprt.exportAardvarkJsonZip(options)
+            : exprt.exportAardvarkJsonZip();
     }
 
-    async exportFilteredResults(req: FacetedSearchRequest, format: 'json' | 'csv'): Promise<Blob | null> {
-        return exprt.exportFilteredResults(req, format);
+    async exportFilteredResults(req: FacetedSearchRequest, format: 'json' | 'csv', options?: JsonExportOptions): Promise<Blob | null> {
+        return options
+            ? exprt.exportFilteredResults(req, format, options)
+            : exprt.exportFilteredResults(req, format);
     }
 }
 

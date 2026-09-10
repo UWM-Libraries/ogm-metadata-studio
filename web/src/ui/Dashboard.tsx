@@ -7,6 +7,7 @@ import { useResourceSearch, FacetConfig } from "../hooks/useResourceSearch";
 import { GalleryView } from "./GalleryView";
 import { ResultsMapView } from "./ResultsMapView";
 import { DashboardResultsList } from "./DashboardResultsList";
+import { JsonExportProfileSelect, useJsonExportProfile } from "./JsonExportProfileSelect";
 
 
 import { ActiveFilterBar } from "./ActiveFilterBar";
@@ -50,6 +51,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ onEdit, onSelect }) => {
     const [isExporting, setIsExporting] = useState(false);
     const [modalState, setModalState] = useState<{ field: string; label: string } | null>(null);
     const [hoveredResourceId, setHoveredResourceId] = useState<string | null>(null);
+    const jsonExportProfile = useJsonExportProfile();
 
     // Asset Queues
     const { thumbnails, register } = useThumbnailQueue();
@@ -89,7 +91,10 @@ export const Dashboard: React.FC<DashboardProps> = ({ onEdit, onSelect }) => {
                 sort: [],
                 bbox: currentBBox // Reuse the parsed BBox
             };
-            const blob = await databaseService.exportFilteredResults(req, format);
+            const jsonOptions = format === "json" ? jsonExportProfile.options : undefined;
+            const blob = jsonOptions
+                ? await databaseService.exportFilteredResults(req, format, jsonOptions)
+                : await databaseService.exportFilteredResults(req, format);
             if (!blob) throw new Error("Export yielded no data");
 
             const url = URL.createObjectURL(blob);
@@ -237,6 +242,11 @@ export const Dashboard: React.FC<DashboardProps> = ({ onEdit, onSelect }) => {
                                 <option value="title_asc">Title (A-Z)</option>
                                 <option value="title_desc">Title (Z-A)</option>
                             </select>
+                            <JsonExportProfileSelect
+                                profile={jsonExportProfile.profile}
+                                onChange={jsonExportProfile.setProfile}
+                                compact
+                            />
                             <div className="flex items-center bg-gray-100 dark:bg-slate-800 rounded-md p-0.5 border border-gray-200 dark:border-slate-700">
                                 <button onClick={() => handleExport('json')} disabled={isExporting || total === 0} className="px-3 py-1.5 text-xs font-medium text-slate-500 dark:text-slate-300 hover:bg-white dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-white rounded disabled:opacity-50 disabled:cursor-not-allowed transition-colors shadow-sm hover:shadow">JSON</button>
                                 <div className="w-px bg-gray-300 dark:bg-slate-700 h-4 mx-0.5"></div>

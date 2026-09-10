@@ -86,6 +86,53 @@ describe('Export Logic', () => {
             expect(zipInstance.generateAsync).toHaveBeenCalled();
             expect(blob).toBeInstanceOf(Blob);
         });
+
+        it('uses the AGSL ARK name convention without changing JSON ids', async () => {
+            const resources = [{
+                id: 'ark:-77981-gmgs0c4sj3x',
+                gbl_resourceClass_sm: ['Maps'],
+                extra: {}
+            }] as any[];
+
+            await exporter.zipResources(resources, null, {
+                filenameProfile: 'agsl',
+                includeResourceClassDirectories: false
+            });
+
+            const MockZip: any = JSZip;
+            const zipInstance = MockZip.mock.results[0].value;
+            expect(zipInstance.file).toHaveBeenCalledWith(
+                'metadata-aardvark/gmgs0c4sj3x_BL_Aardvark.json',
+                expect.stringContaining('"id": "ark:-77981-gmgs0c4sj3x"')
+            );
+        });
+
+        it('makes unsafe identifiers safe in the default profile', () => {
+            expect(exporter.jsonFilenameForResource({ id: 'ark:/1234/a:b?c' }))
+                .toBe('ark__1234_a_b_c.json');
+        });
+
+        it('supports configurable suffix and directory policy', () => {
+            expect(exporter.jsonPathForResource(
+                { id: 'record-1', gbl_resourceClass_sm: ['Maps'] },
+                {
+                    filenameSuffix: '_AardvarkV2',
+                    rootDirectory: 'json',
+                    includeResourceClassDirectories: false
+                }
+            )).toBe('json/record-1_AardvarkV2.json');
+        });
+
+        it('rejects case-insensitive archive path collisions', async () => {
+            const resources = [
+                { id: 'Record', gbl_resourceClass_sm: ['Maps'], extra: {} },
+                { id: 'record', gbl_resourceClass_sm: ['Maps'], extra: {} }
+            ] as any[];
+
+            await expect(exporter.zipResources(resources)).rejects.toThrow(
+                'JSON export filename collision'
+            );
+        });
     });
 
     describe('exportFilteredResults', () => {
