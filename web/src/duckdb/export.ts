@@ -3,6 +3,7 @@ import { Resource, resourceToJson, SCALAR_FIELDS, REPEATABLE_STRING_FIELDS, CSV_
 import { queryResources, compileFacetedWhere, fetchResourcesByIds } from "./queries";
 import { FacetedSearchRequest } from "./types";
 import JSZip from "jszip";
+import { parseAgslResourceId, validateAgslIdentifiers } from "../aardvark/identifiers";
 
 export type JsonFilenameProfile = "safe" | "agsl";
 
@@ -24,21 +25,13 @@ function safePathSegment(value: string, fallback: string): string {
     return WINDOWS_RESERVED_NAMES.test(safe) ? `_${safe}` : safe;
 }
 
-function agslArkName(id: string): string {
-    const match = id.trim().match(/^ark:(?:\/|-)?77981(?:\/|-)(.+)$/i);
-    if (!match) {
-        throw new Error(`AGSL filename profile requires an ARK with NAAN 77981; received ${JSON.stringify(id)}`);
-    }
-    return safePathSegment(match[1], "record");
-}
-
 export function jsonFilenameForResource(
     resource: Pick<Resource, "id">,
     options: JsonExportOptions = {}
 ): string {
     const profile = options.filenameProfile ?? "safe";
     const stem = profile === "agsl"
-        ? agslArkName(resource.id)
+        ? safePathSegment(parseAgslResourceId(resource.id).name, "record")
         : safePathSegment(resource.id, "record");
     const defaultSuffix = profile === "agsl" ? "_BL_Aardvark" : "";
     const suffix = safePathSegment(options.filenameSuffix ?? defaultSuffix, "");
@@ -89,9 +82,23 @@ export async function zipResources(
 ): Promise<Blob> {
     const zip = new JSZip();
     const archivePaths = new Set<string>();
-    const exportableResources = resources
-        .filter((resource) => !!resource.id)
-        .map((resource) => ({ resource, path: jsonPathForResource(resource, options) }));
+    const resourcesWithIds = resources.filter((resource) => !!resource.id);
+
+    if (options.filenameProfile === "agsl") {
+        const identifierErrors = resourcesWithIds.flatMap((resource) =>
+            validateAgslIdentifiers(resource).map((issue) =>
+                `- ${resource.id} [${issue.field}]: ${issue.message}`
+            )
+        );
+        if (identifierErrors.length > 0) {
+            throw new Error(`AGSL identifier validation failed:\n${identifierErrors.join("\n")}`);
+        }
+    }
+
+    const exportableResources = resourcesWithIds.map((resource) => ({
+        resource,
+        path: jsonPathForResource(resource, options),
+    }));
 
     for (const { path } of exportableResources) {
         const collisionKey = path.toLocaleLowerCase("en-US");

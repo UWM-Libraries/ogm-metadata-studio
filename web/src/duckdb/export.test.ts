@@ -90,6 +90,7 @@ describe('Export Logic', () => {
         it('uses the AGSL ARK name convention without changing JSON ids', async () => {
             const resources = [{
                 id: 'ark:-77981-gmgs0c4sj3x',
+                dct_identifier_sm: ['ark:/77981/gmgs0c4sj3x'],
                 gbl_resourceClass_sm: ['Maps'],
                 extra: {}
             }] as any[];
@@ -105,6 +106,32 @@ describe('Export Logic', () => {
                 'metadata-aardvark/gmgs0c4sj3x_BL_Aardvark.json',
                 expect.stringContaining('"id": "ark:-77981-gmgs0c4sj3x"')
             );
+        });
+
+        it('rejects canonical ARKs where the AGSL profile requires a resource id', () => {
+            expect(() => exporter.jsonFilenameForResource(
+                { id: 'ark:/77981/gmgs0c4sj3x' },
+                { filenameProfile: 'agsl' }
+            )).toThrow('AGSL resource ID must begin');
+        });
+
+        it('reports identifier mismatches before generating an AGSL archive', async () => {
+            const resources = [{
+                id: 'ark:-77981-gmgs0c4sj3x',
+                dct_identifier_sm: ['ark:/77981/different'],
+                gbl_resourceClass_sm: ['Maps'],
+                extra: {}
+            }] as any[];
+
+            await expect(exporter.zipResources(resources, null, {
+                filenameProfile: 'agsl'
+            })).rejects.toThrow(
+                'ark:-77981-gmgs0c4sj3x [dct_identifier_sm]'
+            );
+
+            const MockZip: any = JSZip;
+            const zipInstance = MockZip.mock.results[0].value;
+            expect(zipInstance.file).not.toHaveBeenCalled();
         });
 
         it('makes unsafe identifiers safe in the default profile', () => {
