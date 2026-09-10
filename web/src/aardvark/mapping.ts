@@ -4,6 +4,7 @@ import {
   REPEATABLE_STRING_FIELDS,
   Resource,
   SCALAR_FIELDS,
+  canonicalReferenceKey,
   resourceFromJson,
   resourceToJson,
 } from "./model";
@@ -123,8 +124,9 @@ export function resourceFromRow(
     // 1. Group by relation_key
     for (const d of distributionsForResource) {
       if (!d.relation_key || !d.url) continue;
-      if (!grouped.has(d.relation_key)) grouped.set(d.relation_key, []);
-      grouped.get(d.relation_key)?.push(d);
+      const key = canonicalReferenceKey(d.relation_key);
+      if (!grouped.has(key)) grouped.set(key, []);
+      grouped.get(key)?.push(d);
     }
 
     // 2. Build JSON
@@ -174,13 +176,21 @@ export function extractDistributionsFromJson(
 
   const resourceId = String(json["id"] ?? "");
   const distributions: Distribution[] = [];
-  for (const [key, url] of Object.entries(obj as Record<string, unknown>)) {
-    if (!url) continue;
-    distributions.push({
-      resource_id: resourceId,
-      relation_key: String(key),
-      url: String(url),
-    });
+  for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
+    const items = Array.isArray(value) ? value : [value];
+    for (const item of items) {
+      if (!item) continue;
+      const isObject = typeof item === "object" && item !== null;
+      const url = isObject && "url" in item ? String(item.url) : String(item);
+      if (!url) continue;
+      const label = isObject && "label" in item ? String(item.label) : undefined;
+      distributions.push({
+        resource_id: resourceId,
+        relation_key: canonicalReferenceKey(key),
+        url,
+        label,
+      });
+    }
   }
   return distributions;
 }
@@ -194,8 +204,9 @@ export function buildDctReferencesS(
 
   for (const d of distributions) {
     if (!d.relation_key || !d.url) continue;
-    if (!grouped.has(d.relation_key)) grouped.set(d.relation_key, []);
-    grouped.get(d.relation_key)?.push(d);
+    const key = canonicalReferenceKey(d.relation_key);
+    if (!grouped.has(key)) grouped.set(key, []);
+    grouped.get(key)?.push(d);
   }
 
   for (const [key, dists] of grouped.entries()) {
@@ -213,5 +224,4 @@ export function buildDctReferencesS(
   if (Object.keys(refs).length === 0) return undefined;
   return JSON.stringify(refs, Object.keys(refs).sort(), 2);
 }
-
 

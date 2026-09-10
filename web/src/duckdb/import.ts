@@ -1,7 +1,8 @@
 import { getDuckDbContext } from "./dbInit";
 import { saveDb } from "./lifecycle";
 import { upsertResource } from "./mutations";
-import { Resource, SCALAR_FIELDS, REPEATABLE_STRING_FIELDS, CSV_HEADER_MAPPING, REFERENCE_URI_MAPPING, Distribution } from "../aardvark/model";
+import { Resource, SCALAR_FIELDS, REPEATABLE_STRING_FIELDS, CSV_HEADER_MAPPING, canonicalReferenceKey } from "../aardvark/model";
+import { extractDistributionsFromJson } from "../aardvark/mapping";
 import * as duckdb from "@duckdb/duckdb-wasm";
 
 export async function importCsv(file: File): Promise<{ success: boolean, message: string, count?: number }> {
@@ -108,19 +109,19 @@ export async function importCsv(file: File): Promise<{ success: boolean, message
             for (const row of refs.toArray()) {
                 const id = row.id;
                 try {
-                    const json = JSON.parse(row.dct_references_s);
+                    const distributions = extractDistributionsFromJson({
+                        id,
+                        dct_references_s: row.dct_references_s
+                    });
                     const stmt = await conn.prepare(`INSERT INTO distributions VALUES (?, ?, ?, ?)`);
-                    // Note: distributions table mismatch? (resource_id, relation_key, url, label).
-                    // Original code: INSERT INTO distributions VALUES (?, ?, ?) - ONLY 3 columns?
-                    // Let's check dbInit schema: (resource_id, relation_key, url, label). 4 columns.
-                    // But original code (Line 937) used VALUES (?, ?, ?) which implies it might have been missing label or using default?
-                    // Actually Line 937 in duckdbClient.ts used `await stmt.query(id, key, String(url))`.
-                    // The schema has 4 columns. If I insert 3 values, it might fail or fill first 3.
-                    // Label is last.
-                    // I should check if I need to pass NULL for label.
 
-                    for (const [key, url] of Object.entries(json)) {
-                        await stmt.query(id, key, String(url), null); // Explicitly pass null for label
+                    for (const distribution of distributions) {
+                        await stmt.query(
+                            id,
+                            canonicalReferenceKey(distribution.relation_key),
+                            distribution.url,
+                            distribution.label ?? null
+                        );
                     }
                     await stmt.close();
                 } catch { /* ignore */ }
@@ -144,14 +145,9 @@ export async function importCsv(file: File): Promise<{ success: boolean, message
 export async function importJsonData(json: any, options: { skipSave?: boolean } = {}): Promise<number> {
     const records = Array.isArray(json) ? json : [json];
     let count = 0;
-    const uriToKey = new Map<string, string>();
-    for (const [key, uri] of Object.entries(REFERENCE_URI_MAPPING)) {
-        uriToKey.set(uri, key);
-    }
-
     for (const record of records) {
         if (!record.id) continue;
-        const distributions = extractDistributions(record, uriToKey);
+        const distributions = extractDistributionsFromJson(record);
         const res = prepareResource(record);
         await upsertResource(res, distributions, { skipSave: true });
         count++;
@@ -161,46 +157,6 @@ export async function importJsonData(json: any, options: { skipSave?: boolean } 
         await saveDb();
     }
     return count;
-}
-
-function extractDistributions(record: any, uriToKey: Map<string, string>): Distribution[] {
-    const distributions: Distribution[] = [];
-    if (record.dct_references_s) {
-        try {
-            const refs = JSON.parse(record.dct_references_s);
-            for (const [uri, value] of Object.entries(refs)) {
-                const relKey = uriToKey.get(uri);
-                if (relKey) {
-                    const items = Array.isArray(value) ? value : [value];
-                    for (const item of items) {
-                        let finalUrl = "";
-                        let label: string | undefined = undefined;
-                        if (typeof item === 'string') {
-                            finalUrl = item;
-                        } else if (typeof item === 'object' && item !== null) {
-                            if ('url' in item) {
-                                finalUrl = String((item as any).url);
-                                if ('label' in item) label = String((item as any).label);
-                            } else {
-                                finalUrl = JSON.stringify(item);
-                            }
-                        } else {
-                            finalUrl = String(item);
-                        }
-                        if (finalUrl) {
-                            distributions.push({
-                                resource_id: record.id,
-                                relation_key: relKey,
-                                url: finalUrl,
-                                label: label
-                            });
-                        }
-                    }
-                }
-            }
-        } catch { /* ignore */ }
-    }
-    return distributions;
 }
 
 function prepareResource(record: any): Resource {

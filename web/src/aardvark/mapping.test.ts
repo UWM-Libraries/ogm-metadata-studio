@@ -112,6 +112,23 @@ describe('Aardvark Mapping Logic', () => {
             expect(dists[0].relation_key).toBe('http://schema.org/url');
         });
 
+        it('normalizes aliases and preserves labeled multiple downloads', () => {
+            const dists = extractDistributionsFromJson({
+                id: 'test-aliases',
+                dct_references_s: JSON.stringify({
+                    file: [
+                        { url: 'http://example.com/a.zip', label: 'Shapefile' },
+                        { url: 'http://example.com/b.zip', label: 'GeoPackage' }
+                    ]
+                })
+            });
+
+            expect(dists).toEqual([
+                { resource_id: 'test-aliases', relation_key: 'http://schema.org/downloadUrl', url: 'http://example.com/a.zip', label: 'Shapefile' },
+                { resource_id: 'test-aliases', relation_key: 'http://schema.org/downloadUrl', url: 'http://example.com/b.zip', label: 'GeoPackage' }
+            ]);
+        });
+
         it('returns empty for invalid JSON', () => {
             const dists = extractDistributionsFromJson({ id: 't', dct_references_s: '{broken' });
             expect(dists).toEqual([]);
@@ -147,6 +164,18 @@ describe('Aardvark Mapping Logic', () => {
 
         it('returns undefined for empty input', () => {
             expect(buildDctReferencesS([])).toBeUndefined();
+        });
+
+        it('emits canonical keys for legacy aliases', () => {
+            const json = buildDctReferencesS([
+                { resource_id: '1', relation_key: 'file', url: 'u1' },
+                { resource_id: '1', relation_key: 'url', url: 'u2' }
+            ]);
+
+            expect(JSON.parse(json!)).toEqual({
+                'http://schema.org/downloadUrl': 'u1',
+                'http://schema.org/url': 'u2'
+            });
         });
     });
 });

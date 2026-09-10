@@ -31,7 +31,7 @@ This is a high-level roadmap for adapting Aardvark Metadata Studio to the Americ
 - [ ] Add an optional AGSL validation profile alongside generic OGM Aardvark validation.
 - [ ] Validate authoritative exports against the community schema and AGSL's stricter local requirements.
 - [ ] Audit the application's internal field types, especially arrays, Booleans, dates, and `gbl_indexYear_im`.
-- [ ] Normalize reference aliases to canonical Aardvark reference URIs without losing labels or multiple downloads.
+- [x] Normalize reference aliases to canonical Aardvark reference URIs without losing labels or multiple downloads.
 - [ ] Provide clear record- and field-level import validation reports before data is committed.
 - [ ] Replace the current ID-only permissive checks with explicit community-schema validation and optional AGSL policy validation while still allowing invalid legacy records to be imported for repair.
 - [x] Investigate and plan remediation for published records whose envelope-form Geometry reverses the Bounding Box's west/east order.

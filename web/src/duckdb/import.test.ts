@@ -73,6 +73,26 @@ describe('DuckDB Import', () => {
                 expect.any(Object)
             );
         });
+
+        it('stores references with canonical keys and preserves labels', async () => {
+            await importJsonData({
+                id: '1',
+                dct_references_s: JSON.stringify({
+                    file: [{ url: 'https://example.com/data.zip', label: 'Shapefile' }]
+                })
+            });
+
+            expect(mutations.upsertResource).toHaveBeenCalledWith(
+                expect.any(Object),
+                [{
+                    resource_id: '1',
+                    relation_key: 'http://schema.org/downloadUrl',
+                    url: 'https://example.com/data.zip',
+                    label: 'Shapefile'
+                }],
+                expect.any(Object)
+            );
+        });
     });
 
     describe('importCsv', () => {

@@ -84,4 +84,25 @@ describe('Aardvark Model', () => {
             gbl_indexYear_im: ['2001', 'twenty-two']
         })).toThrow('Invalid Index Year');
     });
+
+    it('normalizes reference aliases without losing colliding values', () => {
+        const resource = resourceFromJson({
+            id: 'references',
+            dct_title_s: 'References',
+            dct_references_s: JSON.stringify({
+                download: 'https://example.com/one.zip',
+                file: 'https://example.com/two.zip',
+                metadata: 'https://example.com/metadata.xml'
+            })
+        });
+        const output = resourceToJson(resource);
+
+        expect(JSON.parse(output.dct_references_s as string)).toEqual({
+            'http://schema.org/downloadUrl': [
+                'https://example.com/one.zip',
+                'https://example.com/two.zip'
+            ],
+            'http://www.isotc211.org/schemas/2005/gmd/': 'https://example.com/metadata.xml'
+        });
+    });
 });

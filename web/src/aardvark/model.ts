@@ -205,6 +205,41 @@ export const REFERENCE_URI_MAPPING: Record<string, string> = {
   "image_map_layer": "urn:x-esri:serviceType:ArcGIS#ImageMapLayer"
 };
 
+export function canonicalReferenceKey(key: string): string {
+  return REFERENCE_URI_MAPPING[key.trim().toLowerCase()] ?? key.trim();
+}
+
+export function normalizeDctReferencesS(value: unknown): string | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  if (typeof value !== "string") {
+    throw new Error("dct_references_s must be a JSON-encoded string");
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new Error("dct_references_s must contain valid JSON");
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("dct_references_s must encode a JSON object");
+  }
+
+  const grouped = new Map<string, unknown[]>();
+  for (const [key, referenceValue] of Object.entries(parsed)) {
+    const canonicalKey = canonicalReferenceKey(key);
+    const values = Array.isArray(referenceValue) ? referenceValue : [referenceValue];
+    grouped.set(canonicalKey, [...(grouped.get(canonicalKey) ?? []), ...values]);
+  }
+
+  const normalized: Record<string, unknown> = {};
+  for (const key of Array.from(grouped.keys()).sort()) {
+    const values = grouped.get(key)!;
+    normalized[key] = values.length === 1 ? values[0] : values;
+  }
+  return JSON.stringify(normalized);
+}
+
 const REQUIRED_FIELDS = [
   "id",
   "dct_title_s",
@@ -354,7 +389,7 @@ function extractAdminFields(raw: AardvarkJson) {
 function extractObjectFields(raw: AardvarkJson) {
   return {
     gbl_fileSize_s: (raw["gbl_fileSize_s"] as string | undefined) ?? null,
-    dct_references_s: (raw["dct_references_s"] as string | undefined),
+    dct_references_s: normalizeDctReferencesS(raw["dct_references_s"]),
   };
 }
 
@@ -430,7 +465,7 @@ export function resourceToJson(resource: Resource): AardvarkJson {
   if (resource.gbl_wxsIdentifier_s) base["gbl_wxsIdentifier_s"] = resource.gbl_wxsIdentifier_s;
   if (resource.gbl_suppressed_b !== null && resource.gbl_suppressed_b !== undefined) base["gbl_suppressed_b"] = resource.gbl_suppressed_b;
   if (resource.gbl_fileSize_s) base["gbl_fileSize_s"] = resource.gbl_fileSize_s;
-  if (resource.dct_references_s) base["dct_references_s"] = resource.dct_references_s;
+  if (resource.dct_references_s) base["dct_references_s"] = normalizeDctReferencesS(resource.dct_references_s);
   if (resource.gbl_mdModified_dt) base["gbl_mdModified_dt"] = resource.gbl_mdModified_dt;
 
 
