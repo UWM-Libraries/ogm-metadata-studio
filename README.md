@@ -1,3 +1,10 @@
+# AGSL - OGM Metadata Studio:
+
+* Added codex folder with a todo list.
+* Ingested some JSON data and already caught a major geometry error in existing AGSL Records.
+
+
+
 # OGM Metadata Studio
 
 A browser-native metadata management workspace for the [OpenGeoMetadata Aardvark](https://opengeometadata.org/schema/geoblacklight-schema-aardvark.json) standard.
