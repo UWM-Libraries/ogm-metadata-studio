@@ -125,7 +125,7 @@ export async function zipResources(
     return await zip.generateAsync({ type: "blob" });
 }
 
-function csvResources(resources: Resource[]): Blob {
+export function csvResources(resources: Resource[]): Blob {
     const fields = [...SCALAR_FIELDS, ...REPEATABLE_STRING_FIELDS];
 
     // Invert mapping: SolrField -> FriendlyHeader
@@ -152,8 +152,11 @@ function csvResources(resources: Resource[]): Blob {
             return str;
         }).join(",");
     });
-    const csvContent = [headerRow, ...rows].join("\n");
-    return new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const csvContent = [headerRow, ...rows].join("\r\n");
+
+    // Excel does not consistently honor the charset on downloaded CSV files.
+    // A UTF-8 BOM makes it detect non-ASCII punctuation and text correctly.
+    return new Blob(["\uFEFF", csvContent], { type: "text/csv;charset=utf-8" });
 }
 
 

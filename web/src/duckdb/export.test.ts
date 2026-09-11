@@ -163,6 +163,25 @@ describe('Export Logic', () => {
     });
 
     describe('exportFilteredResults', () => {
+        it('marks csv exports as UTF-8 for Excel', async () => {
+            const blob = exporter.csvResources([{
+                id: 'res-1',
+                dct_title_s: 'American Geographical Society Library – UWM Libraries',
+                extra: {}
+            } as any]);
+            const bytes = await new Promise<Uint8Array>((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(new Uint8Array(reader.result as ArrayBuffer));
+                reader.onerror = () => reject(reader.error);
+                reader.readAsArrayBuffer(blob);
+            });
+
+            expect(Array.from(bytes.slice(0, 3))).toEqual([0xef, 0xbb, 0xbf]);
+            expect(new TextDecoder().decode(bytes)).toContain(
+                'American Geographical Society Library – UWM Libraries'
+            );
+        });
+
         it('exports json zip', async () => {
             const mockBuffer = new Uint8Array([1]);
             mockDb.copyFileToBuffer.mockResolvedValue(mockBuffer);
