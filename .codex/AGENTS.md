@@ -44,6 +44,19 @@ Do not replace the general-purpose Studio CSV export with an institution-specifi
 
 Current Studio imports replace an existing record with the same `id`, including its repeatable fields and distributions. Treat this as full-record replacement, not a partial merge. Make that behavior visible and test it carefully because omitted fields may be lost.
 
+### Text encoding and interoperability
+
+Target UTF-8 for all textual metadata and application interchange. Apply BOMs by artifact type rather than treating them as a general UTF-8 requirement:
+
+- Browser-downloaded, human-facing CSV exports should use UTF-8 with a BOM and CRLF line endings. The BOM lets Excel reliably recognize characters such as en dashes when a user opens the file directly.
+- Machine-oriented CSV may use UTF-8 without a BOM when required by a downstream system. CSV does not universally enforce an encoding, although W3C CSV-on-the-Web guidance recommends UTF-8. Parsers should tolerate and strip an optional UTF-8 BOM from the first header.
+- OGM Aardvark records, GeoBlacklight metadata, GitHub metadata files, and JSON API payloads must be UTF-8 without a BOM. OGM uses JSON, and RFC 8259 requires UTF-8 for interoperable JSON while prohibiting producers from adding a BOM to network-transmitted JSON.
+- XML metadata, including FGDC and ISO 19139 serializations, should use UTF-8 without a BOM and declare `encoding="UTF-8"` when emitting an XML declaration. XML permits a UTF-8 BOM, but it is unnecessary.
+- HTTP responses should send the correct media type and charset where applicable, such as `text/csv;charset=utf-8`. JSON's registered media type and RFC 8259 define its UTF-8 interoperability behavior.
+- GIS formats have format-specific rules. GeoPackage text may be UTF-8 or UTF-16 according to its SQLite encoding. Legacy Shapefile/DBF data should declare UTF-8 using the appropriate `.cpg` sidecar rather than relying on a BOM.
+
+When one CSV must serve both Excel users and automated GIS or metadata pipelines, test the actual consumers. Prefer separate clearly labeled Excel-compatible and machine-oriented variants if a downstream parser mishandles the BOM.
+
 ## AGSL and Aardvark conventions
 
 When producing or validating AGSL records:
