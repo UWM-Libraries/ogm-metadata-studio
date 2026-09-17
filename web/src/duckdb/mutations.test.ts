@@ -46,6 +46,7 @@ const mockCtx = {
 describe('DuckDB Mutations', () => {
     beforeEach(() => {
         vi.clearAllMocks();
+        mockConn.query.mockReset();
         vi.mocked(dbInit.getDuckDbContext).mockResolvedValue(mockCtx as any);
     });
 
@@ -77,6 +78,25 @@ describe('DuckDB Mutations', () => {
 
             // Save DB
             expect(lifecycle.saveDb).toHaveBeenCalled();
+            expect(mockConn.query).toHaveBeenCalledWith('BEGIN TRANSACTION');
+            expect(mockConn.query).toHaveBeenCalledWith('COMMIT');
+        });
+
+        it('rolls back the replacement when an insert fails', async () => {
+            mockConn.query.mockImplementation(async (sql: string) => {
+                if (sql.includes('INSERT INTO resources (')) {
+                    throw new Error('insert failed');
+                }
+            });
+
+            await expect(upsertResource({
+                id: 'test-1',
+                dct_title_s: 'Replacement',
+            } as any)).rejects.toThrow('insert failed');
+
+            expect(mockConn.query).toHaveBeenCalledWith('ROLLBACK');
+            expect(mockConn.query).not.toHaveBeenCalledWith('COMMIT');
+            expect(lifecycle.saveDb).not.toHaveBeenCalled();
         });
 
         it('handles geometry updates from envelope', async () => {

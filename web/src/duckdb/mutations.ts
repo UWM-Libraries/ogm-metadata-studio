@@ -64,7 +64,11 @@ export async function deleteResource(id: string): Promise<void> {
     await saveDb();
 }
 
-export async function upsertResource(resource: Resource, distributions: Distribution[] = [], options: { skipSave?: boolean } = {}): Promise<void> {
+export async function upsertResource(
+    resource: Resource,
+    distributions: Distribution[] = [],
+    options: { skipSave?: boolean; withinTransaction?: boolean } = {}
+): Promise<void> {
     const ctx = await getDuckDbContext();
     if (!ctx) throw new Error("DB not available");
     const { conn } = ctx;
@@ -73,6 +77,12 @@ export async function upsertResource(resource: Resource, distributions: Distribu
     if (!id) throw new Error("Resource ID is required");
 
     const safeId = id.replace(/'/g, "''");
+
+    if (!options.withinTransaction) {
+        await conn.query("BEGIN TRANSACTION");
+    }
+
+    try {
 
     await conn.query(`DELETE FROM resources WHERE id = '${safeId}'`);
     await conn.query(`DELETE FROM resources_mv WHERE id = '${safeId}'`);
@@ -147,6 +157,16 @@ export async function upsertResource(resource: Resource, distributions: Distribu
 
     const content = parts.join(" ").replace(/'/g, "''").replace(/\n/g, " ");
     await conn.query(`INSERT INTO search_index (id, content) VALUES ('${safeId}', '${content}')`);
+
+        if (!options.withinTransaction) {
+            await conn.query("COMMIT");
+        }
+    } catch (error) {
+        if (!options.withinTransaction) {
+            await conn.query("ROLLBACK");
+        }
+        throw error;
+    }
 
     if (!options.skipSave) {
         await saveDb();

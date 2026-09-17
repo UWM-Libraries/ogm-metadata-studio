@@ -287,7 +287,10 @@ export async function rebuildFromJsonData(
     await conn.query('DELETE FROM static_maps');
 
     for (const { resource, distributions } of prepared) {
-      await upsertResource(resource, distributions, { skipSave: true });
+      await upsertResource(resource, distributions, {
+        skipSave: true,
+        withinTransaction: true,
+      });
     }
 
     await conn.query('COMMIT');
