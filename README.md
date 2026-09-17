@@ -18,10 +18,10 @@ Built with **React**, **Vite**, **DuckDB-WASM**, and **GitHub REST API**.
 ## ✨ Features
 
 *   **Browser-Native SQL Engine**: Uses [DuckDB-WASM](https://duckdb.org/docs/api/wasm/overview) to perform sub-millisecond queries, filtering, and aggregation on thousands of records directly in the client. No backend server required.
-*   **Git-Backed Persistence**: "Database" changes are actually local state changes that can be synced back to GitHub as `git commit` actions. Your metadata remains in standard JSON files, version-controlled and forkable.
+*   **Browser Working Database**: Edits are stored in browser IndexedDB. Authoritative metadata remains in standard JSON files and is published through a deliberate JSON ZIP and Git review workflow.
 *   **Faceted Search & Discovery**: Powerful faceted search UI (similar to GeoBlacklight) for exploring your metadata collection, powered by SQL `GROUP BY` and `ILIKE` logic.
 *   **Interactive Mapping**: Integrated Leaflet maps to visual bounding boxes (`dcat_bbox`) and spatial footprints.
-*   **Data Ingestion**: Import data from CSV or JSON sources, with automatic validation against the Aardvark schema constants.
+*   **Data Ingestion**: Import data from CSV or JSON sources for review and repair. Import is currently permissive; AGSL JSON export validates records against a pinned community Aardvark schema and AGSL policy checks.
 
 ## 🛠️ Architecture
 
@@ -29,7 +29,7 @@ Built with **React**, **Vite**, **DuckDB-WASM**, and **GitHub REST API**.
 *   **Database**: DuckDB WASM (Persistent `records.duckdb` stored in IndexedDB)
 *   **Testing**: Vitest + React Testing Library + JSDOM
 *   **Styling**: Tailwind CSS
-*   **API**: Direct GitHub REST API calls (no intermediate auth server)
+*   **API**: GitHub REST API support for reading metadata repositories
 
 ## 🚀 Getting Started
 
@@ -78,7 +78,7 @@ npm run coverage
 1.  **Connect**: Provide your GitHub Owner/Repo/Branch/Token to pull the latest `metadata/*.json` files.
 2.  **Ingest**: The app loads these JSONs into `records.duckdb` (client-side).
 3.  **Edit/Search**: Use the dashboard to filter, search, and edit records.
-4.  **Sync**: (In Progress) Edits are committed back to your GitHub repository as new JSON versions.
+4.  **Publish**: Export an AGSL JSON ZIP, reconcile it with a local metadata repository checkout, review the Git diff, and commit approved changes manually.
 
 ## 🤝 Contributing
 

@@ -154,7 +154,8 @@ describe('DuckDB Search & Filter', () => {
         const mainSql = calls.find((s: string) => s.includes('CREATE TEMP TABLE'));
 
         if (mainSql) {
-            expect(mainSql).toContain("id IN (SELECT id FROM search_index");
+        expect(mainSql).toContain("resources.id ILIKE '%maps%'");
+        expect(mainSql).toContain("resources.id IN (SELECT id FROM search_index");
         } else {
             // Or it might be a direct query if optimization didn't trigger?
             // Actually implementation uses global hits table if Q is present.

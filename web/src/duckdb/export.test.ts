@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import * as exporter from './export';
 import * as dbInit from './dbInit';
 import JSZip from 'jszip';
@@ -37,6 +37,20 @@ vi.mock('./queries', () => ({
     compileFacetedWhere: vi.fn().mockReturnValue({ sql: '1=1' }),
     fetchResourcesByIds: vi.fn().mockResolvedValue([{ id: 'res-1', dct_title_s: 'Test', extra: {} }])
 }));
+
+const validAgslResource = {
+    id: 'ark:-77981-gmgs0c4sj3x',
+    dct_title_s: 'Test map',
+    dct_identifier_sm: ['ark:/77981/gmgs0c4sj3x'],
+    gbl_resourceClass_sm: ['Maps'],
+    dct_accessRights_s: 'Public',
+    gbl_mdVersion_s: 'Aardvark',
+    locn_geometry: 'ENVELOPE(-88,-87,44,43)',
+    schema_provider_s: 'American Geographical Society Library – UWM Libraries',
+    dct_rights_sm: ['Copyright UWM Libraries'],
+    gbl_mdModified_dt: '2026-09-17T12:00:00Z',
+    extra: {}
+};
 
 describe('Export Logic', () => {
     beforeEach(() => {
@@ -88,12 +102,7 @@ describe('Export Logic', () => {
         });
 
         it('uses the AGSL ARK name convention without changing JSON ids', async () => {
-            const resources = [{
-                id: 'ark:-77981-gmgs0c4sj3x',
-                dct_identifier_sm: ['ark:/77981/gmgs0c4sj3x'],
-                gbl_resourceClass_sm: ['Maps'],
-                extra: {}
-            }] as any[];
+            const resources = [validAgslResource] as any[];
 
             await exporter.zipResources(resources, null, {
                 filenameProfile: 'agsl',
@@ -117,21 +126,28 @@ describe('Export Logic', () => {
 
         it('reports identifier mismatches before generating an AGSL archive', async () => {
             const resources = [{
-                id: 'ark:-77981-gmgs0c4sj3x',
+                ...validAgslResource,
                 dct_identifier_sm: ['ark:/77981/different'],
-                gbl_resourceClass_sm: ['Maps'],
-                extra: {}
             }] as any[];
 
             await expect(exporter.zipResources(resources, null, {
                 filenameProfile: 'agsl'
             })).rejects.toThrow(
-                'ark:-77981-gmgs0c4sj3x [dct_identifier_sm]'
+                'ark:-77981-gmgs0c4sj3x [agsl:dct_identifier_sm]'
             );
 
             const MockZip: any = JSZip;
             const zipInstance = MockZip.mock.results[0].value;
             expect(zipInstance.file).not.toHaveBeenCalled();
+        });
+
+        it('reports records with missing ids instead of silently omitting them from an AGSL archive', async () => {
+            await expect(exporter.zipResources([{
+                ...validAgslResource,
+                id: ''
+            }] as any[], null, { filenameProfile: 'agsl' })).rejects.toThrow(
+                '(missing id) [agsl:id]'
+            );
         });
 
         it('makes unsafe identifiers safe in the default profile', () => {

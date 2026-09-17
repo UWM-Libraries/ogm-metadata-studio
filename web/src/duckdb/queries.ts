@@ -213,7 +213,7 @@ export function compileFacetedWhere(req: FacetedSearchRequest, omitField: string
 
     if (emitGlobal && req.q && req.q.trim()) {
         const k = req.q.replace(/'/g, "''");
-        clauses.push(`id IN (SELECT id FROM search_index WHERE content ILIKE '%${k}%')`);
+        clauses.push(`(resources.id ILIKE '%${k}%' OR resources.id IN (SELECT id FROM search_index WHERE content ILIKE '%${k}%'))`);
     }
 
     if (emitGlobal && req.bbox) {
@@ -271,7 +271,8 @@ export async function facetedSearch(req: FacetedSearchRequest): Promise<FacetedS
 
     if (req.q && req.q.trim()) {
         useGlobal = true;
-        globalClauses.push(`id IN (SELECT id FROM search_index WHERE content ILIKE '%${req.q.replace(/'/g, "''")}%')`);
+        const k = req.q.replace(/'/g, "''");
+        globalClauses.push(`(resources.id ILIKE '%${k}%' OR resources.id IN (SELECT id FROM search_index WHERE content ILIKE '%${k}%'))`);
     }
 
     if (req.bbox) {

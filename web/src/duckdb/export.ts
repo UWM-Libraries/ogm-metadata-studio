@@ -3,7 +3,8 @@ import { Resource, resourceToJson, SCALAR_FIELDS, REPEATABLE_STRING_FIELDS, CSV_
 import { queryResources, compileFacetedWhere, fetchResourcesByIds } from "./queries";
 import { FacetedSearchRequest } from "./types";
 import JSZip from "jszip";
-import { parseAgslResourceId, validateAgslIdentifiers } from "../aardvark/identifiers";
+import { parseAgslResourceId } from "../aardvark/identifiers";
+import { validateRecordForAgslExport } from "../aardvark/validation";
 
 export type JsonFilenameProfile = "safe" | "agsl";
 
@@ -85,13 +86,14 @@ export async function zipResources(
     const resourcesWithIds = resources.filter((resource) => !!resource.id);
 
     if (options.filenameProfile === "agsl") {
-        const identifierErrors = resourcesWithIds.flatMap((resource) =>
-            validateAgslIdentifiers(resource).map((issue) =>
-                `- ${resource.id} [${issue.field}]: ${issue.message}`
+        const validationErrors = resources.flatMap((resource) => {
+            const json = resourceToJson(resource);
+            return validateRecordForAgslExport(json).map((issue) =>
+                `- ${resource.id || "(missing id)"} [${issue.profile}:${issue.field}]: ${issue.message}`
             )
-        );
-        if (identifierErrors.length > 0) {
-            throw new Error(`AGSL identifier validation failed:\n${identifierErrors.join("\n")}`);
+        });
+        if (validationErrors.length > 0) {
+            throw new Error(`AGSL export validation failed:\n${validationErrors.join("\n")}`);
         }
     }
 

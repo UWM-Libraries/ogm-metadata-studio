@@ -28,8 +28,8 @@ This is a high-level roadmap for adapting Aardvark Metadata Studio to the Americ
 
 ## Metadata quality and validation
 
-- [ ] Add an optional AGSL validation profile alongside generic OGM Aardvark validation.
-- [ ] Validate authoritative exports against the community schema and AGSL's stricter local requirements.
+- [x] Add an optional AGSL validation profile alongside generic OGM Aardvark validation.
+- [x] Validate authoritative AGSL exports against a pinned community schema and AGSL's stricter local requirements.
 - [ ] Audit the application's internal field types, especially arrays, Booleans, dates, and `gbl_indexYear_im`.
 - [x] Normalize reference aliases to canonical Aardvark reference URIs without losing labels or multiple downloads.
 - [ ] Provide clear record- and field-level import validation reports before data is committed.
@@ -41,7 +41,8 @@ This is a high-level roadmap for adapting Aardvark Metadata Studio to the Americ
 
 - [ ] Make common AGSL ingest workflows approachable for students and metadata staff.
 - [ ] Add safe AGSL defaults for provider, metadata version, rights, access, and suppression where appropriate.
-- [ ] Fix current mapping so `gbl_mdModified_dt` survives JSON import and export, then define when Studio should update it without causing timestamp-only churn.
+- [x] Preserve `gbl_mdModified_dt` through JSON import, storage, and export.
+- [ ] Define when Studio should update `gbl_mdModified_dt` without causing timestamp-only churn.
 - [ ] Improve editors for controlled terms, repeatable fields, references, identifiers, and spatial metadata.
 - [ ] Document and test the current full-record replacement behavior for matching IDs, including the effect of omitted fields.
 - [ ] Preview whether an import will create, replace, leave unchanged, or invalidate records.
