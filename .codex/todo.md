@@ -9,6 +9,16 @@ This is a high-level roadmap for adapting Aardvark Metadata Studio to the Americ
 - [ ] Separate reusable community functionality from AGSL-specific configuration, policy, branding, and integrations.
 - [ ] Establish a lightweight process for reviewing local changes for potential contribution upstream.
 
+## Upstream contribution candidates
+
+Keep this list separate from AGSL localization work. Revisit these items on a future institution-neutral branch, confirm they reproduce against the upstream application, and remove AGSL-specific defaults or policy before proposing issues or pull requests.
+
+- [ ] Contribute the year-facet fix: treat `gbl_indexYear_im` as a repeatable integer field when building timeline counts and range predicates, safely handle invalid values, and ensure an active year range does not break other facets.
+- [ ] Evaluate the internal representation of repeatable typed fields—especially `gbl_indexYear_im`—so arrays are not flattened into ambiguous comma-separated scalar text in the search database.
+- [ ] Evaluate the actionable export-validation report and edit-record workflow as a general upstream enhancement, keeping AGSL validation rules in an optional profile.
+- [ ] Evaluate configurable, deterministic JSON export filenames and layouts as a general upstream enhancement, without making the AGSL naming convention the global default.
+- [ ] Evaluate preservation of absent repeatable and Boolean fields during JSON round trips as a general upstream correctness fix.
+
 ## Interoperability
 
 - [ ] Define stable import contracts for metadata produced by existing Python and OpenRefine workflows.

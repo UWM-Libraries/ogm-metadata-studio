@@ -226,6 +226,24 @@ export function compileFacetedWhere(req: FacetedSearchRequest, omitField: string
             if (field === omitField) continue;
             const isScalar = SCALAR_FIELDS.includes(field);
 
+            if (
+                field === 'gbl_indexYear_im' &&
+                (condition.gte !== undefined || condition.lte !== undefined)
+            ) {
+                const yearBounds: string[] = [];
+                if (condition.gte !== undefined) {
+                    yearBounds.push(`TRY_CAST(trim(year_value) AS INTEGER) >= ${Number(condition.gte)}`);
+                }
+                if (condition.lte !== undefined) {
+                    yearBounds.push(`TRY_CAST(trim(year_value) AS INTEGER) <= ${Number(condition.lte)}`);
+                }
+                clauses.push(`EXISTS (
+                    SELECT 1
+                    FROM UNNEST(string_split(COALESCE(resources."${field}", ''), ',')) AS years(year_value)
+                    WHERE ${yearBounds.join(' AND ')}
+                )`);
+            }
+
             if (condition.any && Array.isArray(condition.any) && condition.any.length > 0) {
                 const values = condition.any.map((v: string) => `'${String(v).replace(/'/g, "''")}'`).join(",");
                 if (isScalar) {
@@ -250,8 +268,10 @@ export function compileFacetedWhere(req: FacetedSearchRequest, omitField: string
                 clauses.push(`( SELECT count(DISTINCT m.val) FROM resources_mv m WHERE m.id = resources.id AND m.field = '${field}' AND m.val IN (${values}) ) = ${count}`);
             }
 
-            if (condition.gte !== undefined) clauses.push(`CAST("${field}" AS INTEGER) >= ${Number(condition.gte)}`);
-            if (condition.lte !== undefined) clauses.push(`CAST("${field}" AS INTEGER) <= ${Number(condition.lte)}`);
+            if (field !== 'gbl_indexYear_im') {
+                if (condition.gte !== undefined) clauses.push(`TRY_CAST("${field}" AS INTEGER) >= ${Number(condition.gte)}`);
+                if (condition.lte !== undefined) clauses.push(`TRY_CAST("${field}" AS INTEGER) <= ${Number(condition.lte)}`);
+            }
         }
     }
     return { sql: clauses.join(" AND ") };
@@ -363,7 +383,22 @@ export async function facetedSearch(req: FacetedSearchRequest): Promise<FacetedS
                 const facetLimit = isYear ? 5000 : limit;
                 let fSql = "";
 
-                if (SCALAR_FIELDS.includes(f.field)) {
+                if (isYear) {
+                    const joins = useGlobal
+                        ? `JOIN ${globalHitsTable} gh ON resources.id = gh.id`
+                        : '';
+                    fSql = `
+                        SELECT TRY_CAST(trim(year_value) AS INTEGER) AS val,
+                               count(DISTINCT resources.id) AS c
+                        FROM resources
+                        ${joins}
+                        CROSS JOIN UNNEST(string_split(COALESCE(resources."gbl_indexYear_im", ''), ',')) AS years(year_value)
+                        WHERE TRY_CAST(trim(year_value) AS INTEGER) IS NOT NULL AND ${fWhere}
+                        GROUP BY val
+                        ORDER BY val ASC
+                        LIMIT ${facetLimit}
+                    `;
+                } else if (SCALAR_FIELDS.includes(f.field)) {
                     const orderBy = isYear ? 'val ASC' : 'c DESC, val ASC';
                     if (useGlobal) {
                         fSql = `SELECT resources."${f.field}" as val, count(*) as c FROM resources JOIN ${globalHitsTable} gh ON resources.id = gh.id WHERE resources."${f.field}" IS NOT NULL AND resources."${f.field}" != '' AND ${fWhere} GROUP BY resources."${f.field}" ORDER BY ${orderBy} LIMIT ${facetLimit}`;

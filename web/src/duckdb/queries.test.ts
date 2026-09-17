@@ -29,6 +29,21 @@ describe('DuckDB Queries', () => {
         (dbInit.getDuckDbContext as any).mockResolvedValue({ conn: mockConn });
     });
 
+    describe('compileFacetedWhere', () => {
+        it('filters each index year without failing on comma-separated arrays', () => {
+            const { sql } = queries.compileFacetedWhere({
+                filters: {
+                    gbl_indexYear_im: { gte: 2000, lte: 2005 }
+                }
+            });
+
+            expect(sql).toContain('UNNEST(string_split');
+            expect(sql).toContain('TRY_CAST(trim(year_value) AS INTEGER) >= 2000');
+            expect(sql).toContain('TRY_CAST(trim(year_value) AS INTEGER) <= 2005');
+            expect(sql).not.toContain('CAST("gbl_indexYear_im" AS INTEGER)');
+        });
+    });
+
     describe('countResources', () => {
         it('returns count when successful', async () => {
             mockQueryReturn([{ c: 42 }]);

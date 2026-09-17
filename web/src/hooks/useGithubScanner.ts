@@ -10,7 +10,7 @@ export type SchemaMode = 'aardvark' | 'gbl1';
 
 export const useGithubScanner = () => {
     // Inputs
-    const [repoUrl, setRepoUrl] = useState("https://github.com/OpenGeoMetadata/edu.umn");
+    const [repoUrl, setRepoUrl] = useState("https://github.com/OpenGeoMetadata/edu.uwm");
     const [branch, setBranch] = useState("main");
     const [token, setToken] = useState("");
 
