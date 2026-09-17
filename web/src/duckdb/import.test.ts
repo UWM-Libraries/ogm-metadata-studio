@@ -100,6 +100,15 @@ describe('DuckDB Import', () => {
         expect.any(Object)
       );
     });
+
+    it('does not overwrite a record when references contain invalid JSON', async () => {
+      await expect(importJsonData({
+        id: '1',
+        dct_references_s: '{broken',
+      })).rejects.toThrow('1 [dct_references_s]: contains invalid JSON');
+
+      expect(mutations.upsertResource).not.toHaveBeenCalled();
+    });
   });
 
   describe('rebuildFromJsonData', () => {

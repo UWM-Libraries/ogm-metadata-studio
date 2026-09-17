@@ -164,17 +164,31 @@ export function extractDistributionsFromJson(
   json: AardvarkJson
 ): Distribution[] {
   const dctRefs = json["dct_references_s"];
-  if (typeof dctRefs !== "string" || !dctRefs.trim()) return [];
+  if (dctRefs === undefined || dctRefs === null || dctRefs === "") return [];
+
+  const resourceId = String(json["id"] ?? "(missing id)");
+  if (typeof dctRefs !== "string") {
+    throw new Error(
+      `${resourceId} [dct_references_s]: must be a JSON-encoded string`
+    );
+  }
+  if (!dctRefs.trim()) return [];
 
   let obj: unknown;
   try {
     obj = JSON.parse(dctRefs);
-  } catch {
-    return [];
+  } catch (error) {
+    const detail = error instanceof Error ? `: ${error.message}` : "";
+    throw new Error(
+      `${resourceId} [dct_references_s]: contains invalid JSON${detail}`
+    );
   }
-  if (typeof obj !== "object" || obj === null) return [];
+  if (typeof obj !== "object" || obj === null || Array.isArray(obj)) {
+    throw new Error(
+      `${resourceId} [dct_references_s]: encoded JSON must be an object`
+    );
+  }
 
-  const resourceId = String(json["id"] ?? "");
   const distributions: Distribution[] = [];
   for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
     const items = Array.isArray(value) ? value : [value];

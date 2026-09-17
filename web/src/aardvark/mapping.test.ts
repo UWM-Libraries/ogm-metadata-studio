@@ -151,9 +151,18 @@ describe('Aardvark Mapping Logic', () => {
             ]);
         });
 
-        it('returns empty for invalid JSON', () => {
-            const dists = extractDistributionsFromJson({ id: 't', dct_references_s: '{broken' });
-            expect(dists).toEqual([]);
+        it('rejects invalid JSON instead of silently discarding references', () => {
+            expect(() => extractDistributionsFromJson({
+                id: 't',
+                dct_references_s: '{broken'
+            })).toThrow('t [dct_references_s]: contains invalid JSON');
+        });
+
+        it('rejects an encoded value that is not an object', () => {
+            expect(() => extractDistributionsFromJson({
+                id: 't',
+                dct_references_s: '[]'
+            })).toThrow('t [dct_references_s]: encoded JSON must be an object');
         });
     });
 
