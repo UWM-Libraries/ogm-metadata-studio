@@ -228,7 +228,8 @@ export const ImportPage: React.FC<ImportPageProps> = ({
             2. Export Data
           </h2>
           <p className="text-slate-500 dark:text-slate-400 mb-6 text-sm">
-            Export your data for backup or to commit back to GitHub.
+            Download a working-state backup or export authoritative JSON for
+            review and publication.
           </p>
 
           <div className="flex gap-4">
@@ -237,8 +238,9 @@ export const ImportPage: React.FC<ImportPageProps> = ({
                 Download Database (Backup)
               </h3>
               <p className="text-xs text-slate-500 dark:text-slate-400 mb-4">
-                Download the full `records.duckdb` file. Commit this to
-                `web/public/` to save changes permanently.
+                Download the current browser database for local recovery. This
+                is a derived backup, not canonical metadata, and should not be
+                committed as the publication source.
               </p>
               <button
                 onClick={handleSaveDb}
@@ -254,8 +256,9 @@ export const ImportPage: React.FC<ImportPageProps> = ({
                 Export OGM JSONs (Publish)
               </h3>
               <p className="text-xs text-slate-500 dark:text-slate-400 mb-4">
-                Download a ZIP of individual Aardvark JSON files, ready for the
-                GBL workflow.
+                Download individual Aardvark JSON files. Reconcile the ZIP with
+                a local checkout of the canonical metadata repository, review
+                the Git diff, and commit only approved changes.
               </p>
               <JsonExportProfileSelect
                 profile={jsonExportProfile.profile}

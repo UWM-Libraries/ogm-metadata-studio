@@ -186,6 +186,15 @@ describe('ImportPage', () => {
     });
   });
 
+  it('describes DuckDB as a backup and JSON as the publication format', () => {
+    render(<ImportPage />);
+    expect(
+      screen.getByText(/derived backup, not canonical metadata/)
+    ).toBeDefined();
+    expect(screen.getByText(/review the Git diff/)).toBeDefined();
+    expect(screen.queryByText(/Commit this to/)).toBeNull();
+  });
+
   it('handles errors during import', async () => {
     vi.mocked(duckdb.importCsv).mockResolvedValue({
       success: false,

@@ -8,17 +8,18 @@ The application uses DuckDB-WASM as its client-side database. The database is pe
 
 Stores the scalar (single-value) metadata fields for each resource.
 
-| Column | Type | Description |
-| :--- | :--- | :--- |
-| `id` | `VARCHAR` | Unique identifier (Primary Key) |
-| `dct_title_s` | `VARCHAR` | Title of the resource |
-| `dct_accessRights_s` | `VARCHAR` | Access rights (e.g., "Public") |
-| `gbl_resourceClass_sm` | `VARCHAR` | *Note*: While mapped as string, this is often treated as list in logic. |
-| ... (All other SCALAR_FIELDS) | `VARCHAR` | See `src/aardvark/model.ts` for full list of scalar fields. |
-| `geom` | `GEOMETRY` | PostGIS-compatible geometry derived from `dcat_bbox`. Used for spatial search. |
-| `embedding` | `FLOAT[]` | Vector embedding of the resource metadata for semantic search. |
+| Column                        | Type       | Description                                                                    |
+| :---------------------------- | :--------- | :----------------------------------------------------------------------------- |
+| `id`                          | `VARCHAR`  | Unique identifier (Primary Key)                                                |
+| `dct_title_s`                 | `VARCHAR`  | Title of the resource                                                          |
+| `dct_accessRights_s`          | `VARCHAR`  | Access rights (e.g., "Public")                                                 |
+| `gbl_resourceClass_sm`        | `VARCHAR`  | _Note_: While mapped as string, this is often treated as list in logic.        |
+| ... (All other SCALAR_FIELDS) | `VARCHAR`  | See `src/aardvark/model.ts` for full list of scalar fields.                    |
+| `geom`                        | `GEOMETRY` | PostGIS-compatible geometry derived from `dcat_bbox`. Used for spatial search. |
+| `embedding`                   | `FLOAT[]`  | Vector embedding of the resource metadata for semantic search.                 |
 
 **Key Scalar Fields:**
+
 - `dct_format_s`
 - `gbl_mdVersion_s`
 - `schema_provider_s`
@@ -37,13 +38,14 @@ Stores the scalar (single-value) metadata fields for each resource.
 
 Stores multivalued fields in a normalized "long" format.
 
-| Column | Type | Description |
-| :--- | :--- | :--- |
-| `id` | `VARCHAR` | Foreign Key to `resources.id` |
+| Column  | Type      | Description                         |
+| :------ | :-------- | :---------------------------------- |
+| `id`    | `VARCHAR` | Foreign Key to `resources.id`       |
 | `field` | `VARCHAR` | Field name (e.g., "dct_subject_sm") |
-| `val` | `VARCHAR` | Single value for the field |
+| `val`   | `VARCHAR` | Single value for the field          |
 
 **Common Multivalued Fields:**
+
 - `dct_subject_sm`
 - `dct_creator_sm`
 - `dct_spatial_sm`
@@ -54,21 +56,21 @@ Stores multivalued fields in a normalized "long" format.
 
 Stores links to external resources (downloads, services, etc.). These are reconstructed into the `dct_references_s` JSON blob for the Aardvark schema.
 
-| Column | Type | Description |
-| :--- | :--- | :--- |
-| `resource_id` | `VARCHAR` | Foreign Key to `resources.id` |
+| Column         | Type      | Description                                    |
+| :------------- | :-------- | :--------------------------------------------- |
+| `resource_id`  | `VARCHAR` | Foreign Key to `resources.id`                  |
 | `relation_key` | `VARCHAR` | Type of link (e.g., "download", "wms", "iiif") |
-| `url` | `VARCHAR` | The URL of the detailed resource |
-| `label` | `VARCHAR` | Optional label for the link |
+| `url`          | `VARCHAR` | The URL of the detailed resource               |
+| `label`        | `VARCHAR` | Optional label for the link                    |
 
 ### `resources_image_service`
 
 Stores cached thumbnail images to prevent repeated fetching.
 
-| Column | Type | Description |
-| :--- | :--- | :--- |
-| `id` | `VARCHAR` | Foreign Key to `resources.id` |
-| `data` | `VARCHAR` | Base64 encoded image data |
+| Column         | Type      | Description                                     |
+| :------------- | :-------- | :---------------------------------------------- |
+| `id`           | `VARCHAR` | Foreign Key to `resources.id`                   |
+| `data`         | `VARCHAR` | Base64 encoded image data                       |
 | `last_updated` | `UBIGINT` | Timestamp (ms) of when the thumbnail was cached |
 
 ## Relationships
@@ -81,3 +83,5 @@ Stores cached thumbnail images to prevent repeated fetching.
 ## Persistence
 
 The database file `records.duckdb` is saved to the browser's IndexedDB under the store `aardvark-duckdb`. On page load, the application attempts to hydrate DuckDB from this file.
+
+This database is derived working state, not the authoritative metadata store. A downloaded `records.duckdb` file is a local recovery backup and should not be treated as the publication artifact. Canonical metadata remains the individual Aardvark JSON files in the metadata repository. Use the repository rebuild workflow to reconstruct Studio state, and publish edits by exporting JSON, reconciling it with a local repository checkout, reviewing the Git diff, and committing approved changes.
