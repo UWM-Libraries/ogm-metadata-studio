@@ -318,7 +318,7 @@ function prepareResource(record: any): Resource {
     gbl_resourceClass_sm: Array.isArray(record.gbl_resourceClass_sm)
       ? record.gbl_resourceClass_sm
       : [],
-    dct_accessRights_s: record.dct_accessRights_s || 'Public',
+    dct_accessRights_s: record.dct_accessRights_s || '',
     ...record,
   };
 

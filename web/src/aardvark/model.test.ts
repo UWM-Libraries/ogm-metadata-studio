@@ -62,6 +62,18 @@ describe('Aardvark Model', () => {
         expect(json.dct_relation_sm).toBeUndefined();
     });
 
+    it('does not invent missing required descriptive metadata', () => {
+        const resource = resourceFromJson({ id: 'incomplete' });
+        const json = resourceToJson(resource);
+
+        expect(json.dct_title_s).toBe('');
+        expect(json.dct_accessRights_s).toBe('');
+        expect(json.gbl_resourceClass_sm).toEqual([]);
+        expect(json.dct_title_s).not.toBe('[Untitled]');
+        expect(json.dct_accessRights_s).not.toBe('Public');
+        expect(json.gbl_resourceClass_sm).not.toEqual(['Other']);
+    });
+
     it('preserves the canonical metadata modified timestamp', () => {
         const canonicalJson = {
             id: 'ark:-77981-gmgs0c4sj3x',

@@ -68,6 +68,20 @@ describe('DuckDB Import', () => {
       expect(mutations.upsertResource).toHaveBeenCalledTimes(1);
     });
 
+    it('does not invent access rights or resource classes during import', async () => {
+      await importJsonData({ id: '1' });
+
+      expect(mutations.upsertResource).toHaveBeenCalledWith(
+        expect.objectContaining({
+          dct_title_s: '',
+          dct_accessRights_s: '',
+          gbl_resourceClass_sm: [],
+        }),
+        expect.any(Array),
+        expect.any(Object)
+      );
+    });
+
     it('normalizes list fields', async () => {
       const data = { id: '1', dct_subject_sm: 'History' }; // string instead of array
       await importJsonData(data);

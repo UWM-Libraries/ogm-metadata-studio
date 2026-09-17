@@ -268,14 +268,10 @@ export function resourceFromJson(raw: AardvarkJson): Resource {
   }
 
   const id = String(raw["id"]);
-  // Provide robust defaults for other "required" fields
-  const title = (raw["dct_title_s"] as string) || "[Untitled]";
-  const access = (raw["dct_accessRights_s"] as string) || "Public";
-
-  let classes = (raw["gbl_resourceClass_sm"] as unknown[]) ?? [];
-  if (classes.length === 0) {
-    classes = ["Other"];
-  }
+  // Preserve missing required metadata as empty so validation can report it.
+  const title = (raw["dct_title_s"] as string) || "";
+  const access = (raw["dct_accessRights_s"] as string) || "";
+  const classes = (raw["gbl_resourceClass_sm"] as unknown[]) ?? [];
 
   const modeledKeys = new Set([
     ...SCALAR_FIELDS,
