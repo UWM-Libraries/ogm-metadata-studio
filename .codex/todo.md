@@ -5,7 +5,7 @@ This is a high-level roadmap for adapting Aardvark Metadata Studio to the Americ
 ## Direction and architecture
 
 - [x] Define `OpenGeoMetadata/edu.uwm` JSON as canonical metadata and Metadata Studio as an editor with a derived working database.
-- [ ] Make the Studio database reproducibly rebuildable from canonical `edu.uwm` JSON.
+- [x] Make the Studio database reproducibly rebuildable from repository JSON with an acquisition-first, transactional replacement workflow.
 - [ ] Separate reusable community functionality from AGSL-specific configuration, policy, branding, and integrations.
 - [ ] Establish a lightweight process for reviewing local changes for potential contribution upstream.
 

@@ -17,11 +17,13 @@ import { ExportValidationReport } from './ExportValidationReport';
 interface ImportPageProps {
   resourceCount?: number;
   onEdit?: (id: string) => void;
+  onDatabaseChanged?: () => void | Promise<void>;
 }
 
 export const ImportPage: React.FC<ImportPageProps> = ({
   resourceCount = 0,
   onEdit,
+  onDatabaseChanged,
 }) => {
   const [status, setStatus] = useState<string>('');
   const [loading, setLoading] = useState(false);
@@ -217,7 +219,7 @@ export const ImportPage: React.FC<ImportPageProps> = ({
               Scan a GitHub repository for `metadata-aardvark` folders and bulk
               import JSON records.
             </p>
-            <GithubImport />
+            <GithubImport onDatabaseChanged={onDatabaseChanged} />
           </div>
         )}
 
