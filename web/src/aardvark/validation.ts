@@ -12,6 +12,27 @@ export interface ValidationIssue {
   message: string;
 }
 
+export interface ExportValidationFailure {
+  recordId: string;
+  issue: ValidationIssue;
+}
+
+export class ExportValidationError extends Error {
+  readonly failures: ExportValidationFailure[];
+
+  constructor(failures: ExportValidationFailure[]) {
+    const details = failures
+      .map(
+        ({ recordId, issue }) =>
+          `- ${recordId || '(missing id)'} [${issue.profile}:${issue.field}]: ${issue.message}`
+      )
+      .join('\n');
+    super(`AGSL export validation failed:\n${details}`);
+    this.name = 'ExportValidationError';
+    this.failures = failures;
+  }
+}
+
 const ajv = new Ajv({ allErrors: true, jsonPointers: true, schemaId: 'auto' });
 const validateSchema = ajv.compile(aardvarkSchema);
 

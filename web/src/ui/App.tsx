@@ -410,7 +410,7 @@ export const App: React.FC = () => {
                     >
                       ← Back to Dashboard
                     </button>
-                    <ImportPage resourceCount={resourceCount} />
+                    <ImportPage resourceCount={resourceCount} onEdit={handleEditResource} />
                   </div>
                 )}
 
